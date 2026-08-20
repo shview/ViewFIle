@@ -4,7 +4,6 @@
 build/
 .flutter-plugins
 .flutter-plugins-dependencies
-pubspec.lock
 *.iml
 
 # IDE

@@ -38,7 +38,14 @@
 - [x] M0.5 竞品调研：Search Everything / Quick Search / Solid Explorer /
       MiXplorer / X-plore / MT管理器（结论：无"开源 + 免root/root 双模式 +
       Everything 级即时索引"的完整同类产品，定位成立）
-- [ ] M1 脚手架 + 无 root 端到端：扫描 /sdcard → SQLite → 即时搜索 UI
+- [x] M1 脚手架 + 无 root 端到端（2026-08-20 真机验证通过）：
+      扫描 /sdcard → SQLite staging 换表 → 内存排序数组 → 即时搜索 UI。
+      Pixel 7 实测：扫描 67 条/121ms（本机可见条目全量），载入 1ms，
+      单次查询 0.06–0.28ms，端到端（含通道往返）0–11ms。
+      已知边界：A11+ FUSE 对所有应用隐藏 Android/data 与 Android/obb
+      （本机该区域有 261 条，正是 M2 Shizuku/root 要覆盖的部分）。
+      坑位记录：Android 16 禁止 execSQL 执行带返回行的 PRAGMA
+      （journal_mode / wal_checkpoint 必须走 rawQuery）。
 - [ ] M2 三层访问引擎接入：root（libsu）→ Shizuku → SAF 批量授权向导
 - [ ] M3 增量体系：打开时增量 + 前台监听 + 可选实时监听
 - [ ] M4 文件管理器：浏览/复制/移动/删除/重命名/属性/打开方式/书签
