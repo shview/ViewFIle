@@ -3,6 +3,7 @@ package com.viewfile.viewfile.core
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.os.Environment
+import android.util.Log
 import java.util.concurrent.Executors
 
 /**
@@ -26,6 +27,7 @@ object Engine {
     private lateinit var appContext: Context
     private val scanExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-scan") }
     private val searchExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-search") }
+    private val opsExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-ops") }
 
     val db: SQLiteDatabase by lazy { Db.open(appContext) }
 
@@ -81,7 +83,7 @@ object Engine {
                 lastScan = r
                 lastScanAt = System.currentTimeMillis()
                 state = State.READY
-                android.util.Log.i("ViewFile/Scan", "index loaded: $n entries in ${loadMs}ms")
+                Log.i("ViewFile/Scan", "index loaded: $n entries in ${loadMs}ms")
                 onDone(r, null)
             } catch (t: Throwable) {
                 state = State.IDLE
@@ -95,8 +97,39 @@ object Engine {
             val t0 = System.nanoTime()
             val res = index.query(query, limit)
             val ms = (System.nanoTime() - t0) / 1_000_000.0
-            android.util.Log.d("ViewFile/Search", "'$query' -> ${res.size} hits in ${"%.2f".format(ms)}ms")
+            Log.d("ViewFile/Search", "'$query' -> ${res.size} hits in ${"%.2f".format(ms)}ms")
             cb(res)
+        }
+    }
+
+    /**
+     * 写操作（重命名/删除）：串行执行，扫描期间拒绝；
+     * 成功后自动重载内存索引，把数据库的最新状态带给 UI。
+     */
+    fun opAsync(
+        cb: (Map<String, Any?>) -> Unit,
+        body: () -> Map<String, Any?>
+    ) {
+        opsExec.execute {
+            val out = if (state == State.SCANNING) {
+                mapOf("ok" to false, "error" to "索引正在扫描，请稍后再试")
+            } else {
+                try {
+                    body()
+                } catch (t: Throwable) {
+                    mapOf("ok" to false, "error" to (t.message ?: t.toString()))
+                }
+            }
+            if (out["ok"] == true) {
+                try {
+                    val t0 = System.currentTimeMillis()
+                    index.load(db)
+                    loadMs = System.currentTimeMillis() - t0
+                } catch (t: Throwable) {
+                    Log.w("ViewFile/Ops", "index reload after op failed", t)
+                }
+            }
+            cb(out)
         }
     }
 }

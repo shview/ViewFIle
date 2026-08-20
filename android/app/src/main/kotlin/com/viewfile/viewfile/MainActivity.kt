@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import com.viewfile.viewfile.core.Engine
+import com.viewfile.viewfile.core.FileOps
 import com.viewfile.viewfile.core.SearchIndex
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -63,6 +64,36 @@ class MainActivity : FlutterActivity() {
                         val limit = call.argument<Int>("limit") ?: 200
                         Engine.searchAsync(q, limit) { list ->
                             main.post { result.success(list.map { it.toMap() }) }
+                        }
+                    }
+                    "open" -> {
+                        val paths = call.argument<List<String>>("paths") ?: emptyList()
+                        result.success(if (paths.size == 1) FileOps.open(this, paths[0]) else "一次只能打开一个文件")
+                    }
+                    "share" -> {
+                        val paths = call.argument<List<String>>("paths") ?: emptyList()
+                        result.success(FileOps.share(this, paths))
+                    }
+                    "rename" -> {
+                        val path = call.argument<String>("path") ?: ""
+                        val newName = call.argument<String>("newName") ?: ""
+                        Engine.opAsync({ m -> main.post { result.success(m) } }) {
+                            val err = FileOps.rename(Engine.db, path, newName)
+                            if (err == null) mapOf("ok" to true) else mapOf("ok" to false, "error" to err)
+                        }
+                    }
+                    "delete" -> {
+                        val paths = call.argument<List<String>>("paths") ?: emptyList()
+                        Engine.opAsync({ m -> main.post { result.success(m) } }) {
+                            val (ok, failed) = FileOps.delete(Engine.db, paths)
+                            mapOf(
+                                "ok" to failed.isEmpty(),
+                                "deleted" to ok,
+                                "failedCount" to failed.size,
+                                "failed" to failed.take(5),
+                                "error" to if (failed.isEmpty()) null
+                                    else "部分项目删除失败（可能被占用或无权限）",
+                            )
                         }
                     }
                     else -> result.notImplemented()

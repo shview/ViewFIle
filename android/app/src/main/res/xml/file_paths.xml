@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- /storage/emulated/0 下的索引文件 -->
+    <external-path name="external_storage" path="." />
+    <!-- 为 M2 root 模式预留：全盘任意路径 -->
+    <root-path name="root" path="." />
+</paths>
