@@ -16,8 +16,12 @@ class _SettingsPageState extends State<SettingsPage> {
   int _resultLimit = 200;
   bool _rootIndex = true;
   bool _systemIndex = false;
+  bool _showHidden = false;
   bool _rootGranted = false;
+  bool _shizukuGranted = false;
+  bool _shizukuBinder = false;
   bool _rootChecking = false;
+  bool _shizukuChecking = false;
   bool _dirty = false;
 
   @override
@@ -29,8 +33,12 @@ class _SettingsPageState extends State<SettingsPage> {
         _resultLimit = p.getInt('resultLimit') ?? 200;
         _rootIndex = p.getBool('rootIndex') ?? true;
         _systemIndex = p.getBool('systemIndex') ?? false;
+        _showHidden = p.getBool('showHidden') ?? false;
       });
     });
+    // 打开即自动检测两层状态
+    _checkRoot();
+    _checkShizuku();
   }
 
   Future<void> _save(String key, Object value) async {
@@ -52,6 +60,31 @@ class _SettingsPageState extends State<SettingsPage> {
       _rootChecking = false;
       _dirty = true;
     });
+  }
+
+  Future<void> _checkShizuku() async {
+    setState(() => _shizukuChecking = true);
+    final granted = await _api.hasShizuku();
+    final binder = await _api.shizukuBinderAlive();
+    if (!mounted) return;
+    setState(() {
+      _shizukuGranted = granted;
+      _shizukuBinder = binder;
+      _shizukuChecking = false;
+      _dirty = true;
+    });
+  }
+
+  Future<void> _requestShizuku() async {
+    final ok = await _api.requestShizuku();
+    if (!mounted) return;
+    if (ok) {
+      await _checkShizuku();
+    } else {
+      // 弹出授权框后稍等再刷新状态
+      await Future.delayed(const Duration(seconds: 2));
+      if (mounted) await _checkShizuku();
+    }
   }
 
   @override
@@ -128,22 +161,48 @@ class _SettingsPageState extends State<SettingsPage> {
                 },
               ),
             ),
-            const _SectionHeader('root 与索引范围'),
+            SwitchListTile(
+              secondary: const Icon(Icons.visibility_off_outlined),
+              title: const Text('显示隐藏文件'),
+              subtitle: const Text('显示 . 开头的文件与文件夹'),
+              value: _showHidden,
+              onChanged: (v) {
+                setState(() => _showHidden = v);
+                _save('showHidden', v);
+              },
+            ),
+            const _SectionHeader('特权层级与索引范围'),
             ListTile(
               leading: const Icon(Icons.key),
-              title: const Text('root 状态'),
+              title: const Text('root（T3 · 全盘）'),
               subtitle: Text(_rootChecking
                   ? '检测中…'
-                  : (_rootGranted ? '已授权（T3 全盘）' : '未授权或不可用')),
+                  : (_rootGranted ? '已授权：/data/data 与 Android/data 全覆盖' : '未授权或不可用')),
               trailing: TextButton(
                 onPressed: _rootChecking ? null : _checkRoot,
                 child: const Text('检测'),
               ),
             ),
+            ListTile(
+              leading: const Icon(Icons.phonelink_setup),
+              title: const Text('Shizuku（T2 · 免 root）'),
+              subtitle: Text(_shizukuChecking
+                  ? '检测中…'
+                  : (!_shizukuBinder
+                      ? '服务未运行：请先在 Shizuku 应用里启动'
+                      : (_shizukuGranted
+                          ? '已授权：可读 Android/data、Android/obb（不含 /data/data）'
+                          : '服务运行中，等待授权'))),
+              trailing: TextButton(
+                onPressed: _shizukuChecking ? null : (_shizukuGranted ? _checkShizuku : _requestShizuku),
+                child: Text(_shizukuGranted ? '检测' : '授权'),
+              ),
+            ),
             SwitchListTile(
               secondary: const Icon(Icons.manage_search),
-              title: const Text('root 全盘索引'),
-              subtitle: const Text('索引 Android/data、Android/obb、/data/data、/data/local/tmp'),
+              title: const Text('特权层索引'),
+              subtitle: const Text(
+                  '索引 Android/data、Android/obb、/data/local/tmp；root 再加 /data/data'),
               value: _rootIndex,
               onChanged: (v) {
                 setState(() => _rootIndex = v);

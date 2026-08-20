@@ -68,7 +68,18 @@
       孤儿进程清理正常（pkill 兜底）。
       侧边栏新增「使用提示与已知限制」页：访问分层/实时性边界/操作风险
       全量披露（含 inotify 上限临时调大的说明）。
-- [ ] M2.5 Shizuku 接入（免 root 大众路径）与 SAF 批量授权向导
+- [x] M2.5 Shizuku 接入（2026-08-20 真机验证通过，含 root 禁用回退测试）：
+      PrivShell 统一特权入口（root > Shizuku 自动降级），API 13 走
+      IShizukuService binder newProcess；Shizuku 层覆盖 Android/data、obb、
+      /data/local/tmp（/data/data 仅真 root）；扫描区城/浏览/删除/重命名/
+      vfwatch 前台监听全链路支持 T2。
+      真机问题记录：双 shizuku_server 实例导致授权回写丢失（弹窗无效、
+      manager 列表不显示），清理单实例后恢复；pm grant 可直授框架级权限。
+      root 隐藏侧信道加固：inotify 上限仅在实际不足时调大且停止即恢复
+      原值（实测默认 52061 足够，未做任何系统改动）。
+      其余：应用检索默认目录入口视图（Android/data、obb、data/data）、
+      显示隐藏文件开关、空目录 xargs -r 修复、/Android 父目录 FUSE 隐藏
+      data 的解封锁、设置页打开即自动检测特权层。
 - [ ] M4 文件管理器：浏览/复制/移动/删除/重命名/属性/打开方式/书签
 - [ ] M5 打磨与发布：过滤/排序/主题/国际化，推送 GitHub
 

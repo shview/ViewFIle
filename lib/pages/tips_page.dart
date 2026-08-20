@@ -22,8 +22,11 @@ class TipsPage extends StatelessWidget {
             _Tip(theme, Icons.key, 'root（T3）',
                 '授权后可索引 /data/data、/data/local/tmp 并解锁 Android/data、'
                 'Android/obb；删除/重命名会自动改用 root 权限执行。'),
-            _Tip(theme, Icons.schedule, 'Shizuku（T2，开发中）',
-                '面向无 root 用户的中间方案，届时可在免 root 下读取 Android/data。'),
+            _Tip(theme, Icons.phonelink_setup, 'Shizuku（T2，已支持）',
+                '面向无 root 用户：Shizuku 以 shell 身份运行，可读取 Android/data、'
+                'Android/obb 与 /data/local/tmp；但不能读 /data/data（应用私有'
+                '数据，仅真 root 可见）。需要先在 Shizuku 应用中启动服务并在'
+                '设置页授权。'),
           ]),
           _Section(theme, '索引与实时性', [
             _Tip(theme, Icons.bolt, '打开时自动增量',

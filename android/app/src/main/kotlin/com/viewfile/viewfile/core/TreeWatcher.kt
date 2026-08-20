@@ -43,12 +43,15 @@ class TreeWatcher(
         private const val MAX_DELAY_MS = 10000L  // 持续变动时的最长拖延
     }
 
-    fun start(rootGranted: Boolean) {
+    fun start(useRoot: Boolean, useShizuku: Boolean) {
         if (running) return
         running = true
-        rootMode = rootGranted
-        if (rootGranted) startRootProcess() else startMediaObserver()
+        rootMode = useRoot || useShizuku
+        usingShizuku = useShizuku && !useRoot
+        if (rootMode) startRootProcess(usingShizuku) else startMediaObserver()
     }
+
+    @Volatile private var usingShizuku = false
 
     fun isRunning() = running
 
@@ -57,25 +60,32 @@ class TreeWatcher(
             ?.let { dir -> File(dir, "libvfwatch.so") }
             ?.takeIf { it.exists() }?.absolutePath
 
-    /** root 辅助进程监听（watch 上限临时调大，重启手机后失效） */
-    private fun startRootProcess() {
+    /** root 辅助进程监听；仅当默认 watch 上限不足时才临时调大并在停止时恢复 */
+    private fun startRootProcess(useShizuku: Boolean) {
         val bin = binaryPath()
         if (bin == null) {
             Log.w(TAG, "libvfwatch.so missing, fallback to media observer")
             startMediaObserver()
             return
         }
-        SuShell.run("echo 2097152 > /proc/sys/fs/inotify/max_user_watches")
+        // 目录清单先取出来（同时用于判断是否需要调大上限）
+        val dirs = ArrayList<String>(1024)
+        db.rawQuery("SELECT path FROM files WHERE is_dir=1", null).use { c ->
+            while (c.moveToNext()) dirs.add(RootScanner.toRaw(c.getString(0)))
+        }
+        if (!useShizuku) ensureWatchLimit(dirs.size)
         try {
-            val p = ProcessBuilder("su", "-c", shq(bin)).start()
+            val p = if (useShizuku) {
+                ShizukuShell.newProcess(arrayOf(bin))
+            } else {
+                ProcessBuilder("su", "-c", shq(bin)).start()
+            }
             rootProc = p
             // 喂目录清单（原始路径）
             Thread({
                 try {
                     val w = BufferedWriter(OutputStreamWriter(p.outputStream))
-                    db.rawQuery("SELECT path FROM files WHERE is_dir=1", null).use { c ->
-                        while (c.moveToNext()) w.write(RootScanner.toRaw(c.getString(0)) + "\n")
-                    }
+                    for (d in dirs) w.write(d + "\n")
                     w.write(".\n")
                     w.flush()
                     w.close()
@@ -92,10 +102,38 @@ class TreeWatcher(
                 } catch (_: Throwable) {}
                 Log.w(TAG, "vfwatch exited")
             }, "vf-watch-read").start()
-            Log.i(TAG, "root watcher started ($bin)")
+            Log.i(TAG, "root watcher started via ${if (useShizuku) "shizuku" else "su"} ($bin, ${dirs.size} dirs)")
         } catch (t: Throwable) {
             Log.w(TAG, "start root watcher failed: ${t.message}, fallback")
             startMediaObserver()
+        }
+    }
+
+    /** 仅当现有上限不足以覆盖 needed 时才调大；记录原值供恢复 */
+    private fun ensureWatchLimit(needed: Int) {
+        try {
+            val cur = SuShell.run("cat /proc/sys/fs/inotify/max_user_watches").out.trim()
+            val curVal = cur.toIntOrNull() ?: return
+            if (curVal >= needed) return  // 默认上限够用：不做任何系统改动
+            if (savedWatchLimit == null) savedWatchLimit = cur
+            SuShell.run("echo ${needed * 2} > /proc/sys/fs/inotify/max_user_watches")
+            Log.i(TAG, "watch limit raised $cur -> ${needed * 2} (will restore on stop)")
+        } catch (t: Throwable) {
+            Log.w(TAG, "ensureWatchLimit failed: ${t.message}")
+        }
+    }
+
+    private var savedWatchLimit: String? = null
+
+    private fun restoreWatchLimit() {
+        savedWatchLimit?.let { orig ->
+            savedWatchLimit = null
+            Thread({
+                runCatching {
+                    SuShell.run("echo $orig > /proc/sys/fs/inotify/max_user_watches")
+                    Log.i(TAG, "watch limit restored to $orig")
+                }
+            }, "vf-watch-restore").start()
         }
     }
 
@@ -111,11 +149,11 @@ class TreeWatcher(
         Log.i(TAG, "media store observer started (no-root mode)")
     }
 
-    /** 同步完成后调用：root 模式重启辅助进程以覆盖新增目录 */
+    /** 同步完成后调用：特权模式重启辅助进程以覆盖新增目录 */
     fun refreshRootProcess() {
         if (!running || !rootMode) return
         stopRootProcess()
-        startRootProcess()
+        startRootProcess(usingShizuku)
     }
 
     private fun stopRootProcess() {
@@ -126,6 +164,8 @@ class TreeWatcher(
         // destroy 只杀到 su，vfwatch 会成为孤儿进程；按名清理（异步，避免阻塞主线程）
         Thread({
             runCatching { SuShell.run("pkill -f libvfwatch.so") }
+            runCatching { ShizukuShell.run("pkill -f libvfwatch.so", 5000) }
+            restoreWatchLimit()
         }, "vf-watch-kill").start()
     }
 

@@ -60,4 +60,7 @@ flutter {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
+    // Shizuku（T2 免 root 特权层）
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 }

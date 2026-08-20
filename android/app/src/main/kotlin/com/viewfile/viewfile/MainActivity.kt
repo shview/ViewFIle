@@ -11,6 +11,7 @@ import android.provider.Settings
 import com.viewfile.viewfile.core.Engine
 import com.viewfile.viewfile.core.FileOps
 import com.viewfile.viewfile.core.SearchIndex
+import com.viewfile.viewfile.core.ShizukuShell
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -31,6 +32,11 @@ class MainActivity : FlutterActivity() {
                     "hasPermission" -> result.success(hasStoragePermission())
                     "requestPermission" -> { requestStoragePermission(); result.success(null) }
                     "hasRoot" -> result.success(Engine.refreshRoot())
+                    "hasShizuku" -> result.success(ShizukuShell.getAvailable(refresh = true))
+                    "shizukuBinderAlive" -> result.success(ShizukuShell.isBinderAlive())
+                    "requestShizuku" -> {
+                        result.success(ShizukuShell.requestPermission())
+                    }
                     "stats" -> result.success(Engine.stats())
                     "ensureIndexLoaded" -> Engine.loadIndexAsync { n ->
                         main.post { result.success(n) }

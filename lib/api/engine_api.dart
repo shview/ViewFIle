@@ -13,6 +13,18 @@ class EngineApi {
   /// 检测 root（会触发系统的 root 授权框）
   Future<bool> hasRoot() async => await _m.invokeMethod<bool>('hasRoot') ?? false;
 
+  /// 检测 Shizuku（已授权返回 true；binder 活着但未授权返回 false）
+  Future<bool> hasShizuku() async =>
+      await _m.invokeMethod<bool>('hasShizuku') ?? false;
+
+  /// Shizuku 服务是否在运行（用于区分“未启动”和“未授权”）
+  Future<bool> shizukuBinderAlive() async =>
+      await _m.invokeMethod<bool>('shizukuBinderAlive') ?? false;
+
+  /// 发起 Shizuku 授权（弹出系统框），返回是否已处于授权状态
+  Future<bool> requestShizuku() async =>
+      await _m.invokeMethod<bool>('requestShizuku') ?? false;
+
   Future<Map<dynamic, dynamic>> stats() async =>
       Map<dynamic, dynamic>.from(await _m.invokeMethod('stats'));
 

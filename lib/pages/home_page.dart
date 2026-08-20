@@ -47,6 +47,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // 排序：name | size | time
   String _sortKey = 'name';
   bool _sortDesc = false;
+  bool _showHidden = false;
+  String _tier = 'NONE'; // ROOT | SHIZUKU | NONE
 
   // 按应用检索：{pkg, label, dirs}
   Map<String, dynamic>? _appScope;
@@ -75,6 +77,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _systemIndex = prefs.getBool('systemIndex') ?? false;
       _sortKey = prefs.getString('sortKey') ?? 'name';
       _sortDesc = prefs.getBool('sortDesc') ?? false;
+      _showHidden = prefs.getBool('showHidden') ?? false;
     });
     if (_rootIndex) {
       final r = await _api.hasRoot();
@@ -128,6 +131,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() {
       _entries = (s['entries'] as num?)?.toInt() ?? _entries;
       _root = s['root'] == true;
+      _tier = (s['tier'] as String?) ?? 'NONE';
     });
   }
 
@@ -221,6 +225,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _runQuery(String q) async {
+    // 应用检索默认视图：显示该应用的几个根目录入口（可点进去浏览）
+    if (_appScope != null && q.trim().isEmpty) {
+      final dirs = List<String>.from(_appScope!['dirs']);
+      setState(() {
+        _results = dirs
+            .map((d) => <dynamic, dynamic>{
+                  'path': d,
+                  'name': _appDirLabel(d),
+                  'isDir': true,
+                  'size': 0,
+                  'mtime': 0,
+                })
+            .toList();
+        _searching = false;
+      });
+      return;
+    }
     List<String>? scopes;
     if (_appScope != null) {
       scopes = List<String>.from(_appScope!['dirs']);
@@ -238,6 +259,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _searching = false;
       });
     }
+  }
+
+  static String _appDirLabel(String dir) {
+    if (dir.contains('/Android/data/')) return 'Android/data';
+    if (dir.contains('/Android/obb/')) return 'Android/obb';
+    if (dir.startsWith('/data/data/')) return 'data/data（应用私有）';
+    return dir.substringAfterLast('/');
   }
 
   void _clearAppScope() {
@@ -555,7 +583,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     Text('索引 $_entries 条', style: theme.textTheme.bodySmall),
                     const SizedBox(height: 4),
                     Text(
-                      '访问层级：${_root ? 'root（T3）' : '免 root（T1）'}',
+                      '访问层级：${switch (_tier) { 'ROOT' => 'root（T3）', 'SHIZUKU' => 'Shizuku（T2）', _ => '免 root（T1）' }}',
                       style: theme.textTheme.bodySmall,
                     ),
                   ],
@@ -806,9 +834,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  /// 当前视图的排序副本（浏览模式文件夹置顶；搜索结果纯按所选键）
+  /// 当前视图的排序副本（浏览模式文件夹置顶；搜索结果纯按所选键；隐藏文件过滤）
   List<Map<dynamic, dynamic>> _sortedView() {
-    final list = List<Map<dynamic, dynamic>>.from(_displayList);
+    final list = _displayList
+        .where((e) => _showHidden || !((e['name'] as String? ?? '').startsWith('.')))
+        .toList();
     int sizeOf(Map<dynamic, dynamic> e) => e['isDir'] == true
         ? ((e['dirSize'] as num?)?.toInt() ?? 0)
         : ((e['size'] as num?)?.toInt() ?? 0);
@@ -916,6 +946,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         if (_selecting) {
           _toggle(path);
         } else if (isDir && browsing) {
+          _loadDir(path);
+        } else if (isDir && _appScope != null && _searchCtl.text.trim().isEmpty) {
+          // 应用检索默认视图：点目录入口 → 进入普通浏览
+          setState(() => _appScope = null);
           _loadDir(path);
         } else {
           _showDetail(e);

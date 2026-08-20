@@ -16,12 +16,12 @@ class RootScanner {
     ): Count {
         val total = Count()
         for ((raw, display) in areas) {
-            val cmd = "find ${shq(raw)} -print0 | xargs -0 stat -c '%n|%F|%s|%Y' 2>/dev/null"
+            val cmd = "find ${shq(raw)} -print0 | xargs -0 -r stat -c '%n|%F|%s|%Y' 2>/dev/null"
             val areaStart = System.currentTimeMillis()
             var areaFiles = 0
             var areaDirs = 0
             var sinceTick = 0
-            val res = SuShell.runStream(cmd) { line ->
+            val res = PrivShell.runStream(cmd) { line ->
                 val e = parseStatLine(line) ?: run { total.skipped++; return@runStream }
                 val displayPath = mapDisplay(e.rawPath, raw, display)
                 val name = displayPath.substringAfterLast('/')

@@ -78,10 +78,13 @@ object FileOps {
         if (target.exists()) return "已存在同名项目"
 
         var renamed = old.exists() && old.renameTo(target)
-        if (!renamed && SuShell.getAvailable()) {
+        if (!renamed && PrivShell.tier() != PrivShell.Tier.NONE) {
             val rawOld = RootScanner.toRaw(old.absolutePath)
             val rawNew = RootScanner.toRaw(target.absolutePath)
-            renamed = SuShell.run("mv ${shq(rawOld)} ${shq(rawNew)}").ok && File(rawNew).exists()
+            if (PrivShell.needsRealRoot(rawOld) && PrivShell.tier() != PrivShell.Tier.ROOT) {
+                return "该位置只有真正的 root 才能修改（Shizuku 不够）"
+            }
+            renamed = PrivShell.run("mv ${shq(rawOld)} ${shq(rawNew)}").ok && File(rawNew).exists()
         }
         if (!renamed) return "重命名失败（存储权限或跨区限制）"
 
@@ -132,13 +135,16 @@ object FileOps {
                 removeRows(db, p)
                 return true
             }
-        } else if (!SuShell.getAvailable()) {
-            removeRows(db, p)  // 文件已不在且无 root，清掉索引即可
+        } else if (PrivShell.tier() == PrivShell.Tier.NONE) {
+            removeRows(db, p)  // 文件已不在且无特权后端，清掉索引即可
             return true
         }
-        if (SuShell.getAvailable()) {
+        if (PrivShell.tier() != PrivShell.Tier.NONE) {
             val raw = RootScanner.toRaw(p)
-            if (SuShell.run("rm -rf ${shq(raw)}").ok && !File(raw).exists()) {
+            if (PrivShell.needsRealRoot(raw) && PrivShell.tier() != PrivShell.Tier.ROOT) {
+                return false  // 只有真 root 能删的位置
+            }
+            if (PrivShell.run("rm -rf ${shq(raw)}").ok && !File(raw).exists()) {
                 removeRows(db, p)
                 return true
             }

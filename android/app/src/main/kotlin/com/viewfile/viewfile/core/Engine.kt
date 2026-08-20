@@ -52,6 +52,8 @@ object Engine {
         "lastScanAt" to lastScanAt,
         "loadMs" to loadMs,
         "root" to rootGranted,
+        "shizuku" to ShizukuShell.getAvailable(),
+        "tier" to PrivShell.tier().name,
     )
 
     /** 配置指纹是否与上次扫描一致（root 开关变化时提示重扫） */
@@ -61,7 +63,7 @@ object Engine {
     }
 
     private fun scanFingerprint(rootIndex: Boolean, systemIndex: Boolean) =
-        "root=$rootIndex,sys=$systemIndex,su=${SuShell.getAvailable()}"
+        "root=$rootIndex,sys=$systemIndex,tier=${PrivShell.tier()}"
 
     /** 已有索引则载入内存；返回条目数，并顺带把状态置为 READY */
     fun loadIndexAsync(cb: (Int) -> Unit) {
@@ -98,7 +100,8 @@ object Engine {
             onDone(null, "扫描已在进行中")
             return
         }
-        rootGranted = SuShell.getAvailable()
+        rootGranted = SuShell.getAvailable(refresh = true)
+        ShizukuShell.getAvailable(refresh = true)
         state = State.SCANNING
         scanExec.execute {
             try {
@@ -122,13 +125,10 @@ object Engine {
                 }
 
                 var withRoot = false
-                if (rootIndex && rootGranted) {
+                // root 区域按特权层级决定：ROOT 全量，SHIZUKU 仅 Android 区+tmp
+                val areas = rootAreas()
+                if (rootIndex && areas.isNotEmpty()) {
                     withRoot = true
-                    val areas = listOf(
-                        "/data/media/0/Android" to "/storage/emulated/0/Android",
-                        "/data/data" to "/data/data",
-                        "/data/local/tmp" to "/data/local/tmp",
-                    )
                     val rc = RootScanner().scanInto(writer, areas) { area, f, d ->
                         onProgress(files + f, dirs + d, area)
                     }
@@ -174,12 +174,19 @@ object Engine {
         searchExec.execute { cb(Fs.listDir(path)) }
     }
 
-    private fun rootAreas(): List<Pair<String, String>> =
-        if (SuShell.getAvailable()) listOf(
+    private fun rootAreas(): List<Pair<String, String>> = when (PrivShell.tier()) {
+        PrivShell.Tier.ROOT -> listOf(
             "/data/media/0/Android" to "/storage/emulated/0/Android",
             "/data/data" to "/data/data",
             "/data/local/tmp" to "/data/local/tmp",
-        ) else emptyList()
+        )
+        // Shizuku 的 shell 身份可读 Android/data 原始路径与 tmp，不能读 /data/data
+        PrivShell.Tier.SHIZUKU -> listOf(
+            "/data/media/0/Android" to "/storage/emulated/0/Android",
+            "/data/local/tmp" to "/data/local/tmp",
+        )
+        PrivShell.Tier.NONE -> emptyList()
+    }
 
     /** 打开 app 时的增量对账：目录 mtime 比对 + root 区刷新，完成后重载内存索引 */
     fun syncAsync(rootIndex: Boolean, cb: (Map<String, Any?>) -> Unit) {
@@ -215,16 +222,18 @@ object Engine {
     /** 前台实时监听：变化触发增量对账，结果通过 onSynced 回调 */
     fun startWatcher(rootIndex: Boolean, onSynced: (Map<String, Any?>) -> Unit) {
         stopWatcher()
+        val tier = PrivShell.tier()
         val w = TreeWatcher(appContext, db, onDirty = {
             syncAsync(rootIndex) { m ->
                 if (m["ok"] == true) {
                     onSynced(m)
-                    // 目录集合可能变化（新建目录）：重启 root 辅助进程以覆盖
+                    // 目录集合可能变化（新建目录）：重启特权辅助进程以覆盖
                     watcher?.refreshRootProcess()
                 }
             }
         })
-        w.start(SuShell.getAvailable() && rootIndex)
+        w.start(tier == PrivShell.Tier.ROOT && rootIndex,
+                tier == PrivShell.Tier.SHIZUKU && rootIndex)
         watcher = w
     }
 

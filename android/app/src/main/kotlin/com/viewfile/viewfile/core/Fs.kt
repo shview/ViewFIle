@@ -9,9 +9,10 @@ import java.io.File
 object Fs {
 
     fun listDir(path: String): Map<String, Any?> {
+        val tier = PrivShell.tier()
         if (isFuseBlocked(path)) {
-            return if (SuShell.getAvailable()) rootListing(path)
-            else err("该目录受系统保护（Android 11+ 限制），需要 root 才能查看")
+            return if (tier != PrivShell.Tier.NONE) rootListing(path)
+            else err("该目录受系统保护（Android 11+ 限制），需要 root 或 Shizuku 才能查看")
         }
         val f = File(path)
         if (!f.isDirectory) return err(if (f.exists()) "不是文件夹" else "目录不存在")
@@ -19,19 +20,22 @@ object Fs {
             val kids = f.listFiles()
             if (kids != null) return ok(kids.map { fileEntryMap(it) })
         }
-        return if (SuShell.getAvailable()) rootListing(path) else err("无权限读取该目录")
+        if (PrivShell.needsRealRoot(path) && tier != PrivShell.Tier.ROOT) {
+            return err("该目录只有真正的 root 才能读取（Shizuku 的 shell 身份不够）")
+        }
+        return if (tier != PrivShell.Tier.NONE) rootListing(path) else err("无权限读取该目录")
     }
 
-    /** /storage/emulated/<n>/Android/{data,obb}（FUSE 对所有应用隐藏） */
+    /** FUSE 会隐藏内容的区域：Android 本身（data 子目录被藏）与 Android/{data,obb} */
     private fun isFuseBlocked(p: String): Boolean {
-        val m = Regex("^/storage/emulated/\\d+/Android/(data|obb)(/|$)").containsMatchIn(p)
-        return m
+        return Regex("^/storage/emulated/\\d+/Android(/(data|obb))?(/|$)").containsMatchIn(p)
     }
 
     private fun rootListing(displayPath: String): Map<String, Any?> {
         val raw = RootScanner.toRaw(displayPath)
-        val res = SuShell.run(
-            "find ${shq(raw)} -mindepth 1 -maxdepth 1 -print0 | xargs -0 stat -c '%n|%F|%s|%Y' 2>/dev/null"
+        // -r：空目录时 xargs 不执行 stat（否则报 rc=123）
+        val res = PrivShell.run(
+            "find ${shq(raw)} -mindepth 1 -maxdepth 1 -print0 | xargs -0 -r stat -c '%n|%F|%s|%Y' 2>/dev/null"
         )
         if (!res.ok) return err("读取失败: ${res.err.take(120).ifBlank { "rc=${res.code}" }}")
         val entries: List<Map<String, Any?>> = res.out.lineSequence()
