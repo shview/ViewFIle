@@ -38,26 +38,34 @@ object Fs {
             .mapNotNull(RootScanner::parseStatLine)
             .map { e ->
                 val dp = RootScanner.toDisplay(e.rawPath)
-                mapOf<String, Any?>(
-                    "path" to dp,
-                    "name" to dp.substringAfterLast('/'),
-                    "isDir" to e.isDir,
-                    "size" to e.size,
-                    "mtime" to e.mtimeMs,
-                )
+                buildMap<String, Any?> {
+                    put("path", dp)
+                    put("name", dp.substringAfterLast('/'))
+                    put("isDir", e.isDir)
+                    put("size", e.size)
+                    put("mtime", e.mtimeMs)
+                    if (e.isDir) Engine.index.statsFor(dp)?.let {
+                        put("dirCount", it.direct)
+                        put("dirSize", it.recSize)
+                    }
+                }
             }
             .sortedWith(dirsFirst)
             .toList()
         return ok(entries)
     }
 
-    private fun fileEntryMap(f: File) = mapOf(
-        "path" to f.absolutePath,
-        "name" to f.name,
-        "isDir" to f.isDirectory,
-        "size" to if (f.isDirectory) 0L else f.length(),
-        "mtime" to f.lastModified(),
-    )
+    private fun fileEntryMap(f: File): Map<String, Any?> = buildMap {
+        put("path", f.absolutePath)
+        put("name", f.name)
+        put("isDir", f.isDirectory)
+        put("size", if (f.isDirectory) 0L else f.length())
+        put("mtime", f.lastModified())
+        if (f.isDirectory) Engine.index.statsFor(f.absolutePath)?.let {
+            put("dirCount", it.direct)
+            put("dirSize", it.recSize)
+        }
+    }
 
     private val dirsFirst = compareByDescending<Map<String, Any?>> { it["isDir"] as Boolean }
         .thenBy { (it["name"] as String).lowercase() }

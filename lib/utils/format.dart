@@ -16,9 +16,11 @@ String fmtDate(int msSinceEpoch) {
   return '${d.year}-${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}';
 }
 
-/// 按扩展名给出人类可读类型 + 图标 + 颜色
-(String, IconData, Color?) describe(String name, bool isDir) {
-  if (isDir) return ('文件夹', Icons.folder, Colors.amber);
+/// 按扩展名给出人类可读类型 + 图标 + 颜色。
+/// [folderColor]：文件夹图标颜色（默认跟随主题主色）
+(String, IconData, Color?) describe(String name, bool isDir,
+    {Color? folderColor}) {
+  if (isDir) return ('文件夹', Icons.folder, folderColor ?? const Color(0xFF64B5F6));
   final dot = name.lastIndexOf('.');
   final ext = dot >= 0 && dot < name.length - 1
       ? name.substring(dot + 1).toLowerCase()

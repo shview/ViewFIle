@@ -3,6 +3,8 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- 按应用检索：需要可见全部已安装应用（A11+ 包可见性限制） -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <application
         android:label="ViewFile"
         android:name="${applicationName}"

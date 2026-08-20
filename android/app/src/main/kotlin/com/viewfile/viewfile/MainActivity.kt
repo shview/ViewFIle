@@ -76,10 +76,31 @@ class MainActivity : FlutterActivity() {
                     "search" -> {
                         val q = call.argument<String>("query") ?: ""
                         val limit = call.argument<Int>("limit") ?: 200
-                        val scope = call.argument<String>("scope")
-                        Engine.searchAsync(q, limit, scope) { list ->
+                        val scopes = call.argument<List<String>>("scopes")
+                            ?: call.argument<String>("scope")?.let { listOf(it) }
+                        Engine.searchAsync(q, limit, scopes) { list ->
                             main.post { result.success(list.map { it.toMap() }) }
                         }
+                    }
+                    "listApps" -> {
+                        Thread {
+                            val pm = packageManager
+                            val apps = pm.getInstalledApplications(0)
+                                .map { ai ->
+                                    val isSystem = (ai.flags and
+                                            android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+                                    mapOf<String, Any?>(
+                                        "pkg" to ai.packageName,
+                                        "label" to ai.loadLabel(pm).toString(),
+                                        "system" to isSystem,
+                                    )
+                                }
+                                .sortedWith(
+                                    compareBy<Map<String, Any?>> { it["system"] as Boolean }
+                                        .thenBy { (it["label"] as String).lowercase() }
+                                )
+                            main.post { result.success(apps) }
+                        }.start()
                     }
                     "listDir" -> {
                         val path = call.argument<String>("path") ?: "/"
@@ -147,6 +168,14 @@ class MainActivity : FlutterActivity() {
     }
 }
 
-private fun SearchIndex.Entry.toMap() = mapOf(
-    "path" to path, "name" to name, "isDir" to isDir, "size" to size, "mtime" to mtime,
-)
+private fun SearchIndex.Entry.toMap(): Map<String, Any?> = buildMap {
+    put("path", path)
+    put("name", name)
+    put("isDir", isDir)
+    put("size", size)
+    put("mtime", mtime)
+    if (isDir) Engine.index.statsFor(path)?.let {
+        put("dirCount", it.direct)
+        put("dirSize", it.recSize)
+    }
+}

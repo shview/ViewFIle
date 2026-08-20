@@ -158,13 +158,14 @@ object Engine {
         }
     }
 
-    fun searchAsync(query: String, limit: Int, scope: String?, cb: (List<SearchIndex.Entry>) -> Unit) {
+    fun searchAsync(query: String, limit: Int, scopes: List<String>?, cb: (List<SearchIndex.Entry>) -> Unit) {
         searchExec.execute {
             val t0 = System.nanoTime()
-            val res = index.query(query, limit, scope)
+            val res = index.query(query, limit, scopes)
             val ms = (System.nanoTime() - t0) / 1_000_000.0
+            val scopeText = if (scopes.isNullOrEmpty()) "ALL" else scopes.joinToString(";")
             Log.d("ViewFile/Search",
-                "'$query' scope=${scope ?: "ALL"} -> ${res.size} hits in ${"%.2f".format(ms)}ms")
+                "'$query' scopes=$scopeText -> ${res.size} hits in ${"%.2f".format(ms)}ms")
             cb(res)
         }
     }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/engine_api.dart';
+import '../theme.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
@@ -64,6 +65,51 @@ class _SettingsPageState extends State<SettingsPage> {
         appBar: AppBar(title: const Text('设置')),
         body: ListView(
           children: [
+            const _SectionHeader('外观'),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+              child: Row(
+                children: [
+                  for (final entry in AppTheme.seedColors.entries)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 10),
+                      child: GestureDetector(
+                        onTap: () => AppTheme.setSeed(entry.value),
+                        child: Container(
+                          width: 34,
+                          height: 34,
+                          decoration: BoxDecoration(
+                            color: Color(entry.value),
+                            shape: BoxShape.circle,
+                            border: AppTheme.seedValue == entry.value
+                                ? Border.all(
+                                    color: Theme.of(context).colorScheme.onSurface,
+                                    width: 3)
+                                : null,
+                          ),
+                          child: AppTheme.seedValue == entry.value
+                              ? const Icon(Icons.check, size: 20, color: Colors.white)
+                              : null,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.brightness_6_outlined),
+              title: const Text('明暗模式'),
+              trailing: SegmentedButton<int>(
+                segments: const [
+                  ButtonSegment(value: 0, icon: Icon(Icons.auto_mode), label: Text('系统')),
+                  ButtonSegment(value: 1, icon: Icon(Icons.light_mode), label: Text('浅色')),
+                  ButtonSegment(value: 2, icon: Icon(Icons.dark_mode), label: Text('深色')),
+                ],
+                selected: {AppTheme.modeValue},
+                showSelectedIcon: false,
+                onSelectionChanged: (s) => AppTheme.setMode(s.first),
+              ),
+            ),
             const _SectionHeader('搜索'),
             ListTile(
               leading: const Icon(Icons.format_list_numbered),

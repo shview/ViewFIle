@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/engine_api.dart';
 import '../utils/format.dart';
+import 'apps_page.dart';
 import 'settings_page.dart';
 
 const kSdcard = '/storage/emulated/0';
@@ -42,11 +43,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _searching = false;
   bool _scopeAll = false; // false = 当前目录
 
+  // 排序：name | size | time
+  String _sortKey = 'name';
+  bool _sortDesc = false;
+
+  // 按应用检索：{pkg, label, dirs}
+  Map<String, dynamic>? _appScope;
+
   // 多选状态（浏览/搜索共用）
   bool _selecting = false;
   final Set<String> _selected = {};
 
-  bool get _isSearching => _searchCtl.text.trim().isNotEmpty;
+  bool get _isSearching => _searchCtl.text.trim().isNotEmpty || _appScope != null;
   List<Map<dynamic, dynamic>> get _displayList => _isSearching ? _results : _dirEntries;
 
   @override
@@ -64,6 +72,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _resultLimit = prefs.getInt('resultLimit') ?? 200;
       _rootIndex = prefs.getBool('rootIndex') ?? true;
       _systemIndex = prefs.getBool('systemIndex') ?? false;
+      _sortKey = prefs.getString('sortKey') ?? 'name';
+      _sortDesc = prefs.getBool('sortDesc') ?? false;
     });
     if (_rootIndex) {
       final r = await _api.hasRoot();
@@ -71,13 +81,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _saveSort() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString('sortKey', _sortKey);
+    await p.setBool('sortDesc', _sortDesc);
+  }
+
   Future<void> _bootstrap() async {
     final ok = await _api.hasPermission();
     setState(() => _hasPerm = ok);
     if (!ok) return;
-    _loadDir(_currentDir);
-    final n = await _api.ensureIndexLoaded();
+    final n = await _api.ensureIndexLoaded(); // 先载入索引（目录统计依赖它）
     setState(() => _entries = n);
+    _loadDir(_currentDir);
     if (n == 0) {
       await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex);
     } else if (await _api.needsRescan(
@@ -162,18 +178,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _runQuery(String q) async {
-    if (q.trim().isEmpty) {
+    List<String>? scopes;
+    if (_appScope != null) {
+      scopes = List<String>.from(_appScope!['dirs']);
+    } else if (q.trim().isEmpty) {
       setState(() => _results = const []);
       return;
+    } else if (!_scopeAll) {
+      scopes = [_currentDir];
     }
     setState(() => _searching = true);
-    final r = await _api.search(q,
-        limit: _resultLimit, scope: _scopeAll ? null : _currentDir);
+    final r = await _api.search(q, limit: _resultLimit, scopes: scopes);
     if (mounted) {
       setState(() {
         _results = r;
         _searching = false;
       });
+    }
+  }
+
+  void _clearAppScope() {
+    setState(() => _appScope = null);
+    if (_searchCtl.text.trim().isEmpty) {
+      setState(() => _results = const []);
+    } else {
+      _runQuery(_searchCtl.text);
     }
   }
 
@@ -347,11 +376,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      canPop: !_selecting && !(_currentDir != kSdcard && !_isSearching),
+      canPop: !_selecting && _appScope == null && !(_currentDir != kSdcard && !_isSearching),
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
         if (_selecting) {
           _exitSelection();
+        } else if (_appScope != null) {
+          _clearAppScope();
         } else {
           _navigateUp();
         }
@@ -401,12 +432,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ],
       );
     }
-    final title = _isSearching
-        ? '搜索${_scopeAll ? '（全盘）' : '（当前目录）'}'
-        : _dirTitle(_currentDir);
+    final title = _appScope != null
+        ? '应用：${_appScope!['label']}'
+        : _isSearching
+            ? '搜索${_scopeAll ? '（全盘）' : '（当前目录）'}'
+            : _dirTitle(_currentDir);
     return AppBar(
       title: Text(title),
       actions: [
+        PopupMenuButton<String>(
+          tooltip: '排序',
+          icon: const Icon(Icons.sort),
+          onSelected: (v) {
+            setState(() {
+              if (v == 'desc') {
+                _sortDesc = !_sortDesc;
+              } else {
+                _sortKey = v;
+              }
+            });
+            _saveSort();
+          },
+          itemBuilder: (_) => [
+            CheckedPopupMenuItem(value: 'name', checked: _sortKey == 'name', child: const Text('名称')),
+            CheckedPopupMenuItem(value: 'size', checked: _sortKey == 'size', child: const Text('大小')),
+            CheckedPopupMenuItem(value: 'time', checked: _sortKey == 'time', child: const Text('修改时间')),
+            const PopupMenuDivider(),
+            CheckedPopupMenuItem(value: 'desc', checked: _sortDesc, child: const Text('降序')),
+          ],
+        ),
         IconButton(
           tooltip: '上一级',
           onPressed: (_isSearching || (_currentDir == kSdcard && !_root) || _currentDir == '/')
@@ -478,6 +532,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   _loadDir('/');
                 },
               ),
+            ListTile(
+              leading: const Icon(Icons.apps),
+              title: const Text('按应用检索'),
+              subtitle: Text('搜某应用的 /data/data 与 Android/data',
+                  style: theme.textTheme.bodySmall),
+              onTap: () async {
+                Navigator.pop(context);
+                final picked = await Navigator.push<Map<String, dynamic>>(
+                    context,
+                    MaterialPageRoute(
+                        builder: (_) => AppsPage(rootAvailable: _root)));
+                if (picked != null && mounted) {
+                  setState(() => _appScope = picked);
+                  _runQuery(_searchCtl.text);
+                }
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.refresh),
               title: const Text('重建索引'),
@@ -577,8 +648,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               enabled: _hasPerm == true,
               onChanged: _onQueryChanged,
               decoration: InputDecoration(
-                hintText: _isSearching
-                    ? null
+                hintText: _appScope != null
+                    ? '在 ${_appScope!['label']} 内搜索…'
                     : (_entries > 0 ? '在${_scopeAll ? '全盘' : '当前目录'}搜索…' : '等待索引建立…'),
                 prefixIcon: const Icon(Icons.search),
                 suffixIcon: _searchCtl.text.isEmpty
@@ -596,17 +667,25 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(width: 8),
-          Tooltip(
-            message: _scopeAll ? '当前搜索全盘，点击改为当前目录' : '当前搜索当前目录，点击改为全盘',
-            child: ActionChip(
-              avatar: Icon(
-                _scopeAll ? Icons.public : Icons.subdirectory_arrow_right,
-                size: 18,
+          if (_appScope != null)
+            InputChip(
+              avatar: const Icon(Icons.apps, size: 18),
+              label: Text('${_appScope!['label']}'),
+              onDeleted: _clearAppScope,
+              tooltip: '点击 ✕ 退出应用检索',
+            )
+          else
+            Tooltip(
+              message: _scopeAll ? '当前搜索全盘，点击改为当前目录' : '当前搜索当前目录，点击改为全盘',
+              child: ActionChip(
+                avatar: Icon(
+                  _scopeAll ? Icons.public : Icons.subdirectory_arrow_right,
+                  size: 18,
+                ),
+                label: Text(_scopeAll ? '全盘' : '当前目录'),
+                onPressed: _toggleScope,
               ),
-              label: Text(_scopeAll ? '全盘' : '当前目录'),
-              onPressed: _toggleScope,
             ),
-          ),
         ],
       ),
     );
@@ -668,6 +747,43 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// 当前视图的排序副本（浏览模式文件夹置顶；搜索结果纯按所选键）
+  List<Map<dynamic, dynamic>> _sortedView() {
+    final list = List<Map<dynamic, dynamic>>.from(_displayList);
+    int sizeOf(Map<dynamic, dynamic> e) => e['isDir'] == true
+        ? ((e['dirSize'] as num?)?.toInt() ?? 0)
+        : ((e['size'] as num?)?.toInt() ?? 0);
+    int cmp(Map<dynamic, dynamic> a, Map<dynamic, dynamic> b) {
+      switch (_sortKey) {
+        case 'size':
+          return sizeOf(a).compareTo(sizeOf(b));
+        case 'time':
+          return (((a['mtime'] as num?)?.toInt() ?? 0))
+              .compareTo(((b['mtime'] as num?)?.toInt() ?? 0));
+        default:
+          return ((a['name'] as String? ?? '').toLowerCase())
+              .compareTo((b['name'] as String? ?? '').toLowerCase());
+      }
+    }
+    final searching = _isSearching;
+    list.sort((a, b) {
+      if (!searching) {
+        final ad = a['isDir'] == true, bd = b['isDir'] == true;
+        if (ad != bd) return ad ? -1 : 1;
+      }
+      final c = cmp(a, b);
+      return _sortDesc ? -c : c;
+    });
+    return list;
+  }
+
+  static String _dirTrailing(Map<dynamic, dynamic> e) {
+    final n = (e['dirCount'] as num?)?.toInt();
+    final s = (e['dirSize'] as num?)?.toInt();
+    if (n == null || s == null) return '[文件夹]';
+    return '$n 项 · ${fmtSize(s)}';
+  }
+
   Widget _listArea() {
     if (_isSearching) {
       if (_results.isEmpty) {
@@ -675,10 +791,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           child: Text('无匹配结果', style: Theme.of(context).textTheme.bodySmall),
         );
       }
+      final view = _sortedView();
       return ListView.builder(
-        itemCount: _results.length,
+        itemCount: view.length,
         itemExtent: 64,
-        itemBuilder: (context, i) => _tile(_results[i], browsing: false),
+        itemBuilder: (context, i) => _tile(view[i], browsing: false),
       );
     }
     // 浏览模式
@@ -702,10 +819,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         child: Text('空文件夹', style: Theme.of(context).textTheme.bodySmall),
       );
     }
+    final view = _sortedView();
     return ListView.builder(
-      itemCount: _dirEntries.length,
+      itemCount: view.length,
       itemExtent: 64,
-      itemBuilder: (context, i) => _tile(_dirEntries[i], browsing: true),
+      itemBuilder: (context, i) => _tile(view[i], browsing: true),
     );
   }
 
@@ -713,7 +831,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final isDir = e['isDir'] == true;
     final path = e['path'] as String? ?? '';
     final name = e['name'] as String? ?? '';
-    final (label, icon, color) = describe(name, isDir);
+    final (label, icon, color) = describe(name, isDir,
+        folderColor: Theme.of(context).colorScheme.primary);
     final selected = _selected.contains(path);
 
     return ListTile(
@@ -723,15 +842,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           : Icon(icon, color: color),
       title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: browsing
-          ? (isDir
-              ? null
-              : Text(fmtDate(((e['mtime'] as num?)?.toInt() ?? 0)),
-                  maxLines: 1, overflow: TextOverflow.ellipsis))
+          ? Text(fmtDate(((e['mtime'] as num?)?.toInt() ?? 0)),
+              maxLines: 1, overflow: TextOverflow.ellipsis)
           : Text(path, maxLines: 1, overflow: TextOverflow.ellipsis),
       trailing: _selecting
           ? null
           : isDir
-              ? Text('[$label]', style: Theme.of(context).textTheme.bodySmall)
+              ? Text(_dirTrailing(e),
+                  style: Theme.of(context).textTheme.bodySmall)
               : Text(fmtSize(((e['size'] as num?)?.toInt() ?? 0)),
                   style: Theme.of(context).textTheme.bodySmall),
       selected: selected,
@@ -752,7 +870,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final isDir = e['isDir'] == true;
     final path = e['path'] as String? ?? '';
     final name = e['name'] as String? ?? '';
-    final (label, icon, color) = describe(name, isDir);
+    final (label, icon, color) = describe(name, isDir,
+        folderColor: Theme.of(context).colorScheme.primary);
+    final dirCount = (e['dirCount'] as num?)?.toInt();
+    final dirSize = (e['dirSize'] as num?)?.toInt();
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
@@ -776,6 +897,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ),
               const SizedBox(height: 12),
               Text('类型：$label${isDir ? '' : ' · ${fmtSize(((e['size'] as num?)?.toInt() ?? 0))}'}'),
+              if (isDir) ...[
+                const SizedBox(height: 6),
+                Text('子项：${dirCount != null ? '$dirCount 项' : '—'}'
+                    ' · 总大小：${dirSize != null ? fmtSize(dirSize) : '—'}'),
+              ],
               const SizedBox(height: 6),
               Text('修改时间：${fmtDate(((e['mtime'] as num?)?.toInt() ?? 0))}'),
               const SizedBox(height: 6),

@@ -32,12 +32,18 @@ class EngineApi {
       });
 
   Future<List<Map<dynamic, dynamic>>> search(String query,
-      {int limit = 200, String? scope}) async {
+      {int limit = 200, List<String>? scopes}) async {
     final list = await _m.invokeMethod<List<dynamic>>('search', {
       'query': query,
       'limit': limit,
-      if (scope != null) 'scope': scope,
+      if (scopes != null) 'scopes': scopes,
     });
+    return list?.map((e) => Map<dynamic, dynamic>.from(e)).toList() ?? const [];
+  }
+
+  /// 已安装应用列表：{pkg, label, system}，非系统应用在前
+  Future<List<Map<dynamic, dynamic>>> listApps() async {
+    final list = await _m.invokeMethod<List<dynamic>>('listApps');
     return list?.map((e) => Map<dynamic, dynamic>.from(e)).toList() ?? const [];
   }
 
