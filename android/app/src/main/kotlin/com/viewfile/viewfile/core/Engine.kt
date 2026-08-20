@@ -56,7 +56,11 @@ object Engine {
         "tier" to PrivShell.tier().name,
     )
 
-    /** 配置指纹是否与上次扫描一致（root 开关变化时提示重扫） */
+    /** 配置指纹是否与上次扫描一致（root 开关变化时提示重扫）；排队后台执行避免与载入争抢连接 */
+    fun needsRescanAsync(rootIndex: Boolean, systemIndex: Boolean, cb: (Boolean) -> Unit) {
+        scanExec.execute { cb(needsRescan(rootIndex, systemIndex)) }
+    }
+
     fun needsRescan(rootIndex: Boolean, systemIndex: Boolean): Boolean {
         val cur = Db.getMeta(db, "scan_cfg") ?: return true
         return cur != scanFingerprint(rootIndex, systemIndex)
@@ -73,6 +77,7 @@ object Engine {
                 val n = index.load(db)
                 loadMs = System.currentTimeMillis() - t0
                 if (n > 0 && state == State.IDLE) state = State.READY
+                Log.i("ViewFile/Scan", "index loaded: $n entries in ${loadMs}ms")
                 cb(n)
             } catch (t: Throwable) {
                 Log.e("ViewFile/Scan", "loadIndex failed", t)
@@ -200,13 +205,17 @@ object Engine {
                 val areas = if (rootIndex) rootAreas() else emptyList()
                 val r = SyncScanner(db).sync("/storage/emulated/0", areas)
                 state = State.READY
-                val t0 = System.currentTimeMillis()
-                val n = index.load(db)
-                loadMs = System.currentTimeMillis() - t0
+                // 无变化不重载索引（大库重载是秒级开销）
+                val changed = r.added + r.removed + r.updated
+                if (changed > 0) {
+                    val t0 = System.currentTimeMillis()
+                    index.load(db)
+                    loadMs = System.currentTimeMillis() - t0
+                }
                 mapOf(
                     "ok" to true,
                     "added" to r.added, "removed" to r.removed, "updated" to r.updated,
-                    "elapsedMs" to r.elapsedMs, "entries" to n,
+                    "elapsedMs" to r.elapsedMs, "entries" to index.size(),
                 )
             } catch (t: Throwable) {
                 state = State.IDLE

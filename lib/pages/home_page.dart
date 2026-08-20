@@ -49,6 +49,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _sortDesc = false;
   bool _showHidden = false;
   String _tier = 'NONE'; // ROOT | SHIZUKU | NONE
+  int _lastScanMs = 0;
+  int _loadMs = 0;
 
   // 按应用检索：{pkg, label, dirs}
   Map<String, dynamic>? _appScope;
@@ -130,6 +132,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final s = await _api.stats();
     setState(() {
       _entries = (s['entries'] as num?)?.toInt() ?? _entries;
+      _lastScanMs = (s['lastScanMs'] as num?)?.toInt() ?? _lastScanMs;
+      _loadMs = (s['loadMs'] as num?)?.toInt() ?? _loadMs;
       _root = s['root'] == true;
       _tier = (s['tier'] as String?) ?? 'NONE';
     });
@@ -581,6 +585,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     Text('ViewFile', style: theme.textTheme.headlineSmall),
                     const SizedBox(height: 6),
                     Text('索引 $_entries 条', style: theme.textTheme.bodySmall),
+                    if (_lastScanMs > 0)
+                      Text(
+                        '扫描 ${(_lastScanMs / 1000.0).toStringAsFixed(1)} s · 载入 $_loadMs ms',
+                        style: theme.textTheme.bodySmall,
+                      ),
                     const SizedBox(height: 4),
                     Text(
                       '访问层级：${switch (_tier) { 'ROOT' => 'root（T3）', 'SHIZUKU' => 'Shizuku（T2）', _ => '免 root（T1）' }}',

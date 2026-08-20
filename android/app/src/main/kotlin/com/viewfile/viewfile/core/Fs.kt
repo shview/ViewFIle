@@ -14,14 +14,22 @@ object Fs {
             return if (tier != PrivShell.Tier.NONE) rootListing(path)
             else err("该目录受系统保护（Android 11+ 限制），需要 root 或 Shizuku 才能查看")
         }
+        // 仅真 root 可读的区域（如 /data/data）：应用视角可能拿到“部分列表”
+        // （只能看到自己与个别系统应用），必须直接走特权列表
+        if (PrivShell.needsRealRoot(path)) {
+            return when (tier) {
+                PrivShell.Tier.ROOT -> rootListing(path)
+                PrivShell.Tier.SHIZUKU ->
+                    err("该目录只有真正的 root 才能读取（Shizuku 的 shell 身份不够）")
+                PrivShell.Tier.NONE ->
+                    err(if (File(path).exists()) "无权限读取该目录（需要 root）" else "目录不存在")
+            }
+        }
         val f = File(path)
         if (!f.isDirectory) return err(if (f.exists()) "不是文件夹" else "目录不存在")
         if (f.canRead()) {
             val kids = f.listFiles()
             if (kids != null) return ok(kids.map { fileEntryMap(it) })
-        }
-        if (PrivShell.needsRealRoot(path) && tier != PrivShell.Tier.ROOT) {
-            return err("该目录只有真正的 root 才能读取（Shizuku 的 shell 身份不够）")
         }
         return if (tier != PrivShell.Tier.NONE) rootListing(path) else err("无权限读取该目录")
     }

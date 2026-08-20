@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/services.dart';
 
 /// 原生引擎通道封装
@@ -64,11 +66,15 @@ class EngineApi {
     return list?.map((e) => Map<dynamic, dynamic>.from(e)).toList() ?? const [];
   }
 
-  /// 已安装应用列表：{pkg, label, system}，非系统应用在前
+  /// 已安装应用列表：{pkg, label, system}，非系统应用在前（不含图标，秒回）
   Future<List<Map<dynamic, dynamic>>> listApps() async {
     final list = await _m.invokeMethod<List<dynamic>>('listApps');
     return list?.map((e) => Map<dynamic, dynamic>.from(e)).toList() ?? const [];
   }
+
+  /// 单个应用图标（懒加载，原生侧有缓存），无图标返回 null
+  Future<Uint8List?> getAppIcon(String pkg) async =>
+      await _m.invokeMethod('getAppIcon', {'pkg': pkg});
 
   /// 浏览目录：返回 {ok, entries} 或 {ok:false, error}
   Future<Map<String, dynamic>> listDir(String path) async =>

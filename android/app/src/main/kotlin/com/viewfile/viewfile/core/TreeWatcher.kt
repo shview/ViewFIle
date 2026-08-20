@@ -41,6 +41,7 @@ class TreeWatcher(
         private const val TAG = "ViewFile/Watch"
         private const val QUIET_MS = 2000L       // 事件静默期
         private const val MAX_DELAY_MS = 10000L  // 持续变动时的最长拖延
+        private const val COOLDOWN_MS = 25000L   // 监听触发同步的最小间隔（大库防同步风暴）
     }
 
     fun start(useRoot: Boolean, useShizuku: Boolean) {
@@ -179,23 +180,39 @@ class TreeWatcher(
         Log.i(TAG, "watcher stopped")
     }
 
+    @Volatile private var lastDispatchAt = 0L
+
     private fun markDirty() {
         if (!running) return
         if (firstDirtyAt == 0L) firstDirtyAt = System.currentTimeMillis()
         val existing = dirtyRunnable
         if (existing == null) {
-            val nr = Runnable {
-                dirtyRunnable = null
-                firstDirtyAt = 0L
-                if (running) onDirty()
+            val nr = object : Runnable {
+                override fun run() {
+                    val sinceSync = System.currentTimeMillis() - lastDispatchAt
+                    if (sinceSync < COOLDOWN_MS) {
+                        // 同步冷却中：顺延到冷却结束再试（保持单一待处理任务）
+                        handler.postDelayed(this, COOLDOWN_MS - sinceSync)
+                        return
+                    }
+                    dirtyRunnable = null
+                    firstDirtyAt = 0L
+                    if (running) {
+                        lastDispatchAt = System.currentTimeMillis()
+                        onDirty()
+                    }
+                }
             }
             dirtyRunnable = nr
             handler.postDelayed(nr, QUIET_MS)
-        } else if (System.currentTimeMillis() - firstDirtyAt >= MAX_DELAY_MS) {
+        } else if (System.currentTimeMillis() - firstDirtyAt >= MAX_DELAY_MS + COOLDOWN_MS) {
             handler.removeCallbacks(existing)
             dirtyRunnable = null
             firstDirtyAt = 0L
-            if (running) onDirty()
+            if (running) {
+                lastDispatchAt = System.currentTimeMillis()
+                onDirty()
+            }
         }
     }
 }

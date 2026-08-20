@@ -20,11 +20,27 @@ class _AppsPageState extends State<AppsPage> {
   List<Map<dynamic, dynamic>> _apps = [];
   List<Map<dynamic, dynamic>> _filtered = [];
   bool _loading = true;
+  final _icons = <String, Uint8List>{};
+  final _iconPending = <String>{};
 
   @override
   void initState() {
     super.initState();
     _load();
+  }
+
+  /// 行构建时懒加载图标（列表本身不等待图标）
+  void _loadIcon(String pkg) {
+    if (_icons.containsKey(pkg) || _iconPending.contains(pkg)) return;
+    _iconPending.add(pkg);
+    _api.getAppIcon(pkg).then((b) {
+      if (mounted) {
+        setState(() {
+          if (b != null && b.isNotEmpty) _icons[pkg] = b;
+          _iconPending.remove(pkg);
+        });
+      }
+    });
   }
 
   Future<void> _load() async {
@@ -118,10 +134,11 @@ class _AppsPageState extends State<AppsPage> {
                       final a = _filtered[i];
                       final pkg = a['pkg'] as String? ?? '';
                       final system = a['system'] == true;
-                      final icon = a['icon'];
+                      _loadIcon(pkg);
+                      final icon = _icons[pkg];
                       return ListTile(
                         dense: true,
-                        leading: (icon is Uint8List && icon.isNotEmpty)
+                        leading: (icon != null && icon.isNotEmpty)
                             ? ClipRRect(
                                 borderRadius: BorderRadius.circular(6),
                                 child: Image.memory(icon,

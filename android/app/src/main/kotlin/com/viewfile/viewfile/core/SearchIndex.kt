@@ -29,39 +29,57 @@ class SearchIndex {
 
     fun statsFor(path: String): DirStat? = dirStats[path]
 
-    /** 整表载入并排序；同时按祖先链累计目录统计 */
+    /** 整表载入并排序；分批读取避免大库撑爆 CursorWindow，统计用深度向上聚合 */
     fun load(db: SQLiteDatabase): Int {
         dirStats.clear()
-        val list = ArrayList<Entry>(128 * 1024)
-        db.rawQuery("SELECT path,name,is_dir,size,mtime FROM files", null).use { c ->
-            while (c.moveToNext()) {
-                val name = c.getString(1)
-                list.add(
-                    Entry(c.getString(0), name, name.lowercase(),
-                        c.getInt(2) == 1, c.getLong(3), c.getLong(4))
-                )
+        val total = db.rawQuery("SELECT COUNT(*) FROM files", null).use { c ->
+            if (c.moveToFirst()) c.getInt(0) else 0
+        }
+        val list = ArrayList<Entry>(total + 16)
+        var lastId = -1L
+        while (true) {
+            val before = list.size
+            db.rawQuery(
+                "SELECT rowid,path,name,is_dir,size,mtime FROM files WHERE rowid>? ORDER BY rowid LIMIT 8000",
+                arrayOf(lastId.toString())
+            ).use { c ->
+                while (c.moveToNext()) {
+                    lastId = c.getLong(0)
+                    val name = c.getString(2)
+                    list.add(
+                        Entry(c.getString(1), name, fastLower(name),
+                            c.getInt(3) == 1, c.getLong(4), c.getLong(5))
+                    )
+                }
             }
+            if (list.size == before) break
         }
         val arr = list.toArray(emptyArray<Entry>())
         Arrays.sort(arr, compareBy { it.nameLower })
-        // 每条目向全部祖先累计递归统计（深度×条目，均摊 O(1) 层级成本）
+
+        // 第一遍：直接子项计数 + 目录父链接
+        val parentOfDir = HashMap<String, String>(arr.size / 4 + 16)
         for (e in arr) {
-            var i = e.path.lastIndexOf('/')
-            while (i > 0) {
-                val anc = e.path.substring(0, i)
-                val s = dirStats.getOrPut(anc) { DirStat() }
-                s.recCount++
-                if (!e.isDir) s.recSize += e.size
-                i = e.path.lastIndexOf('/', i - 1)
-            }
+            val p = e.path.substringBeforeLast('/')
+            if (p.isEmpty()) continue
+            val s = dirStats.getOrPut(p) { DirStat() }
+            s.direct++
+            s.recCount++
+            if (!e.isDir) s.recSize += e.size
+            if (e.isDir) parentOfDir[e.path] = p
         }
-        // 直接子项数单独一遍；同时确保每个目录都有统计记录（空目录 = 0）
+        // 空目录也保证有记录
         for (e in arr) {
             if (e.isDir) dirStats.getOrPut(e.path) { DirStat() }
-            val p = e.path.substringBeforeLast('/')
-            if (p.isNotEmpty()) {
-                dirStats.getOrPut(p) { DirStat() }.direct++
-            }
+        }
+        // 第二遍：按深度降序把子树统计累加给父目录（避免 深度×条目 的字符串分配）
+        val withParent = parentOfDir.keys.sortedByDescending { path -> path.count { it == '/' } }
+        for (d in withParent) {
+            val s = dirStats[d] ?: continue
+            val p = parentOfDir[d] ?: continue
+            val ps = dirStats.getOrPut(p) { DirStat() }
+            ps.recCount += s.recCount
+            ps.recSize += s.recSize
         }
         entries = arr
         return arr.size
@@ -103,5 +121,22 @@ class SearchIndex {
             }
         }
         return out
+    }
+
+    companion object {
+        /** ASCII 快速小写化：String.toLowerCase 在 Android 上是慢路径，
+         *  21 万级条目下差距是秒级；非 ASCII 大写不参与折叠（可接受） */
+        fun fastLower(s: String): String {
+            val chars = s.toCharArray()
+            var changed = false
+            for (i in chars.indices) {
+                val c = chars[i]
+                if (c in 'A'..'Z') {
+                    chars[i] = c + 32
+                    changed = true
+                }
+            }
+            return if (changed) String(chars) else s
+        }
     }
 }

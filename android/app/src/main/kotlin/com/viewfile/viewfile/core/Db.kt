@@ -20,6 +20,8 @@ object Db {
         db.execSQL("PRAGMA synchronous=NORMAL")
         db.execSQL("CREATE TABLE IF NOT EXISTS files($COLS)")
         db.execSQL("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        // 增量同步按 parent 查子项，22 万行无索引=每次全表扫
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent)")
         return db
     }
 
@@ -51,7 +53,10 @@ object Db {
             db.endTransaction()
         }
         // 插入全部完成后再建索引，避免逐行维护 B 树
+        db.execSQL("DROP INDEX IF EXISTS idx_files_name")
+        db.execSQL("DROP INDEX IF EXISTS idx_files_parent")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent)")
         pragma(db, "PRAGMA wal_checkpoint(TRUNCATE)")
     }
 }

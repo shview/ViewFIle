@@ -21,6 +21,7 @@ class MainActivity : FlutterActivity() {
     private val main = Handler(Looper.getMainLooper())
     private var scanSink: EventChannel.EventSink? = null
     private var scanStartMs = 0L
+    private val appIconCache = HashMap<String, ByteArray>()
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -44,7 +45,9 @@ class MainActivity : FlutterActivity() {
                     "needsRescan" -> {
                         val rootIndex = call.argument<Boolean>("rootIndex") ?: true
                         val systemIndex = call.argument<Boolean>("systemIndex") ?: false
-                        result.success(Engine.needsRescan(rootIndex, systemIndex))
+                        Engine.needsRescanAsync(rootIndex, systemIndex) { need ->
+                            main.post { result.success(need) }
+                        }
                     }
                     "startScan" -> {
                         val rootIndex = call.argument<Boolean>("rootIndex") ?: true
@@ -90,9 +93,8 @@ class MainActivity : FlutterActivity() {
                     }
                     "listApps" -> {
                         Thread {
+                            val t0 = System.currentTimeMillis()
                             val pm = packageManager
-                            val sizePx = (48 * resources.displayMetrics.density).toInt()
-                                .coerceAtLeast(64)
                             val apps = pm.getInstalledApplications(0)
                                 .mapNotNull { ai ->
                                     try {
@@ -102,7 +104,6 @@ class MainActivity : FlutterActivity() {
                                             "pkg" to ai.packageName,
                                             "label" to ai.loadLabel(pm).toString(),
                                             "system" to isSystem,
-                                            "icon" to drawableToPng(ai.loadIcon(pm), sizePx),
                                         )
                                     } catch (t: Throwable) {
                                         null
@@ -112,7 +113,22 @@ class MainActivity : FlutterActivity() {
                                     compareBy<Map<String, Any?>> { it["system"] as Boolean }
                                         .thenBy { (it["label"] as String).lowercase() }
                                 )
+                            android.util.Log.i("ViewFile/Apps",
+                                "listApps: ${apps.size} in ${System.currentTimeMillis() - t0}ms")
                             main.post { result.success(apps) }
+                        }.start()
+                    }
+                    "getAppIcon" -> {
+                        val pkg = call.argument<String>("pkg") ?: ""
+                        Thread {
+                            val bytes = synchronized(appIconCache) { appIconCache[pkg] }
+                                ?: try {
+                                    drawableToPng(packageManager.getApplicationIcon(pkg), 96)
+                                        .also { synchronized(appIconCache) { appIconCache[pkg] = it } }
+                                } catch (t: Throwable) {
+                                    null
+                                }
+                            main.post { result.success(bytes) }
                         }.start()
                     }
                     "listDir" -> {
