@@ -1,0 +1,25 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock
+*.iml
+
+# IDE
+.idea/
+.vscode/
+*.log
+
+# Android
+android/.gradle/
+android/local.properties
+android/app/.cxx/
+android/key.properties
+*.keystore
+*.jks
+
+# OS
+.DS_Store
+Thumbs.db
