@@ -56,10 +56,12 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
+    // canPop:false 拦截返回（含 AppBar 返回键），统一走带返回值的 pop；
+    // 此前在 didPop 之后二次 pop 把主页也弹掉，导致黑屏
     return PopScope(
-      canPop: true,
+      canPop: false,
       onPopInvokedWithResult: (didPop, _) {
-        if (didPop) Navigator.pop(context, _dirty);
+        if (!didPop) Navigator.pop(context, _dirty);
       },
       child: Scaffold(
         appBar: AppBar(title: const Text('设置')),

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 
 import 'pages/home_page.dart';
 import 'theme.dart';
@@ -22,6 +23,14 @@ class ViewFileApp extends StatelessWidget {
         theme: AppTheme.light,
         darkTheme: AppTheme.dark,
         themeMode: AppTheme.themeMode,
+        // 文案全中文：让返回键/抽屉/对话框等系统级控件语义也用中文
+        locale: const Locale('zh'),
+        supportedLocales: const [Locale('zh'), Locale('en')],
+        localizationsDelegates: const [
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+        ],
         home: const HomePage(),
       ),
     );

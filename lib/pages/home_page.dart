@@ -102,6 +102,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex);
     } else {
       _refreshStats();
+      _autoSync();
+    }
+  }
+
+  /// 打开 app 时的静默增量对账
+  Future<void> _autoSync() async {
+    final r = await _api.startSync(rootIndex: _rootIndex);
+    if (!mounted || r['ok'] != true) return;
+    final a = (r['added'] as num?)?.toInt() ?? 0;
+    final rm = (r['removed'] as num?)?.toInt() ?? 0;
+    final up = (r['updated'] as num?)?.toInt() ?? 0;
+    final ms = (r['elapsedMs'] as num?)?.toInt() ?? 0;
+    debugPrint('[ViewFile] 增量同步: +$a -$rm ~$up, ${ms}ms');
+    if (a + rm > 0) {
+      _refreshStats();
+      _rerun();
     }
   }
 
@@ -440,6 +456,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return AppBar(
       title: Text(title),
       actions: [
+        if (_appScope != null)
+          IconButton(
+            tooltip: '退出应用检索',
+            icon: const Icon(Icons.close),
+            onPressed: _clearAppScope,
+          ),
         PopupMenuButton<String>(
           tooltip: '排序',
           icon: const Icon(Icons.sort),
@@ -667,14 +689,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(width: 8),
-          if (_appScope != null)
-            InputChip(
-              avatar: const Icon(Icons.apps, size: 18),
-              label: Text('${_appScope!['label']}'),
-              onDeleted: _clearAppScope,
-              tooltip: '点击 ✕ 退出应用检索',
-            )
-          else
+          // 应用检索时不放芯片（AppBar 标题已显示应用名），保持搜索框全长
+          if (_appScope == null)
             Tooltip(
               message: _scopeAll ? '当前搜索全盘，点击改为当前目录' : '当前搜索当前目录，点击改为全盘',
               child: ActionChip(

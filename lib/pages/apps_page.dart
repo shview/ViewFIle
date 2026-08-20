@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import '../api/engine_api.dart';
@@ -116,12 +118,19 @@ class _AppsPageState extends State<AppsPage> {
                       final a = _filtered[i];
                       final pkg = a['pkg'] as String? ?? '';
                       final system = a['system'] == true;
+                      final icon = a['icon'];
                       return ListTile(
                         dense: true,
-                        leading: Icon(
-                          system ? Icons.android : Icons.apps,
-                          color: system ? theme.disabledColor : null,
-                        ),
+                        leading: (icon is Uint8List && icon.isNotEmpty)
+                            ? ClipRRect(
+                                borderRadius: BorderRadius.circular(6),
+                                child: Image.memory(icon,
+                                    width: 34, height: 34, fit: BoxFit.cover),
+                              )
+                            : Icon(
+                                system ? Icons.android : Icons.apps,
+                                color: system ? theme.disabledColor : null,
+                              ),
                         title: Text(a['label'] as String? ?? pkg,
                             maxLines: 1, overflow: TextOverflow.ellipsis),
                         subtitle: Text(pkg,

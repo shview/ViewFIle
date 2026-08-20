@@ -31,6 +31,11 @@ class EngineApi {
         'systemIndex': systemIndex,
       });
 
+  /// 打开 app 时的增量对账，返回 {ok, added, removed, updated, elapsedMs}
+  Future<Map<String, dynamic>> startSync({bool rootIndex = true}) async =>
+      Map<String, dynamic>.from(
+          await _m.invokeMethod('startSync', {'rootIndex': rootIndex}));
+
   Future<List<Map<dynamic, dynamic>>> search(String query,
       {int limit = 200, List<String>? scopes}) async {
     final list = await _m.invokeMethod<List<dynamic>>('search', {

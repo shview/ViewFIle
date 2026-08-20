@@ -56,10 +56,13 @@ object Db {
     }
 }
 
-/** staging 表批量写入器：事务分批提交，供 FUSE 扫描与 root 扫描共用 */
-class IndexWriter(private val db: SQLiteDatabase) {
+/** 批量写入器：默认写 staging（全量重建），可指定表做增量写入 */
+class IndexWriter(
+    private val db: SQLiteDatabase,
+    private val table: String = "files_staging"
+) {
     private val insert = db.compileStatement(
-        "INSERT OR IGNORE INTO files_staging(path,parent,name,is_dir,size,mtime) VALUES(?,?,?,?,?,?)"
+        "INSERT OR IGNORE INTO $table(path,parent,name,is_dir,size,mtime) VALUES(?,?,?,?,?,?)"
     )
     private var pending = 0L
 

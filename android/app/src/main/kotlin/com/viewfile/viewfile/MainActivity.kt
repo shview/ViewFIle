@@ -85,15 +85,22 @@ class MainActivity : FlutterActivity() {
                     "listApps" -> {
                         Thread {
                             val pm = packageManager
+                            val sizePx = (48 * resources.displayMetrics.density).toInt()
+                                .coerceAtLeast(64)
                             val apps = pm.getInstalledApplications(0)
-                                .map { ai ->
-                                    val isSystem = (ai.flags and
-                                            android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
-                                    mapOf<String, Any?>(
-                                        "pkg" to ai.packageName,
-                                        "label" to ai.loadLabel(pm).toString(),
-                                        "system" to isSystem,
-                                    )
+                                .mapNotNull { ai ->
+                                    try {
+                                        val isSystem = (ai.flags and
+                                                android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+                                        mapOf<String, Any?>(
+                                            "pkg" to ai.packageName,
+                                            "label" to ai.loadLabel(pm).toString(),
+                                            "system" to isSystem,
+                                            "icon" to drawableToPng(ai.loadIcon(pm), sizePx),
+                                        )
+                                    } catch (t: Throwable) {
+                                        null
+                                    }
                                 }
                                 .sortedWith(
                                     compareBy<Map<String, Any?>> { it["system"] as Boolean }
@@ -105,6 +112,12 @@ class MainActivity : FlutterActivity() {
                     "listDir" -> {
                         val path = call.argument<String>("path") ?: "/"
                         Engine.listDirAsync(path) { m ->
+                            main.post { result.success(m) }
+                        }
+                    }
+                    "startSync" -> {
+                        val rootIndex = call.argument<Boolean>("rootIndex") ?: true
+                        Engine.syncAsync(rootIndex) { m ->
                             main.post { result.success(m) }
                         }
                     }
@@ -178,4 +191,19 @@ private fun SearchIndex.Entry.toMap(): Map<String, Any?> = buildMap {
         put("dirCount", it.direct)
         put("dirSize", it.recSize)
     }
+}
+
+private fun drawableToPng(d: android.graphics.drawable.Drawable, sizePx: Int): ByteArray {
+    val bmp = if (d is android.graphics.drawable.BitmapDrawable && d.bitmap != null) {
+        android.graphics.Bitmap.createScaledBitmap(d.bitmap, sizePx, sizePx, true)
+    } else {
+        val b = android.graphics.Bitmap.createBitmap(sizePx, sizePx, android.graphics.Bitmap.Config.ARGB_8888)
+        val c = android.graphics.Canvas(b)
+        d.setBounds(0, 0, sizePx, sizePx)
+        d.draw(c)
+        b
+    }
+    val out = java.io.ByteArrayOutputStream()
+    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 90, out)
+    return out.toByteArray()
 }

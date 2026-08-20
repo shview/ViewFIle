@@ -174,6 +174,42 @@ object Engine {
         searchExec.execute { cb(Fs.listDir(path)) }
     }
 
+    private fun rootAreas(): List<Pair<String, String>> =
+        if (SuShell.getAvailable()) listOf(
+            "/data/media/0/Android" to "/storage/emulated/0/Android",
+            "/data/data" to "/data/data",
+            "/data/local/tmp" to "/data/local/tmp",
+        ) else emptyList()
+
+    /** 打开 app 时的增量对账：目录 mtime 比对 + root 区刷新，完成后重载内存索引 */
+    fun syncAsync(rootIndex: Boolean, cb: (Map<String, Any?>) -> Unit) {
+        if (state == State.SCANNING) {
+            cb(mapOf("ok" to false, "error" to "扫描进行中"))
+            return
+        }
+        scanExec.execute {
+            val out = try {
+                state = State.SCANNING
+                val areas = if (rootIndex) rootAreas() else emptyList()
+                val r = SyncScanner(db).sync("/storage/emulated/0", areas)
+                state = State.READY
+                val t0 = System.currentTimeMillis()
+                val n = index.load(db)
+                loadMs = System.currentTimeMillis() - t0
+                mapOf(
+                    "ok" to true,
+                    "added" to r.added, "removed" to r.removed, "updated" to r.updated,
+                    "elapsedMs" to r.elapsedMs, "entries" to n,
+                )
+            } catch (t: Throwable) {
+                state = State.IDLE
+                Log.e("ViewFile/Sync", "sync failed", t)
+                mapOf("ok" to false, "error" to (t.message ?: t.toString()))
+            }
+            cb(out)
+        }
+    }
+
     /**
      * 写操作（重命名/删除）：串行执行，扫描期间拒绝；
      * 成功后自动重载内存索引，把数据库的最新状态带给 UI。
