@@ -22,6 +22,10 @@ object FileOps {
     fun open(context: Context, path: String): String? {
         val f = File(path)
         if (!f.isFile) return "无法打开（不是常规文件）"
+        if (!f.canRead()) {
+            return "该文件位于系统保护区域（如 Android/data），暂不支持直接打开；" +
+                    "可先在浏览中复制到可见区域"
+        }
         return try {
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uriFor(context, f), mimeOf(f))
@@ -35,7 +39,10 @@ object FileOps {
     }
 
     fun share(context: Context, paths: List<String>): String? {
-        val files = paths.map(::File).filter { it.isFile }
+        val files = paths.map(::File).filter { it.isFile && it.canRead() }
+        if (files.size < paths.size) {
+            return "部分文件位于系统保护区域，暂不支持分享"
+        }
         if (files.isEmpty()) return "没有可分享的文件"
         return try {
             val uris = ArrayList<Uri>(files.map { uriFor(context, it) })
@@ -60,16 +67,23 @@ object FileOps {
 
     // ---------- 写操作（需 UI 确认） ----------
 
-    /** 返回 null=成功，否则为错误信息 */
+    /** 返回 null=成功，否则为错误信息。FUSE 失败时回退 root mv */
     fun rename(db: SQLiteDatabase, path: String, newName: String): String? {
         val old = File(path)
         val clean = newName.trim()
         if (clean.isEmpty() || clean.contains('/')) return "文件名不合法"
-        if (!old.exists()) return "文件不存在（可能已被移动）"
+        if (!old.exists() && !SuShell.getAvailable()) return "文件不存在（可能已被移动）"
         if (old.name == clean) return null
         val target = File(old.parentFile, clean)
         if (target.exists()) return "已存在同名项目"
-        if (!old.renameTo(target)) return "重命名失败（存储权限或跨区限制）"
+
+        var renamed = old.exists() && old.renameTo(target)
+        if (!renamed && SuShell.getAvailable()) {
+            val rawOld = RootScanner.toRaw(old.absolutePath)
+            val rawNew = RootScanner.toRaw(target.absolutePath)
+            renamed = SuShell.run("mv ${shq(rawOld)} ${shq(rawNew)}").ok && File(rawNew).exists()
+        }
+        if (!renamed) return "重命名失败（存储权限或跨区限制）"
 
         val oldPath = old.absolutePath
         val newPath = target.absolutePath
@@ -100,25 +114,36 @@ object FileOps {
         return null
     }
 
-    /** 返回 (成功数, 失败路径列表) */
+    /** 返回 (成功数, 失败路径列表)。FUSE 失败时回退 root rm */
     fun delete(db: SQLiteDatabase, paths: List<String>): Pair<Int, List<String>> {
         var deleted = 0
         val failed = mutableListOf<String>()
         for (p in paths) {
-            val f = File(p)
-            if (!f.exists()) {
-                removeRows(db, p)  // 文件已不在，清掉索引即可
-                continue
-            }
-            if (deleteRecursively(f)) {
-                deleted++
-                removeRows(db, p)
-            } else {
-                failed.add(p)
-            }
+            if (deleteOne(db, p)) deleted++ else failed.add(p)
         }
         Log.i(TAG, "delete: ok=$deleted failed=${failed.size}")
         return deleted to failed
+    }
+
+    private fun deleteOne(db: SQLiteDatabase, p: String): Boolean {
+        val f = File(p)
+        if (f.exists()) {
+            if (deleteRecursively(f)) {
+                removeRows(db, p)
+                return true
+            }
+        } else if (!SuShell.getAvailable()) {
+            removeRows(db, p)  // 文件已不在且无 root，清掉索引即可
+            return true
+        }
+        if (SuShell.getAvailable()) {
+            val raw = RootScanner.toRaw(p)
+            if (SuShell.run("rm -rf ${shq(raw)}").ok && !File(raw).exists()) {
+                removeRows(db, p)
+                return true
+            }
+        }
+        return false
     }
 
     private fun deleteRecursively(root: File): Boolean {

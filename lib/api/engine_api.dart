@@ -10,20 +10,40 @@ class EngineApi {
 
   Future<void> requestPermission() => _m.invokeMethod('requestPermission');
 
+  /// 检测 root（会触发系统的 root 授权框）
+  Future<bool> hasRoot() async => await _m.invokeMethod<bool>('hasRoot') ?? false;
+
   Future<Map<dynamic, dynamic>> stats() async =>
       Map<dynamic, dynamic>.from(await _m.invokeMethod('stats'));
 
   Future<int> ensureIndexLoaded() async =>
       await _m.invokeMethod<int>('ensureIndexLoaded') ?? 0;
 
-  Future<void> startScan() => _m.invokeMethod('startScan');
+  Future<bool> needsRescan({bool rootIndex = true, bool systemIndex = false}) async =>
+      await _m.invokeMethod<bool>('needsRescan', {
+        'rootIndex': rootIndex,
+        'systemIndex': systemIndex,
+      }) ?? true;
+
+  Future<void> startScan({bool rootIndex = true, bool systemIndex = false}) =>
+      _m.invokeMethod('startScan', {
+        'rootIndex': rootIndex,
+        'systemIndex': systemIndex,
+      });
 
   Future<List<Map<dynamic, dynamic>>> search(String query,
-      {int limit = 200}) async {
-    final list = await _m.invokeMethod<List<dynamic>>('search',
-        {'query': query, 'limit': limit});
+      {int limit = 200, String? scope}) async {
+    final list = await _m.invokeMethod<List<dynamic>>('search', {
+      'query': query,
+      'limit': limit,
+      if (scope != null) 'scope': scope,
+    });
     return list?.map((e) => Map<dynamic, dynamic>.from(e)).toList() ?? const [];
   }
+
+  /// 浏览目录：返回 {ok, entries} 或 {ok:false, error}
+  Future<Map<String, dynamic>> listDir(String path) async =>
+      Map<String, dynamic>.from(await _m.invokeMethod('listDir', {'path': path}));
 
   /// 打开（系统选择器）。返回 null=已发起，否则为错误信息
   Future<String?> open(List<String> paths) async =>

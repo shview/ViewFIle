@@ -19,6 +19,7 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     private val main = Handler(Looper.getMainLooper())
     private var scanSink: EventChannel.EventSink? = null
+    private var scanStartMs = 0L
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -29,18 +30,29 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "hasPermission" -> result.success(hasStoragePermission())
                     "requestPermission" -> { requestStoragePermission(); result.success(null) }
+                    "hasRoot" -> result.success(Engine.refreshRoot())
                     "stats" -> result.success(Engine.stats())
                     "ensureIndexLoaded" -> Engine.loadIndexAsync { n ->
                         main.post { result.success(n) }
                     }
+                    "needsRescan" -> {
+                        val rootIndex = call.argument<Boolean>("rootIndex") ?: true
+                        val systemIndex = call.argument<Boolean>("systemIndex") ?: false
+                        result.success(Engine.needsRescan(rootIndex, systemIndex))
+                    }
                     "startScan" -> {
+                        val rootIndex = call.argument<Boolean>("rootIndex") ?: true
+                        val systemIndex = call.argument<Boolean>("systemIndex") ?: false
+                        scanStartMs = System.currentTimeMillis()
                         Engine.scanAsync(
-                            onProgress = { p ->
+                            rootIndex, systemIndex,
+                            onProgress = { files, dirs, current ->
                                 main.post {
                                     scanSink?.success(mapOf(
                                         "type" to "progress",
-                                        "files" to p.files, "dirs" to p.dirs,
-                                        "current" to p.current, "elapsedMs" to p.elapsedMs,
+                                        "files" to files, "dirs" to dirs,
+                                        "current" to current,
+                                        "elapsedMs" to System.currentTimeMillis() - scanStartMs,
                                     ))
                                 }
                             },
@@ -51,7 +63,9 @@ class MainActivity : FlutterActivity() {
                                         else mapOf(
                                             "type" to "done",
                                             "files" to r!!.files, "dirs" to r.dirs,
-                                            "elapsedMs" to r.elapsedMs, "loadMs" to Engine.loadMs,
+                                            "elapsedMs" to r.elapsedMs,
+                                            "loadMs" to Engine.loadMs,
+                                            "withRoot" to r.withRoot,
                                         )
                                     )
                                 }
@@ -62,8 +76,15 @@ class MainActivity : FlutterActivity() {
                     "search" -> {
                         val q = call.argument<String>("query") ?: ""
                         val limit = call.argument<Int>("limit") ?: 200
-                        Engine.searchAsync(q, limit) { list ->
+                        val scope = call.argument<String>("scope")
+                        Engine.searchAsync(q, limit, scope) { list ->
                             main.post { result.success(list.map { it.toMap() }) }
+                        }
+                    }
+                    "listDir" -> {
+                        val path = call.argument<String>("path") ?: "/"
+                        Engine.listDirAsync(path) { m ->
+                            main.post { result.success(m) }
                         }
                     }
                     "open" -> {

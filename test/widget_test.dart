@@ -1,30 +1,25 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:viewfile/main.dart';
+import 'package:viewfile/utils/format.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  test('fmtSize 基本换算', () {
+    expect(fmtSize(0), '0 B');
+    expect(fmtSize(2048), '2.0 KB');
+    expect(fmtSize(5 * 1024 * 1024), '5.0 MB');
+  });
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+  test('fmtDate 毫秒时间戳格式化', () {
+    // 2026-08-20 15:59:30 本地时区下的毫秒值由自身反推，保证一致性
+    final d = DateTime(2026, 8, 20, 15, 59, 30);
+    expect(fmtDate(d.millisecondsSinceEpoch), startsWith('2026-08-20 15:59'));
+    expect(fmtDate(0), '—');
+  });
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
-
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+  test('describe 按扩展名分类', () {
+    expect(describe('a.jpg', false).$1, '图片');
+    expect(describe('app.apk', false).$1, '安装包');
+    expect(describe('x', true).$1, '文件夹');
+    expect(describe('unknown.zzz', false).$1, '文件');
   });
 }

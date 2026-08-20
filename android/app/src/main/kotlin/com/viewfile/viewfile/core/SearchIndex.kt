@@ -41,12 +41,14 @@ class SearchIndex {
         return arr.size
     }
 
-    fun query(raw: String, limit: Int): List<Entry> {
+    fun query(raw: String, limit: Int, scope: String? = null): List<Entry> {
         val q = raw.trim().lowercase()
         if (q.isEmpty() || entries.isEmpty()) return emptyList()
+        val scopePrefix = scope?.takeIf { it.isNotEmpty() }
         val tokens = q.split(' ', '\t').filter { it.isNotEmpty() }
         val out = ArrayList<Entry>(minOf(limit, 256))
         for (e in entries) {
+            if (scopePrefix != null && !e.path.startsWith(scopePrefix)) continue
             var hit = true
             for (t in tokens) {
                 if (!e.nameLower.contains(t)) { hit = false; break }

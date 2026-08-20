@@ -8,6 +8,8 @@ import '../api/engine_api.dart';
 import '../utils/format.dart';
 import 'settings_page.dart';
 
+const kSdcard = '/storage/emulated/0';
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -21,19 +23,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Timer? _debounce;
 
   bool? _hasPerm; // null = 检查中
+  bool _root = false;
   bool _scanning = false;
   String _statusLine = '';
   int _entries = 0;
-  int _lastScanMs = 0;
-  int _loadMs = 0;
   int _resultLimit = 200;
+  bool _rootIndex = true;
+  bool _systemIndex = false;
 
+  // 浏览状态
+  String _currentDir = kSdcard;
+  List<Map<dynamic, dynamic>> _dirEntries = const [];
+  bool _loadingDir = false;
+  String? _dirError;
+
+  // 搜索状态
   List<Map<dynamic, dynamic>> _results = const [];
   bool _searching = false;
+  bool _scopeAll = false; // false = 当前目录
 
-  // 多选状态
+  // 多选状态（浏览/搜索共用）
   bool _selecting = false;
   final Set<String> _selected = {};
+
+  bool get _isSearching => _searchCtl.text.trim().isNotEmpty;
+  List<Map<dynamic, dynamic>> get _displayList => _isSearching ? _results : _dirEntries;
 
   @override
   void initState() {
@@ -46,17 +60,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    setState(() => _resultLimit = prefs.getInt('resultLimit') ?? 200);
+    setState(() {
+      _resultLimit = prefs.getInt('resultLimit') ?? 200;
+      _rootIndex = prefs.getBool('rootIndex') ?? true;
+      _systemIndex = prefs.getBool('systemIndex') ?? false;
+    });
+    if (_rootIndex) {
+      final r = await _api.hasRoot();
+      if (mounted) setState(() => _root = r);
+    }
   }
 
   Future<void> _bootstrap() async {
     final ok = await _api.hasPermission();
     setState(() => _hasPerm = ok);
     if (!ok) return;
+    _loadDir(_currentDir);
     final n = await _api.ensureIndexLoaded();
     setState(() => _entries = n);
     if (n == 0) {
-      await _api.startScan(); // 首次启动自动建索引
+      await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex);
+    } else if (await _api.needsRescan(
+        rootIndex: _rootIndex, systemIndex: _systemIndex)) {
+      // 配置变化（如 root 授权状态变化）→ 自动重扫
+      await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex);
     } else {
       _refreshStats();
     }
@@ -66,10 +93,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final s = await _api.stats();
     setState(() {
       _entries = (s['entries'] as num?)?.toInt() ?? _entries;
-      _lastScanMs = (s['lastScanMs'] as num?)?.toInt() ?? _lastScanMs;
-      _loadMs = (s['loadMs'] as num?)?.toInt() ?? _loadMs;
+      _root = s['root'] == true;
     });
   }
+
+  // ---------- 扫描事件 ----------
 
   void _onScanEvent(Map<dynamic, dynamic> e) {
     final type = e['type'] as String?;
@@ -79,22 +107,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final sec = ((e['elapsedMs'] as num?)?.toDouble() ?? 0) / 1000.0;
       setState(() {
         _scanning = true;
-        _statusLine = '已扫描 $files 个文件 · $dirs 个文件夹 · ${sec.toStringAsFixed(1)}s';
+        _statusLine = '索引中：$files 文件 · $dirs 文件夹 · ${sec.toStringAsFixed(1)}s';
       });
     } else if (type == 'done') {
-      final files = e['files'] as int? ?? 0;
-      final dirs = e['dirs'] as int? ?? 0;
-      final ms = (e['elapsedMs'] as num?)?.toInt() ?? 0;
       setState(() {
         _scanning = false;
-        _entries = files + dirs;
-        _lastScanMs = ms;
-        _loadMs = (e['loadMs'] as num?)?.toInt() ?? 0;
+        _entries = (e['files'] as int? ?? 0) + (e['dirs'] as int? ?? 0);
         _statusLine = '';
       });
-      debugPrint('[ViewFile] 扫描完成: $files 文件 + $dirs 文件夹, 耗时 $ms ms');
-      _rerun(); // 用当前关键词刷新结果
-      _selfTest();
+      _refreshStats();
+      _rerun();
     } else if (type == 'error') {
       setState(() {
         _scanning = false;
@@ -103,15 +125,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// 端到端自检：跑几个典型查询并打日志，验证搜索链路
-  Future<void> _selfTest() async {
-    const queries = ['a', '.jpg', 'android', 'pdf download'];
-    for (final q in queries) {
-      final t0 = DateTime.now();
-      final r = await _api.search(q);
-      final ms = DateTime.now().difference(t0).inMilliseconds;
-      debugPrint('[ViewFile] selfTest "$q" -> ${r.length} 条, 端到端 ${ms}ms');
-    }
+  // ---------- 浏览 ----------
+
+  Future<void> _loadDir(String path) async {
+    setState(() {
+      _currentDir = path;
+      _loadingDir = true;
+      _dirError = null;
+      _exitSelectionRaw();
+    });
+    final r = await _api.listDir(path);
+    if (!mounted || _currentDir != path) return;
+    setState(() {
+      _loadingDir = false;
+      if (r['ok'] == true) {
+        _dirEntries = List<Map<dynamic, dynamic>>.from(r['entries'] ?? const []);
+      } else {
+        _dirEntries = const [];
+        _dirError = r['error'] as String?;
+      }
+    });
+  }
+
+  void _navigateUp() {
+    if (_currentDir == kSdcard && !_root) return;
+    if (_currentDir == '/') return;
+    final parent = _currentDir.substringBeforeLast('/');
+    _loadDir(parent.isEmpty ? '/' : parent);
   }
 
   // ---------- 搜索 ----------
@@ -127,7 +167,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
     setState(() => _searching = true);
-    final r = await _api.search(q, limit: _resultLimit);
+    final r = await _api.search(q,
+        limit: _resultLimit, scope: _scopeAll ? null : _currentDir);
     if (mounted) {
       setState(() {
         _results = r;
@@ -136,10 +177,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// 操作完成后用当前关键词刷新结果
+  void _toggleScope() {
+    setState(() => _scopeAll = !_scopeAll);
+    if (_isSearching) _runQuery(_searchCtl.text);
+  }
+
+  /// 操作完成后刷新当前视图
   void _rerun() {
-    final q = _searchCtl.text;
-    if (q.trim().isNotEmpty) _runQuery(q);
+    if (_isSearching) {
+      _runQuery(_searchCtl.text);
+    } else {
+      _loadDir(_currentDir);
+    }
     _refreshStats();
   }
 
@@ -154,16 +203,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
       });
 
-  void _exitSelection() => setState(() {
-        _selecting = false;
-        _selected.clear();
-      });
+  void _exitSelection() => setState(() => _exitSelectionRaw());
+
+  void _exitSelectionRaw() {
+    _selecting = false;
+    _selected.clear();
+  }
 
   void _selectAll() => setState(() {
-        _selected.addAll(_results.map((e) => e['path'] as String));
+        _selected.addAll(_displayList.map((e) => e['path'] as String));
       });
 
-  List<Map<dynamic, dynamic>> get _selectedItems => _results
+  List<Map<dynamic, dynamic>> get _selectedItems => _displayList
       .where((e) => _selected.contains(e['path'] as String?))
       .toList(growable: false);
 
@@ -267,16 +318,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _rescan() async {
+    if (_scanning) return;
+    if (_rootIndex) {
+      final r = await _api.hasRoot(); // 刷新 root 状态（可能刚授权）
+      setState(() => _root = r);
+    }
+    await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex);
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && _hasPerm == false) {
       _bootstrap(); // 从系统授权页返回后重新检查
     }
-  }
-
-  Future<void> _rescan() async {
-    if (_scanning) return;
-    await _api.startScan();
   }
 
   @override
@@ -292,9 +347,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      canPop: !_selecting,
+      canPop: !_selecting && !(_currentDir != kSdcard && !_isSearching),
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _exitSelection();
+        if (didPop) return;
+        if (_selecting) {
+          _exitSelection();
+        } else {
+          _navigateUp();
+        }
       },
       child: Scaffold(
         appBar: _buildAppBar(),
@@ -302,10 +362,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         body: Column(
           children: [
             if (_hasPerm != true) _permissionCard(),
-            _statusCard(),
+            if (_scanning || _statusLine.isNotEmpty) _statusCard(),
             _searchField(),
+            if (!_isSearching) _pathBar(),
             if (_searching) const LinearProgressIndicator(minHeight: 2),
-            Expanded(child: _resultsList()),
+            Expanded(child: _listArea()),
           ],
         ),
       ),
@@ -321,13 +382,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ),
         title: Text('已选 ${_selected.length} 项'),
         actions: [
-          IconButton(tooltip: '全选当前结果', icon: const Icon(Icons.select_all), onPressed: _selectAll),
+          IconButton(tooltip: '全选当前列表', icon: const Icon(Icons.select_all), onPressed: _selectAll),
           IconButton(
             tooltip: '分享',
             icon: const Icon(Icons.share),
-            onPressed: _allSelectedAreFiles
-                ? () => _sharePaths(_selected.toList())
-                : null,
+            onPressed: _allSelectedAreFiles ? () => _sharePaths(_selected.toList()) : null,
           ),
           IconButton(
             tooltip: '复制路径',
@@ -342,9 +401,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ],
       );
     }
+    final title = _isSearching
+        ? '搜索${_scopeAll ? '（全盘）' : '（当前目录）'}'
+        : _dirTitle(_currentDir);
     return AppBar(
-      title: const Text('ViewFile'),
+      title: Text(title),
       actions: [
+        IconButton(
+          tooltip: '上一级',
+          onPressed: (_isSearching || (_currentDir == kSdcard && !_root) || _currentDir == '/')
+              ? null
+              : _navigateUp,
+          icon: const Icon(Icons.arrow_upward),
+        ),
         IconButton(
           tooltip: '重建索引',
           onPressed: _hasPerm == true ? _rescan : null,
@@ -354,9 +423,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  String _dirTitle(String path) {
+    if (path == kSdcard) return '内部存储';
+    if (path == '/') return '根目录 /';
+    return path.substringAfterLast('/');
+  }
+
   Widget _buildDrawer() {
     final theme = Theme.of(context);
-    final sec = _lastScanMs > 0 ? (_lastScanMs / 1000.0).toStringAsFixed(1) : '—';
     return Drawer(
       child: SafeArea(
         child: Column(
@@ -370,15 +444,40 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   children: [
                     Text('ViewFile', style: theme.textTheme.headlineSmall),
                     const SizedBox(height: 6),
-                    Text('索引 $_entries 条 · 扫描 $sec s · 载入 $_loadMs ms',
-                        style: theme.textTheme.bodySmall),
+                    Text('索引 $_entries 条', style: theme.textTheme.bodySmall),
                     const SizedBox(height: 4),
-                    Text('访问层级：免 root（T1）', style: theme.textTheme.bodySmall),
+                    Text(
+                      '访问层级：${_root ? 'root（T3）' : '免 root（T1）'}',
+                      style: theme.textTheme.bodySmall,
+                    ),
                   ],
                 ),
               ),
             ),
             const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.home_outlined),
+              title: const Text('内部存储'),
+              subtitle: Text(kSdcard, style: theme.textTheme.bodySmall),
+              onTap: () {
+                Navigator.pop(context);
+                _searchCtl.clear();
+                setState(() => _results = const []);
+                _loadDir(kSdcard);
+              },
+            ),
+            if (_root)
+              ListTile(
+                leading: const Icon(Icons.memory),
+                title: const Text('根目录 /'),
+                subtitle: Text('root 模式', style: theme.textTheme.bodySmall),
+                onTap: () {
+                  Navigator.pop(context);
+                  _searchCtl.clear();
+                  setState(() => _results = const []);
+                  _loadDir('/');
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.refresh),
               title: const Text('重建索引'),
@@ -397,8 +496,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ListTile(
               leading: const Icon(Icons.settings_outlined),
               title: const Text('设置'),
-              onTap: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const SettingsPage())),
+              onTap: () async {
+                Navigator.pop(context);
+                final changed = await Navigator.push<bool>(context,
+                    MaterialPageRoute(builder: (_) => const SettingsPage()));
+                if (changed == true) {
+                  await _loadPrefs();
+                  if (mounted && await _api.needsRescan(rootIndex: _rootIndex, systemIndex: _systemIndex)) {
+                    _rescan();
+                  }
+                }
+              },
             ),
             const Divider(height: 1),
             ListTile(
@@ -407,15 +515,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               onTap: () => showAboutDialog(
                 context: context,
                 applicationName: 'ViewFile',
-                applicationVersion: '0.1.0 (M1.5)',
+                applicationVersion: '0.2.0 (M2)',
                 applicationLegalese: 'Android 上的 Everything：即时文件搜索 + 文件管理',
               ),
-            ),
-            const Spacer(),
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text('M2 预告：root / Shizuku 全盘索引',
-                  style: theme.textTheme.bodySmall),
             ),
           ],
         ),
@@ -447,28 +549,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Widget _statusCard() {
-    final theme = Theme.of(context);
-    String text;
-    if (_scanning || _statusLine.isNotEmpty) {
-      text = _statusLine.isEmpty ? '正在扫描…' : _statusLine;
-    } else if (_entries > 0) {
-      text = '索引 $_entries 条 · 输入关键词搜索';
-    } else {
-      text = '索引为空，点击右上角刷新按钮开始扫描';
-    }
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
       child: Row(
         children: [
-          Icon(
-            _scanning ? Icons.sync : Icons.check_circle_outline,
-            size: 16,
-            color: _scanning ? theme.colorScheme.primary : Colors.tealAccent,
-          ),
+          Icon(Icons.sync, size: 16, color: Theme.of(context).colorScheme.primary),
           const SizedBox(width: 8),
           Expanded(
-            child: Text(text,
-                style: theme.textTheme.bodySmall,
+            child: Text(_statusLine.isEmpty ? '正在扫描…' : _statusLine,
+                style: Theme.of(context).textTheme.bodySmall,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis),
           ),
@@ -479,51 +568,151 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _searchField() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-      child: TextField(
-        controller: _searchCtl,
-        enabled: _hasPerm == true,
-        onChanged: _onQueryChanged,
-        decoration: InputDecoration(
-          hintText: _entries > 0 ? '文件名，多词空格 = AND' : '等待索引建立…',
-          prefixIcon: const Icon(Icons.search),
-          suffixIcon: _searchCtl.text.isEmpty
-              ? null
-              : IconButton(
-                  icon: const Icon(Icons.clear),
-                  onPressed: () {
-                    _searchCtl.clear();
-                    _onQueryChanged('');
-                  },
-                ),
-          border: const OutlineInputBorder(),
-          isDense: true,
-        ),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _searchCtl,
+              enabled: _hasPerm == true,
+              onChanged: _onQueryChanged,
+              decoration: InputDecoration(
+                hintText: _isSearching
+                    ? null
+                    : (_entries > 0 ? '在${_scopeAll ? '全盘' : '当前目录'}搜索…' : '等待索引建立…'),
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _searchCtl.text.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.clear),
+                        onPressed: () {
+                          _searchCtl.clear();
+                          _onQueryChanged('');
+                        },
+                      ),
+                border: const OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Tooltip(
+            message: _scopeAll ? '当前搜索全盘，点击改为当前目录' : '当前搜索当前目录，点击改为全盘',
+            child: ActionChip(
+              avatar: Icon(
+                _scopeAll ? Icons.public : Icons.subdirectory_arrow_right,
+                size: 18,
+              ),
+              label: Text(_scopeAll ? '全盘' : '当前目录'),
+              onPressed: _toggleScope,
+            ),
+          ),
+        ],
       ),
     );
   }
 
-  Widget _resultsList() {
-    if (_results.isEmpty) {
-      return Center(
-        child: Text(
-          _searchCtl.text.isEmpty ? '索引 $_entries 条 · 输入关键词开始搜索' : '无匹配结果',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
-      );
+  /// 面包屑路径条（浏览模式）
+  Widget _pathBar() {
+    final theme = Theme.of(context);
+    final crumbs = <(String, String)>[
+      if (_root) ('/', '/'),
+      if (_currentDir == kSdcard || _currentDir.startsWith('$kSdcard/'))
+        ('内部存储', kSdcard),
+    ];
+    if (!_currentDir.startsWith(kSdcard)) {
+      // root 区域路径：/data/data/... 等
+      var acc = '';
+      for (final seg in _currentDir.split('/')) {
+        if (seg.isEmpty) continue;
+        acc = '$acc/$seg';
+        crumbs.add((seg, acc));
+      }
+    } else {
+      var acc = kSdcard;
+      for (final seg in _currentDir.substring(kSdcard.length).split('/')) {
+        if (seg.isEmpty) continue;
+        acc = '$acc/$seg';
+        crumbs.add((seg, acc));
+      }
     }
-    return ListView.builder(
-      itemCount: _results.length,
-      itemExtent: 64,
-      itemBuilder: (context, i) => _tile(_results[i]),
+    return SizedBox(
+      height: 40,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        children: [
+          for (var i = 0; i < crumbs.length; i++)
+            Row(
+              children: [
+                if (i > 0)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 2),
+                    child: Icon(Icons.chevron_right,
+                        size: 16, color: theme.colorScheme.outline),
+                  ),
+                ActionChip(
+                  visualDensity: VisualDensity.compact,
+                  label: Text(crumbs[i].$1,
+                      style: i == crumbs.length - 1
+                          ? TextStyle(
+                              color: theme.colorScheme.primary,
+                              fontWeight: FontWeight.bold)
+                          : null),
+                  onPressed: () => _loadDir(crumbs[i].$2),
+                ),
+              ],
+            ),
+        ],
+      ),
     );
   }
 
-  Widget _tile(Map<dynamic, dynamic> e) {
+  Widget _listArea() {
+    if (_isSearching) {
+      if (_results.isEmpty) {
+        return Center(
+          child: Text('无匹配结果', style: Theme.of(context).textTheme.bodySmall),
+        );
+      }
+      return ListView.builder(
+        itemCount: _results.length,
+        itemExtent: 64,
+        itemBuilder: (context, i) => _tile(_results[i], browsing: false),
+      );
+    }
+    // 浏览模式
+    if (_loadingDir) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_dirError != null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(_dirError!, style: Theme.of(context).textTheme.bodySmall),
+            const SizedBox(height: 8),
+            FilledButton.tonal(onPressed: () => _loadDir(_currentDir), child: const Text('重试')),
+          ],
+        ),
+      );
+    }
+    if (_dirEntries.isEmpty) {
+      return Center(
+        child: Text('空文件夹', style: Theme.of(context).textTheme.bodySmall),
+      );
+    }
+    return ListView.builder(
+      itemCount: _dirEntries.length,
+      itemExtent: 64,
+      itemBuilder: (context, i) => _tile(_dirEntries[i], browsing: true),
+    );
+  }
+
+  Widget _tile(Map<dynamic, dynamic> e, {required bool browsing}) {
     final isDir = e['isDir'] == true;
     final path = e['path'] as String? ?? '';
     final name = e['name'] as String? ?? '';
-    final parent = isDir ? path : (path.split('/')..removeLast()).join('/');
     final (label, icon, color) = describe(name, isDir);
     final selected = _selected.contains(path);
 
@@ -533,7 +722,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ? Checkbox(value: selected, onChanged: (_) => _toggle(path))
           : Icon(icon, color: color),
       title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
-      subtitle: Text(parent, maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: browsing
+          ? (isDir
+              ? null
+              : Text(fmtDate(((e['mtime'] as num?)?.toInt() ?? 0)),
+                  maxLines: 1, overflow: TextOverflow.ellipsis))
+          : Text(path, maxLines: 1, overflow: TextOverflow.ellipsis),
       trailing: _selecting
           ? null
           : isDir
@@ -544,6 +738,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       onTap: () {
         if (_selecting) {
           _toggle(path);
+        } else if (isDir && browsing) {
+          _loadDir(path);
         } else {
           _showDetail(e);
         }
@@ -640,5 +836,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ),
       ),
     );
+  }
+}
+
+extension _StrX on String {
+  String substringBeforeLast(String sep) {
+    final i = lastIndexOf(sep);
+    return i <= 0 ? '' : substring(0, i);
+  }
+
+  String substringAfterLast(String sep) {
+    final i = lastIndexOf(sep);
+    return i < 0 ? this : substring(i + 1);
   }
 }

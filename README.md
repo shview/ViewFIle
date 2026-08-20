@@ -46,7 +46,19 @@
       （本机该区域有 261 条，正是 M2 Shizuku/root 要覆盖的部分）。
       坑位记录：Android 16 禁止 execSQL 执行带返回行的 PRAGMA
       （journal_mode / wal_checkpoint 必须走 rawQuery）。
-- [ ] M2 三层访问引擎接入：root（libsu）→ Shizuku → SAF 批量授权向导
+- [x] M2 root 接入 + 浏览模式（2026-08-20 真机验证通过）：
+      自研 SuShell（su -c 检测/执行/流式，兼容 Magisk/APatch）；
+      RootScanner 用 `find -print0 | xargs -0 stat` 单管道流式扫根区，
+      /data/media/0/Android 映射回 /storage/emulated/0/... 路径自动去重；
+      FileOps 删除/重命名 FUSE 失败回退 root rm/mv；
+      浏览模式（默认 /sdcard，root 可到 /，面包屑导航）；
+      搜索默认当前目录、一键切全盘。
+      Pixel 7 实测：4134 条全量重建 0.6s（Android/data 解锁 263 条 +
+      /data/data 3785 条，符号链接等非常规文件按设计跳过），
+      索引载入 17ms，范围搜索 'apk' 当前目录 4 条 vs 全盘 16 条，
+      Android/data 内文件 root 删除 + 索引同步正常。
+      已知边界：索引不感知扫描后的新建文件（M3 增量体系解决）。
+- [ ] M2.5 Shizuku 接入（免 root 大众路径）与 SAF 批量授权向导
 - [ ] M3 增量体系：打开时增量 + 前台监听 + 可选实时监听
 - [ ] M4 文件管理器：浏览/复制/移动/删除/重命名/属性/打开方式/书签
 - [ ] M5 打磨与发布：过滤/排序/主题/国际化，推送 GitHub

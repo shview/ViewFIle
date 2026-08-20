@@ -2,25 +2,29 @@ package com.viewfile.viewfile.core
 
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
-import android.os.Environment
 import android.util.Log
+import java.io.File
 import java.util.concurrent.Executors
 
 /**
- * 引擎单例：管理数据库连接、内存索引与后台线程。
- * scanExec 串行执行扫描/载入，searchExec 独立执行搜索，互不阻塞。
+ * 引擎单例：数据库连接、内存索引、三类后台线程
+ * （scan=扫描/载入，search=搜索/浏览，ops=文件写操作）。
  */
 object Engine {
     enum class State { IDLE, SCANNING, READY }
 
     @Volatile var state = State.IDLE
         private set
-    @Volatile var lastScan: Scanner.Result? = null
+    @Volatile var lastScan: Result? = null
         private set
     @Volatile var lastScanAt = 0L
         private set
     @Volatile var loadMs = 0L
         private set
+    @Volatile var rootGranted = false
+        private set
+
+    class Result(val files: Int, val dirs: Int, val elapsedMs: Long, val withRoot: Boolean)
 
     val index = SearchIndex()
 
@@ -35,8 +39,10 @@ object Engine {
         appContext = ctx.applicationContext
     }
 
-    fun externalStoragePath(): String? =
-        Environment.getExternalStorageDirectory()?.takeIf { it.canRead() }?.absolutePath
+    fun refreshRoot(): Boolean {
+        rootGranted = SuShell.getAvailable(refresh = true)
+        return rootGranted
+    }
 
     fun stats(): Map<String, Any?> = mapOf(
         "state" to state.name,
@@ -45,7 +51,17 @@ object Engine {
         "lastScanMs" to lastScan?.elapsedMs,
         "lastScanAt" to lastScanAt,
         "loadMs" to loadMs,
+        "root" to rootGranted,
     )
+
+    /** 配置指纹是否与上次扫描一致（root 开关变化时提示重扫） */
+    fun needsRescan(rootIndex: Boolean, systemIndex: Boolean): Boolean {
+        val cur = Db.getMeta(db, "scan_cfg") ?: return true
+        return cur != scanFingerprint(rootIndex, systemIndex)
+    }
+
+    private fun scanFingerprint(rootIndex: Boolean, systemIndex: Boolean) =
+        "root=$rootIndex,sys=$systemIndex,su=${SuShell.getAvailable()}"
 
     /** 已有索引则载入内存；返回条目数，并顺带把状态置为 READY */
     fun loadIndexAsync(cb: (Int) -> Unit) {
@@ -57,15 +73,24 @@ object Engine {
                 if (n > 0 && state == State.IDLE) state = State.READY
                 cb(n)
             } catch (t: Throwable) {
-                android.util.Log.e("ViewFile/Scan", "loadIndex failed", t)
+                Log.e("ViewFile/Scan", "loadIndex failed", t)
                 cb(0)
             }
         }
     }
 
-    fun scanAsync(onProgress: (Scanner.Progress) -> Unit, onDone: (Scanner.Result?, String?) -> Unit) {
-        val root = externalStoragePath()
-        if (root == null) {
+    /**
+     * 全量重建：FUSE 扫描 /storage/emulated/0（+ 可选系统分区），
+     * root 开启时追加 /data/media/0/Android（Android/data+obb 解封锁）、
+     * /data/data、/data/local/tmp，统一写入 staging 后换表。
+     */
+    fun scanAsync(
+        rootIndex: Boolean,
+        systemIndex: Boolean,
+        onProgress: (files: Int, dirs: Int, current: String) -> Unit,
+        onDone: (Result?, String?) -> Unit
+    ) {
+        if (!File("/storage/emulated/0").canRead()) {
             onDone(null, "无法读取外部存储（缺少“所有文件访问”权限）")
             return
         }
@@ -73,33 +98,79 @@ object Engine {
             onDone(null, "扫描已在进行中")
             return
         }
+        rootGranted = SuShell.getAvailable()
         state = State.SCANNING
         scanExec.execute {
             try {
-                val r = Scanner(db).scan(root, onProgress)
                 val t0 = System.currentTimeMillis()
+                Db.beginRebuild(db)
+                val writer = IndexWriter(db)
+                writer.beginTx()
+                var files = 0
+                var dirs = 0
+
+                val fuseRoots = mutableListOf("/storage/emulated/0")
+                if (systemIndex) fuseRoots += listOf("/system", "/vendor", "/product", "/odm")
+                for (root in fuseRoots) {
+                    val t1 = System.currentTimeMillis()
+                    val c = Scanner().scanInto(writer, root) { f, d, cur ->
+                        onProgress(files + f, dirs + d, cur)
+                    }
+                    files += c.files
+                    dirs += c.dirs
+                    logScanDone(root, c.files, c.dirs, System.currentTimeMillis() - t1)
+                }
+
+                var withRoot = false
+                if (rootIndex && rootGranted) {
+                    withRoot = true
+                    val areas = listOf(
+                        "/data/media/0/Android" to "/storage/emulated/0/Android",
+                        "/data/data" to "/data/data",
+                        "/data/local/tmp" to "/data/local/tmp",
+                    )
+                    val rc = RootScanner().scanInto(writer, areas) { area, f, d ->
+                        onProgress(files + f, dirs + d, area)
+                    }
+                    files += rc.files
+                    dirs += rc.dirs
+                }
+
+                writer.finishTx()
+                Db.finishRebuild(db)
+                Db.setMeta(db, "scan_cfg", scanFingerprint(rootIndex, systemIndex))
+
+                val t2 = System.currentTimeMillis()
                 val n = index.load(db)
-                loadMs = System.currentTimeMillis() - t0
+                loadMs = System.currentTimeMillis() - t2
+                val r = Result(files, dirs, System.currentTimeMillis() - t0, withRoot)
                 lastScan = r
                 lastScanAt = System.currentTimeMillis()
                 state = State.READY
-                Log.i("ViewFile/Scan", "index loaded: $n entries in ${loadMs}ms")
+                Log.i("ViewFile/Scan", "rebuild done: $files files, $dirs dirs, " +
+                        "index $n loaded in ${loadMs}ms, root=$withRoot")
                 onDone(r, null)
             } catch (t: Throwable) {
                 state = State.IDLE
+                Log.e("ViewFile/Scan", "scan failed", t)
                 onDone(null, t.message ?: t.toString())
             }
         }
     }
 
-    fun searchAsync(query: String, limit: Int, cb: (List<SearchIndex.Entry>) -> Unit) {
+    fun searchAsync(query: String, limit: Int, scope: String?, cb: (List<SearchIndex.Entry>) -> Unit) {
         searchExec.execute {
             val t0 = System.nanoTime()
-            val res = index.query(query, limit)
+            val res = index.query(query, limit, scope)
             val ms = (System.nanoTime() - t0) / 1_000_000.0
-            Log.d("ViewFile/Search", "'$query' -> ${res.size} hits in ${"%.2f".format(ms)}ms")
+            Log.d("ViewFile/Search",
+                "'$query' scope=${scope ?: "ALL"} -> ${res.size} hits in ${"%.2f".format(ms)}ms")
             cb(res)
         }
+    }
+
+    fun listDirAsync(path: String, cb: (Map<String, Any?>) -> Unit) {
+        searchExec.execute { cb(Fs.listDir(path)) }
     }
 
     /**
