@@ -32,6 +32,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   int _resultLimit = 200;
   bool _rootIndex = true;
   bool _systemIndex = false;
+  bool _deepData = false;
 
   // 浏览状态
   String _currentDir = kSdcard;
@@ -77,6 +78,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _resultLimit = prefs.getInt('resultLimit') ?? 200;
       _rootIndex = prefs.getBool('rootIndex') ?? true;
       _systemIndex = prefs.getBool('systemIndex') ?? false;
+      _deepData = prefs.getBool('deepDataIndex') ?? false;
       _sortKey = prefs.getString('sortKey') ?? 'name';
       _sortDesc = prefs.getBool('sortDesc') ?? false;
       _showHidden = prefs.getBool('showHidden') ?? false;
@@ -101,11 +103,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() => _entries = n);
     _loadDir(_currentDir);
     if (n == 0) {
-      await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex);
+      await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex, deepData: _deepData);
     } else if (await _api.needsRescan(
         rootIndex: _rootIndex, systemIndex: _systemIndex)) {
       // 配置变化（如 root 授权状态变化）→ 自动重扫
-      await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex);
+      await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex, deepData: _deepData);
     } else {
       _refreshStats();
       _autoSync();
@@ -115,7 +117,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   /// 打开 app 时的静默增量对账
   Future<void> _autoSync() async {
-    final r = await _api.startSync(rootIndex: _rootIndex);
+    final r = await _api.startSync(rootIndex: _rootIndex, deepData: _deepData);
     if (!mounted || r['ok'] != true) return;
     final a = (r['added'] as num?)?.toInt() ?? 0;
     final rm = (r['removed'] as num?)?.toInt() ?? 0;
@@ -183,7 +185,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void _ensureWatcher() {
     if (_watcherStarted || _hasPerm != true) return;
     _watcherStarted = true;
-    _api.startWatcher(rootIndex: _rootIndex);
+    _api.startWatcher(rootIndex: _rootIndex, deepData: _deepData);
   }
 
   void _maybeStopWatcher() {
@@ -424,11 +426,34 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _rescan() async {
     if (_scanning) return;
+    // 二次确认：全量重建耗时与库规模成正比
+    final lastSec = _lastScanMs > 0 ? '（上次约 ${(_lastScanMs / 1000).toStringAsFixed(0)} 秒）' : '';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('重建索引？'),
+        content: Text(
+          '将放弃现有索引并全量重扫$lastSec，'
+          '期间搜索结果不更新、文件操作暂不可用。\n当前索引 $_entries 条。',
+          style: const TextStyle(fontSize: 14),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('开始')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
     if (_rootIndex) {
       final r = await _api.hasRoot(); // 刷新 root 状态（可能刚授权）
       setState(() => _root = r);
     }
-    await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex);
+    // 立即进入扫描态：进度条与计数马上可见，不等首个进度事件
+    setState(() {
+      _scanning = true;
+      _statusLine = '正在启动扫描…';
+    });
+    await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex, deepData: _deepData);
   }
 
   @override
@@ -664,7 +689,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     MaterialPageRoute(builder: (_) => const SettingsPage()));
                 if (changed == true) {
                   await _loadPrefs();
-                  if (mounted && await _api.needsRescan(rootIndex: _rootIndex, systemIndex: _systemIndex)) {
+                  if (mounted && await _api.needsRescan(rootIndex: _rootIndex, systemIndex: _systemIndex, deepData: _deepData)) {
                     _rescan();
                   }
                 }

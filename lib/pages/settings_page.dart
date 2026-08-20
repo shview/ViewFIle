@@ -16,6 +16,7 @@ class _SettingsPageState extends State<SettingsPage> {
   int _resultLimit = 200;
   bool _rootIndex = true;
   bool _systemIndex = false;
+  bool _deepData = false;
   bool _showHidden = false;
   bool _rootGranted = false;
   bool _shizukuGranted = false;
@@ -33,6 +34,7 @@ class _SettingsPageState extends State<SettingsPage> {
         _resultLimit = p.getInt('resultLimit') ?? 200;
         _rootIndex = p.getBool('rootIndex') ?? true;
         _systemIndex = p.getBool('systemIndex') ?? false;
+        _deepData = p.getBool('deepDataIndex') ?? false;
         _showHidden = p.getBool('showHidden') ?? false;
       });
     });
@@ -207,6 +209,18 @@ class _SettingsPageState extends State<SettingsPage> {
               onChanged: (v) {
                 setState(() => _rootIndex = v);
                 _save('rootIndex', v);
+              },
+            ),
+            SwitchListTile(
+              secondary: const Icon(Icons.account_tree_outlined),
+              title: const Text('深度索引 /data/data'),
+              subtitle: const Text(
+                  '默认只索引两层（应用概览）。深度索引会纳入应用全部私有文件，'
+                  '重度应用（如微信）可达百万条，内存/空间/耗时显著增加'),
+              value: _deepData,
+              onChanged: (v) {
+                setState(() => _deepData = v);
+                _save('deepDataIndex', v);
               },
             ),
             SwitchListTile(

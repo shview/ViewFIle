@@ -42,10 +42,20 @@ object SuShell {
         return ok
     }
 
+    /**
+     * su 命令包装：进入 PID1 的挂载命名空间再执行。
+     * Magisk su 默认继承调用方（app）的命名空间，部分 ROM（实测 ColorOS 15）
+     * 在 app 命名空间里对 /data/data 是过滤视图——su 也只能看到自己与 GMS，
+     * 扫描与浏览都会缺失。nsenter 后视图与 adb shell 一致。
+     */
+    private fun suArgs(cmd: String): Array<String> =
+        // "--" 必须：否则 toybox nsenter 会把 sh 的 -c 当成自己的选项
+        arrayOf("su", "-c", "nsenter -t 1 -m -- /system/bin/sh -c " + shq(cmd))
+
     /** 常规执行（输出量小的命令） */
     fun run(cmd: String, timeoutMs: Long = 15000): Result {
         return try {
-            val p = ProcessBuilder("su", "-c", cmd).start()
+            val p = ProcessBuilder(*suArgs(cmd)).start()
             val errThread = Thread { p.errorStream.bufferedReader().use { it.readText() } }
             errThread.isDaemon = true
             errThread.start()
@@ -67,7 +77,7 @@ object SuShell {
      */
     fun runStream(cmd: String, timeoutMs: Long = 600000, onLine: (String) -> Unit): Result {
         return try {
-            val p = ProcessBuilder("su", "-c", cmd).start()
+            val p = ProcessBuilder(*suArgs(cmd)).start()
             val errBuilder = StringBuilder()
             val errThread = Thread {
                 p.errorStream.bufferedReader().forEachLine { errBuilder.appendLine(it) }

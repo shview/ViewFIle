@@ -46,6 +46,8 @@ object Fs {
             "find ${shq(raw)} -mindepth 1 -maxdepth 1 -print0 | xargs -0 -r stat -c '%n|%F|%s|%Y' 2>/dev/null"
         )
         if (!res.ok) return err("读取失败: ${res.err.take(120).ifBlank { "rc=${res.code}" }}")
+        android.util.Log.i("ViewFile/Fs",
+            "rootListing $displayPath tier=${PrivShell.tier()} lines=${res.out.lineSequence().count()} head=${res.out.take(160)}")
         val entries: List<Map<String, Any?>> = res.out.lineSequence()
             .mapNotNull(RootScanner::parseStatLine)
             .map { e ->

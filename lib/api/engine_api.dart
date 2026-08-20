@@ -33,26 +33,31 @@ class EngineApi {
   Future<int> ensureIndexLoaded() async =>
       await _m.invokeMethod<int>('ensureIndexLoaded') ?? 0;
 
-  Future<bool> needsRescan({bool rootIndex = true, bool systemIndex = false}) async =>
+  Future<bool> needsRescan(
+      {bool rootIndex = true, bool systemIndex = false, bool deepData = false}) async =>
       await _m.invokeMethod<bool>('needsRescan', {
         'rootIndex': rootIndex,
         'systemIndex': systemIndex,
+        'deepData': deepData,
       }) ?? true;
 
-  Future<void> startScan({bool rootIndex = true, bool systemIndex = false}) =>
+  Future<void> startScan(
+      {bool rootIndex = true, bool systemIndex = false, bool deepData = false}) =>
       _m.invokeMethod('startScan', {
         'rootIndex': rootIndex,
         'systemIndex': systemIndex,
+        'deepData': deepData,
       });
 
   /// 打开 app 时的增量对账，返回 {ok, added, removed, updated, elapsedMs}
-  Future<Map<String, dynamic>> startSync({bool rootIndex = true}) async =>
-      Map<String, dynamic>.from(
-          await _m.invokeMethod('startSync', {'rootIndex': rootIndex}));
+  Future<Map<String, dynamic>> startSync(
+      {bool rootIndex = true, bool deepData = false}) async =>
+      Map<String, dynamic>.from(await _m.invokeMethod(
+          'startSync', {'rootIndex': rootIndex, 'deepData': deepData}));
 
   /// 前台实时监听（变化→自动增量同步，结果走 scanEvents 的 synced 事件）
-  Future<void> startWatcher({bool rootIndex = true}) =>
-      _m.invokeMethod('startWatcher', {'rootIndex': rootIndex});
+  Future<void> startWatcher({bool rootIndex = true, bool deepData = false}) =>
+      _m.invokeMethod('startWatcher', {'rootIndex': rootIndex, 'deepData': deepData});
 
   Future<void> stopWatcher() => _m.invokeMethod('stopWatcher');
 

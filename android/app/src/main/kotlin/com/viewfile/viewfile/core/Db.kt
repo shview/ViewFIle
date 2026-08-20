@@ -12,15 +12,23 @@ object Db {
     private const val COLS =
         "path TEXT PRIMARY KEY, parent TEXT NOT NULL, name TEXT NOT NULL, " +
         "is_dir INTEGER NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL"
+    private const val SCHEMA = "v2-worowid" // WITHOUT ROWID：行存进主键树，省一份路径索引
 
     fun open(context: Context): SQLiteDatabase {
         val db = context.openOrCreateDatabase("index.db", Context.MODE_PRIVATE, null)
         // journal_mode / wal_checkpoint 会返回结果行，A16 起必须走 rawQuery
         pragma(db, "PRAGMA journal_mode=WAL")
         db.execSQL("PRAGMA synchronous=NORMAL")
-        db.execSQL("CREATE TABLE IF NOT EXISTS files($COLS)")
         db.execSQL("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
-        // 增量同步按 parent 查子项，22 万行无索引=每次全表扫
+        if (getMeta(db, "schema") != SCHEMA) {
+            // 旧结构（含 rowid 主键树）：整体废弃，首次打开自动全量重建
+            db.execSQL("DROP TABLE IF EXISTS files")
+            db.execSQL("DROP TABLE IF EXISTS files_staging")
+            db.execSQL("DELETE FROM meta WHERE k='scan_cfg'")
+            setMeta(db, "schema", SCHEMA)
+        }
+        db.execSQL("CREATE TABLE IF NOT EXISTS files($COLS) WITHOUT ROWID")
+        // 增量同步按 parent 查子项，无索引=全表扫（name 不建索引：搜索全在内存）
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent)")
         return db
     }
@@ -40,7 +48,7 @@ object Db {
 
     fun beginRebuild(db: SQLiteDatabase) {
         db.execSQL("DROP TABLE IF EXISTS files_staging")
-        db.execSQL("CREATE TABLE files_staging($COLS)")
+        db.execSQL("CREATE TABLE files_staging($COLS) WITHOUT ROWID")
     }
 
     fun finishRebuild(db: SQLiteDatabase) {
@@ -52,16 +60,16 @@ object Db {
         } finally {
             db.endTransaction()
         }
-        // 插入全部完成后再建索引，避免逐行维护 B 树
-        db.execSQL("DROP INDEX IF EXISTS idx_files_name")
-        db.execSQL("DROP INDEX IF EXISTS idx_files_parent")
-        db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent)")
         pragma(db, "PRAGMA wal_checkpoint(TRUNCATE)")
+        // 回收 staging 换表留下的空闲页（WITHOUT ROWID 后库显著变小）
+        db.execSQL("VACUUM")
     }
 }
 
-/** 批量写入器：默认写 staging（全量重建），可指定表做增量写入 */
+/** 批量写入器：默认写 staging（全量重建），可指定表做增量写入。
+ *  注意：add 必须与 beginTx 在同一线程调用（写事务绑定唯一连接，
+ *  跨线程插入会永久等待连接——并行扫描采用“采集入队、单线程落库”）。 */
 class IndexWriter(
     private val db: SQLiteDatabase,
     private val table: String = "files_staging"

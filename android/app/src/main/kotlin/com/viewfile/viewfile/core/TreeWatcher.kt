@@ -79,7 +79,8 @@ class TreeWatcher(
             val p = if (useShizuku) {
                 ShizukuShell.newProcess(arrayOf(bin))
             } else {
-                ProcessBuilder("su", "-c", shq(bin)).start()
+                // nsenter 进 PID1 命名空间：同 SuShell，避免 app 视图过滤
+                ProcessBuilder("su", "-c", "nsenter -t 1 -m " + shq(bin)).start()
             }
             rootProc = p
             // 喂目录清单（原始路径）

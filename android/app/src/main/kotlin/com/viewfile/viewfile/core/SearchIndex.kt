@@ -36,19 +36,19 @@ class SearchIndex {
             if (c.moveToFirst()) c.getInt(0) else 0
         }
         val list = ArrayList<Entry>(total + 16)
-        var lastId = -1L
+        var lastPath = ""
         while (true) {
             val before = list.size
             db.rawQuery(
-                "SELECT rowid,path,name,is_dir,size,mtime FROM files WHERE rowid>? ORDER BY rowid LIMIT 8000",
-                arrayOf(lastId.toString())
+                "SELECT path,name,is_dir,size,mtime FROM files WHERE path>? ORDER BY path LIMIT 8000",
+                arrayOf(lastPath)
             ).use { c ->
                 while (c.moveToNext()) {
-                    lastId = c.getLong(0)
-                    val name = c.getString(2)
+                    lastPath = c.getString(0)
+                    val name = c.getString(1)
                     list.add(
-                        Entry(c.getString(1), name, fastLower(name),
-                            c.getInt(3) == 1, c.getLong(4), c.getLong(5))
+                        Entry(lastPath, name, fastLower(name),
+                            c.getInt(2) == 1, c.getLong(3), c.getLong(4))
                     )
                 }
             }

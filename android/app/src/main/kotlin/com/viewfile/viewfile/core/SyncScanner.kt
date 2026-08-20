@@ -18,7 +18,7 @@ class SyncScanner(private val db: SQLiteDatabase) {
         private const val MAX_RELIST_PER_SYNC = 2000
     }
 
-    fun sync(fuseRoot: String, rootAreas: List<Pair<String, String>>): Result {
+    fun sync(fuseRoot: String, rootAreas: List<Area>): Result {
         val t0 = System.currentTimeMillis()
         var added = 0
         var removed = 0
@@ -118,8 +118,9 @@ class SyncScanner(private val db: SQLiteDatabase) {
      * 2) 与库中不符/新增的目录 → 重新列出其直接子项并 diff
      * 3) 库里有、实际没有的目录 → 整树删除
      */
-    private fun syncRootArea(area: Pair<String, String>): Triple<Int, Int, Int> {
-        val (raw, display) = area
+    private fun syncRootArea(area: Area): Triple<Int, Int, Int> {
+        val raw = area.raw
+        val display = area.display
         var added = 0
         var removed = 0
         var updated = 0
@@ -135,7 +136,7 @@ class SyncScanner(private val db: SQLiteDatabase) {
 
         val actual = HashMap<String, Long>(dirMtimes.size + 64)
         val dirRes = PrivShell.runStream(
-            "find ${shq(raw)} -type d -print0 | xargs -0 -r stat -c '%n|%Y' 2>/dev/null"
+            "find ${shq(raw)}${if (area.depth > 0) " -maxdepth ${area.depth}" else ""} -type d -print0 | xargs -0 -r stat -c '%n|%Y' 2>/dev/null"
         ) { line ->
             val i = line.lastIndexOf('|')
             if (i <= 0) return@runStream

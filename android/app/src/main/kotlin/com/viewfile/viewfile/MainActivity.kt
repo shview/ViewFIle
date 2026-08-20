@@ -32,8 +32,15 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "hasPermission" -> result.success(hasStoragePermission())
                     "requestPermission" -> { requestStoragePermission(); result.success(null) }
-                    "hasRoot" -> result.success(Engine.refreshRoot())
-                    "hasShizuku" -> result.success(ShizukuShell.getAvailable(refresh = true))
+                    "hasRoot" -> Engine.refreshRootAsync { ok ->
+                        main.post { result.success(ok) }
+                    }
+                    "hasShizuku" -> {
+                        Thread {
+                            val ok = ShizukuShell.getAvailable(refresh = true)
+                            main.post { result.success(ok) }
+                        }.start()
+                    }
                     "shizukuBinderAlive" -> result.success(ShizukuShell.isBinderAlive())
                     "requestShizuku" -> {
                         result.success(ShizukuShell.requestPermission())
@@ -45,16 +52,18 @@ class MainActivity : FlutterActivity() {
                     "needsRescan" -> {
                         val rootIndex = call.argument<Boolean>("rootIndex") ?: true
                         val systemIndex = call.argument<Boolean>("systemIndex") ?: false
-                        Engine.needsRescanAsync(rootIndex, systemIndex) { need ->
+                        val deepData = call.argument<Boolean>("deepData") ?: false
+                        Engine.needsRescanAsync(rootIndex, systemIndex, deepData) { need ->
                             main.post { result.success(need) }
                         }
                     }
                     "startScan" -> {
                         val rootIndex = call.argument<Boolean>("rootIndex") ?: true
                         val systemIndex = call.argument<Boolean>("systemIndex") ?: false
+                        val deepData = call.argument<Boolean>("deepData") ?: false
                         scanStartMs = System.currentTimeMillis()
                         Engine.scanAsync(
-                            rootIndex, systemIndex,
+                            rootIndex, systemIndex, deepData,
                             onProgress = { files, dirs, current ->
                                 main.post {
                                     scanSink?.success(mapOf(
@@ -139,13 +148,15 @@ class MainActivity : FlutterActivity() {
                     }
                     "startSync" -> {
                         val rootIndex = call.argument<Boolean>("rootIndex") ?: true
-                        Engine.syncAsync(rootIndex) { m ->
+                        val deepData = call.argument<Boolean>("deepData") ?: false
+                        Engine.syncAsync(rootIndex, deepData) { m ->
                             main.post { result.success(m) }
                         }
                     }
                     "startWatcher" -> {
                         val rootIndex = call.argument<Boolean>("rootIndex") ?: true
-                        Engine.startWatcher(rootIndex) { m ->
+                        val deepData = call.argument<Boolean>("deepData") ?: false
+                        Engine.startWatcher(rootIndex, deepData) { m ->
                             main.post {
                                 scanSink?.success(mapOf("type" to "synced") + m)
                             }

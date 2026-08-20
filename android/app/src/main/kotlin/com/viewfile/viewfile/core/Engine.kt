@@ -44,6 +44,11 @@ object Engine {
         return rootGranted
     }
 
+    /** root 探测可能耗时（授权框/超时），异步执行避免主线程 ANR */
+    fun refreshRootAsync(cb: (Boolean) -> Unit) {
+        Thread({ cb(refreshRoot()) }, "vf-root-check").start()
+    }
+
     fun stats(): Map<String, Any?> = mapOf(
         "state" to state.name,
         "entries" to index.size(),
@@ -57,17 +62,17 @@ object Engine {
     )
 
     /** 配置指纹是否与上次扫描一致（root 开关变化时提示重扫）；排队后台执行避免与载入争抢连接 */
-    fun needsRescanAsync(rootIndex: Boolean, systemIndex: Boolean, cb: (Boolean) -> Unit) {
-        scanExec.execute { cb(needsRescan(rootIndex, systemIndex)) }
+    fun needsRescanAsync(rootIndex: Boolean, systemIndex: Boolean, deepData: Boolean, cb: (Boolean) -> Unit) {
+        scanExec.execute { cb(needsRescan(rootIndex, systemIndex, deepData)) }
     }
 
-    fun needsRescan(rootIndex: Boolean, systemIndex: Boolean): Boolean {
+    fun needsRescan(rootIndex: Boolean, systemIndex: Boolean, deepData: Boolean): Boolean {
         val cur = Db.getMeta(db, "scan_cfg") ?: return true
-        return cur != scanFingerprint(rootIndex, systemIndex)
+        return cur != scanFingerprint(rootIndex, systemIndex, deepData)
     }
 
-    private fun scanFingerprint(rootIndex: Boolean, systemIndex: Boolean) =
-        "root=$rootIndex,sys=$systemIndex,tier=${PrivShell.tier()}"
+    private fun scanFingerprint(rootIndex: Boolean, systemIndex: Boolean, deepData: Boolean) =
+        "root=$rootIndex,sys=$systemIndex,deep=$deepData,tier=${PrivShell.tier()}"
 
     /** 已有索引则载入内存；返回条目数，并顺带把状态置为 READY */
     fun loadIndexAsync(cb: (Int) -> Unit) {
@@ -94,26 +99,37 @@ object Engine {
     fun scanAsync(
         rootIndex: Boolean,
         systemIndex: Boolean,
+        deepData: Boolean,
         onProgress: (files: Int, dirs: Int, current: String) -> Unit,
         onDone: (Result?, String?) -> Unit
     ) {
-        if (!File("/storage/emulated/0").canRead()) {
-            onDone(null, "无法读取外部存储（缺少“所有文件访问”权限）")
-            return
-        }
-        if (state == State.SCANNING) {
-            onDone(null, "扫描已在进行中")
-            return
-        }
-        rootGranted = SuShell.getAvailable(refresh = true)
-        ShizukuShell.getAvailable(refresh = true)
-        state = State.SCANNING
+        // 前置检查（含 su 探测，最长数秒）全部后台执行，避免阻塞主线程触发 ANR
         scanExec.execute {
+            if (!File("/storage/emulated/0").canRead()) {
+                onDone(null, "无法读取外部存储（缺少“所有文件访问”权限）")
+                return@execute
+            }
+            if (state == State.SCANNING) {
+                onDone(null, "扫描已在进行中")
+                return@execute
+            }
+            rootGranted = SuShell.getAvailable(refresh = true)
+            ShizukuShell.getAvailable(refresh = true)
+            state = State.SCANNING
+            var txOpen = false
             try {
                 val t0 = System.currentTimeMillis()
+                // 防御：上次异常可能让连接残留事务，导致 PRAGMA 报
+                // “Safety level may not be changed inside a transaction”
+                if (db.inTransaction()) {
+                    Log.w("ViewFile/Scan", "stale transaction detected, ending")
+                    db.setTransactionSuccessful()
+                    db.endTransaction()
+                }
                 Db.beginRebuild(db)
                 val writer = IndexWriter(db)
                 writer.beginTx()
+                txOpen = true
                 var files = 0
                 var dirs = 0
 
@@ -131,7 +147,7 @@ object Engine {
 
                 var withRoot = false
                 // root 区域按特权层级决定：ROOT 全量，SHIZUKU 仅 Android 区+tmp
-                val areas = rootAreas()
+                val areas = rootAreas(deepData)
                 if (rootIndex && areas.isNotEmpty()) {
                     withRoot = true
                     val rc = RootScanner().scanInto(writer, areas) { area, f, d ->
@@ -142,8 +158,14 @@ object Engine {
                 }
 
                 writer.finishTx()
-                Db.finishRebuild(db)
-                Db.setMeta(db, "scan_cfg", scanFingerprint(rootIndex, systemIndex))
+                txOpen = false
+                try {
+                    Db.finishRebuild(db)
+                } catch (t: Throwable) {
+                    // VACUUM 等收尾失败不致命：索引本体已换表完成
+                    Log.w("ViewFile/Scan", "finishRebuild tail failed: ${t.message}")
+                }
+                Db.setMeta(db, "scan_cfg", scanFingerprint(rootIndex, systemIndex, deepData))
 
                 val t2 = System.currentTimeMillis()
                 val n = index.load(db)
@@ -156,6 +178,12 @@ object Engine {
                         "index $n loaded in ${loadMs}ms, root=$withRoot")
                 onDone(r, null)
             } catch (t: Throwable) {
+                if (txOpen) {
+                    try {
+                        db.setTransactionSuccessful() // 写入不完整也先结束事务，避免连接卡死
+                        db.endTransaction()
+                    } catch (_: Throwable) {}
+                }
                 state = State.IDLE
                 Log.e("ViewFile/Scan", "scan failed", t)
                 onDone(null, t.message ?: t.toString())
@@ -179,22 +207,27 @@ object Engine {
         searchExec.execute { cb(Fs.listDir(path)) }
     }
 
-    private fun rootAreas(): List<Pair<String, String>> = when (PrivShell.tier()) {
+    /**
+     * root 扫描区域。/data/data 默认只索引两层（应用目录+一级子目录）：
+     * 深层是微信等应用的海量小文件（实测一台机 112 万条），全量索引
+     * 内存 700MB/库 600MB+，得不偿失；浏览与按应用概览不受影响。
+     */
+    private fun rootAreas(deepData: Boolean): List<Area> = when (PrivShell.tier()) {
         PrivShell.Tier.ROOT -> listOf(
-            "/data/media/0/Android" to "/storage/emulated/0/Android",
-            "/data/data" to "/data/data",
-            "/data/local/tmp" to "/data/local/tmp",
+            Area("/data/media/0/Android", "/storage/emulated/0/Android"),
+            Area("/data/data", "/data/data", depth = if (deepData) 0 else 2),
+            Area("/data/local/tmp", "/data/local/tmp"),
         )
         // Shizuku 的 shell 身份可读 Android/data 原始路径与 tmp，不能读 /data/data
         PrivShell.Tier.SHIZUKU -> listOf(
-            "/data/media/0/Android" to "/storage/emulated/0/Android",
-            "/data/local/tmp" to "/data/local/tmp",
+            Area("/data/media/0/Android", "/storage/emulated/0/Android"),
+            Area("/data/local/tmp", "/data/local/tmp"),
         )
         PrivShell.Tier.NONE -> emptyList()
     }
 
     /** 打开 app 时的增量对账：目录 mtime 比对 + root 区刷新，完成后重载内存索引 */
-    fun syncAsync(rootIndex: Boolean, cb: (Map<String, Any?>) -> Unit) {
+    fun syncAsync(rootIndex: Boolean, deepData: Boolean, cb: (Map<String, Any?>) -> Unit) {
         if (state == State.SCANNING) {
             cb(mapOf("ok" to false, "error" to "扫描进行中"))
             return
@@ -202,7 +235,7 @@ object Engine {
         scanExec.execute {
             val out = try {
                 state = State.SCANNING
-                val areas = if (rootIndex) rootAreas() else emptyList()
+                val areas = if (rootIndex) rootAreas(deepData) else emptyList()
                 val r = SyncScanner(db).sync("/storage/emulated/0", areas)
                 state = State.READY
                 // 无变化不重载索引（大库重载是秒级开销）
@@ -229,11 +262,11 @@ object Engine {
     private var watcher: TreeWatcher? = null
 
     /** 前台实时监听：变化触发增量对账，结果通过 onSynced 回调 */
-    fun startWatcher(rootIndex: Boolean, onSynced: (Map<String, Any?>) -> Unit) {
+    fun startWatcher(rootIndex: Boolean, deepData: Boolean, onSynced: (Map<String, Any?>) -> Unit) {
         stopWatcher()
         val tier = PrivShell.tier()
         val w = TreeWatcher(appContext, db, onDirty = {
-            syncAsync(rootIndex) { m ->
+            syncAsync(rootIndex, deepData) { m ->
                 if (m["ok"] == true) {
                     onSynced(m)
                     // 目录集合可能变化（新建目录）：重启特权辅助进程以覆盖
