@@ -121,6 +121,19 @@ class MainActivity : FlutterActivity() {
                             main.post { result.success(m) }
                         }
                     }
+                    "startWatcher" -> {
+                        val rootIndex = call.argument<Boolean>("rootIndex") ?: true
+                        Engine.startWatcher(rootIndex) { m ->
+                            main.post {
+                                scanSink?.success(mapOf("type" to "synced") + m)
+                            }
+                        }
+                        result.success(null)
+                    }
+                    "stopWatcher" -> {
+                        Engine.stopWatcher()
+                        result.success(null)
+                    }
                     "open" -> {
                         val paths = call.argument<List<String>>("paths") ?: emptyList()
                         result.success(if (paths.size == 1) FileOps.open(this, paths[0]) else "一次只能打开一个文件")

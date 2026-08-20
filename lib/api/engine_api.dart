@@ -36,6 +36,12 @@ class EngineApi {
       Map<String, dynamic>.from(
           await _m.invokeMethod('startSync', {'rootIndex': rootIndex}));
 
+  /// 前台实时监听（变化→自动增量同步，结果走 scanEvents 的 synced 事件）
+  Future<void> startWatcher({bool rootIndex = true}) =>
+      _m.invokeMethod('startWatcher', {'rootIndex': rootIndex});
+
+  Future<void> stopWatcher() => _m.invokeMethod('stopWatcher');
+
   Future<List<Map<dynamic, dynamic>>> search(String query,
       {int limit = 200, List<String>? scopes}) async {
     final list = await _m.invokeMethod<List<dynamic>>('search', {

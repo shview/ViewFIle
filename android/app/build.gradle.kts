@@ -27,6 +27,22 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // vfwatch 需要落盘为可执行文件（su -c 运行），不能用 APK 内直载
+            useLegacyPackaging = true
+        }
     }
 
     buildTypes {

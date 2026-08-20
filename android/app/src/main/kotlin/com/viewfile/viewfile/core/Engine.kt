@@ -210,6 +210,31 @@ object Engine {
         }
     }
 
+    private var watcher: TreeWatcher? = null
+
+    /** 前台实时监听：变化触发增量对账，结果通过 onSynced 回调 */
+    fun startWatcher(rootIndex: Boolean, onSynced: (Map<String, Any?>) -> Unit) {
+        stopWatcher()
+        val w = TreeWatcher(appContext, db, onDirty = {
+            syncAsync(rootIndex) { m ->
+                if (m["ok"] == true) {
+                    onSynced(m)
+                    // 目录集合可能变化（新建目录）：重启 root 辅助进程以覆盖
+                    watcher?.refreshRootProcess()
+                }
+            }
+        })
+        w.start(SuShell.getAvailable() && rootIndex)
+        watcher = w
+    }
+
+    fun stopWatcher() {
+        watcher?.stop()
+        watcher = null
+    }
+
+    fun isWatching(): Boolean = watcher?.isRunning() == true
+
     /**
      * 写操作（重命名/删除）：串行执行，扫描期间拒绝；
      * 成功后自动重载内存索引，把数据库的最新状态带给 UI。

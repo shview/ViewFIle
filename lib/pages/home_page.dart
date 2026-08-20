@@ -8,6 +8,7 @@ import '../api/engine_api.dart';
 import '../utils/format.dart';
 import 'apps_page.dart';
 import 'settings_page.dart';
+import 'tips_page.dart';
 
 const kSdcard = '/storage/emulated/0';
 
@@ -104,6 +105,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _refreshStats();
       _autoSync();
     }
+    _ensureWatcher();
   }
 
   /// 打开 app 时的静默增量对账
@@ -149,12 +151,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       });
       _refreshStats();
       _rerun();
+      _ensureWatcher(); // 全量重建后目录集合变化，重启监听
+    } else if (type == 'synced') {
+      // 前台监听触发的自动增量同步
+      final a = (e['added'] as num?)?.toInt() ?? 0;
+      final rm = (e['removed'] as num?)?.toInt() ?? 0;
+      final ms = (e['elapsedMs'] as num?)?.toInt() ?? 0;
+      if (a + rm > 0) {
+        debugPrint('[ViewFile] 前台自动同步: +$a -$rm, ${ms}ms');
+        _refreshStats();
+        _rerun();
+      }
     } else if (type == 'error') {
       setState(() {
         _scanning = false;
         _statusLine = '扫描失败: ${e['error']}';
       });
     }
+  }
+
+  bool _watcherStarted = false;
+
+  void _ensureWatcher() {
+    if (_watcherStarted || _hasPerm != true) return;
+    _watcherStarted = true;
+    _api.startWatcher(rootIndex: _rootIndex);
+  }
+
+  void _maybeStopWatcher() {
+    if (!_watcherStarted) return;
+    _watcherStarted = false;
+    _api.stopWatcher();
   }
 
   // ---------- 浏览 ----------
@@ -374,8 +401,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _hasPerm == false) {
-      _bootstrap(); // 从系统授权页返回后重新检查
+    if (state == AppLifecycleState.resumed) {
+      if (_hasPerm == false) {
+        _bootstrap(); // 从系统授权页返回后重新检查
+      }
+      _ensureWatcher(); // 前台实时监听
+    } else if (state == AppLifecycleState.paused) {
+      _maybeStopWatcher(); // 退出前台即停，不耗电
     }
   }
 
@@ -599,6 +631,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     _rescan();
                   }
                 }
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.tips_and_updates_outlined),
+              title: const Text('使用提示与已知限制'),
+              subtitle: Text('访问分层 · 实时性边界 · 操作风险',
+                  style: theme.textTheme.bodySmall),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(context,
+                    MaterialPageRoute(builder: (_) => const TipsPage()));
               },
             ),
             const Divider(height: 1),
