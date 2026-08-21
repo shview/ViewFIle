@@ -229,15 +229,24 @@ class MainActivity : FlutterActivity() {
     }
 }
 
-private fun SearchIndex.Entry.toMap(): Map<String, Any?> = buildMap {
-    put("path", path)
-    put("name", name)
-    put("isDir", isDir)
-    put("size", size)
-    put("mtime", mtime)
-    if (isDir) Engine.index.statsFor(path)?.let {
-        put("dirCount", it.direct)
-        put("dirSize", it.recSize)
+private fun SearchIndex.Hit.toMap(): Map<String, Any?> {
+    val ix = Engine.index
+    val path = ix.pathOf(this)
+    val name = ix.nameOf(this)
+    val isDir = ix.isDirOf(this)
+    val size = ix.sizeOf(this)
+    val mtime = ix.mtimeOf(this)
+    val st = if (isDir) ix.statsFor(path) else null
+    return buildMap {
+        put("path", path)
+        put("name", name)
+        put("isDir", isDir)
+        put("size", size)
+        put("mtime", mtime)
+        if (st != null) {
+            put("dirCount", st.direct)
+            put("dirSize", st.recSize)
+        }
     }
 }
 

@@ -206,7 +206,7 @@ object Engine {
         }
     }
 
-    fun searchAsync(query: String, limit: Int, scopes: List<String>?, cb: (List<SearchIndex.Entry>) -> Unit) {
+    fun searchAsync(query: String, limit: Int, scopes: List<String>?, cb: (List<SearchIndex.Hit>) -> Unit) {
         searchExec.execute {
             val t0 = System.nanoTime()
             val res = index.query(query, limit, scopes)
