@@ -29,7 +29,9 @@ import java.util.concurrent.atomic.AtomicReference
 class TreeWatcher(
     private val context: Context,
     private val index: SearchIndex,
-    private val onDirty: () -> Unit,
+    val mode: WatcherMode,
+    /** null means protocol/MediaStore uncertainty and requires a full sync. */
+    private val onDirty: (Set<String>?) -> Unit,
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private val lifecycleLock = Any()
@@ -39,14 +41,16 @@ class TreeWatcher(
     private var generation = 0L
     @Volatile private var running = false
     @Volatile private var rootMode = false
+    @Volatile private var dirtySession = 0L // changes only across start/stop, not helper refresh
+    // The following debounce state is owned exclusively by [handler]'s looper.
     private var dirtyRunnable: Runnable? = null
-    @Volatile private var firstDirtyAt = 0L
+    private val dirtyAccumulator = DirtyScopeAccumulator()
+    private var firstDirtyAt = 0L
 
     companion object {
         private const val TAG = "ViewFile/Watch"
         private const val QUIET_MS = 2000L       // 事件静默期
         private const val MAX_DELAY_MS = 10000L  // 持续变动时的最长拖延
-        private const val COOLDOWN_MS = 25000L   // 监听触发同步的最小间隔（大库防同步风暴）
         private const val HELPER_STATE_PREFS = "vfwatch_helper_state"
         private const val PREF_BACKEND = "backend"
         private const val PREF_HELPER_PATH = "helper_path"
@@ -179,7 +183,9 @@ class TreeWatcher(
         }
     }
 
-    fun start(useRoot: Boolean, useShizuku: Boolean) {
+    fun start() {
+        val useRoot = mode == WatcherMode.SU
+        val useShizuku = mode == WatcherMode.SHIZUKU
         enqueueStart(this, prepare = { ticket ->
             synchronized(lifecycleLock) {
                 if (running) false else {
@@ -187,6 +193,7 @@ class TreeWatcher(
                     rootMode = useRoot || useShizuku
                     usingShizuku = useShizuku && !useRoot
                     generation = ticket
+                    dirtySession++
                     true
                 }
             }
@@ -308,7 +315,9 @@ class TreeWatcher(
                                 return@use
                             }
                             val dirtyDirectory = dirs[ordinal]
-                            if (WatcherEventFilter.shouldTriggerSync(dirtyDirectory)) markDirty()
+                            if (WatcherEventFilter.shouldTriggerSync(dirtyDirectory)) {
+                                markDirty(dirtyDirectory)
+                            }
                         }
                     }
                 } catch (_: Throwable) {
@@ -332,18 +341,34 @@ class TreeWatcher(
                 } catch (_: Throwable) {}
             }, "vf-watch-err").apply { isDaemon = true }.start()
 
-            val received = try {
-                readyLatch.await(WatcherProtocol.READY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                false
+            val deadline = System.nanoTime() +
+                TimeUnit.MILLISECONDS.toNanos(WatcherProtocol.READY_TIMEOUT_MS)
+            var received = false
+            while (isDesired(requestGeneration, requireRoot = true)) {
+                val remaining = deadline - System.nanoTime()
+                if (remaining <= 0) break
+                try {
+                    if (readyLatch.await(
+                            minOf(TimeUnit.NANOSECONDS.toMillis(remaining), 100L),
+                            TimeUnit.MILLISECONDS,
+                        )
+                    ) {
+                        received = true
+                        break
+                    }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
             }
             val handshake = ready.get()
-            val healthy = received && handshake != null && p.isAlive &&
+            val stillDesired = isDesired(requestGeneration, requireRoot = true)
+            val healthy = stillDesired && received && handshake != null && p.isAlive &&
                     WatcherProtocol.coversExpected(dirs.size, handshake)
             if (!healthy) {
                 decisionLatch.countDown()
                 val reason = when {
+                    !stillDesired -> "lifecycle request superseded during ready handshake"
                     !received -> "ready timeout"
                     handshake == null -> "invalid ready handshake: ${firstLine.get()}"
                     !p.isAlive -> "process exited during ready handshake"
@@ -405,6 +430,7 @@ class TreeWatcher(
             Log.w(TAG, "$reason; stopping native watcher and falling back")
             cleanupPublishedResources(failedGeneration, stopRequest = false)
             installMediaObserverIfCurrent(failedGeneration)
+            markDirty(null)
         }
     }
 
@@ -440,7 +466,7 @@ class TreeWatcher(
         if (!isDesired(requestGeneration, requireRoot = false)) return
         val obs = object : ContentObserver(handler) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
-                markDirty()
+                markDirty(null)
             }
         }
         context.contentResolver.registerContentObserver(
@@ -678,47 +704,63 @@ class TreeWatcher(
                 if (!running) false else {
                     running = false
                     generation = ticket
-                    dirtyRunnable?.let { handler.removeCallbacks(it) }
-                    dirtyRunnable = null
+                    dirtySession++
+                    handler.post { clearDirtyOnHandler() }
                     true
                 }
             }
         }) { ticket, ownsGlobalStop -> runStop(ticket, ownsGlobalStop) }
     }
 
-    @Volatile private var lastDispatchAt = 0L
+    private fun markDirty(directory: String?) {
+        val eventSession = synchronized(lifecycleLock) {
+            if (!running) return
+            dirtySession
+        }
+        handler.post { markDirtyOnHandler(directory, eventSession) }
+    }
 
-    private fun markDirty() {
-        if (!running) return
+    private fun markDirtyOnHandler(directory: String?, eventSession: Long) {
+        if (!running || dirtySession != eventSession) return
+        dirtyAccumulator.add(directory)
         if (firstDirtyAt == 0L) firstDirtyAt = System.currentTimeMillis()
         val existing = dirtyRunnable
         if (existing == null) {
             val nr = object : Runnable {
                 override fun run() {
-                    val sinceSync = System.currentTimeMillis() - lastDispatchAt
-                    if (sinceSync < COOLDOWN_MS) {
-                        // 同步冷却中：顺延到冷却结束再试（保持单一待处理任务）
-                        handler.postDelayed(this, COOLDOWN_MS - sinceSync)
-                        return
-                    }
-                    dirtyRunnable = null
+                    if (dirtyRunnable === this) dirtyRunnable = null
                     firstDirtyAt = 0L
-                    if (running) {
-                        lastDispatchAt = System.currentTimeMillis()
-                        onDirty()
-                    }
+                    dispatchDirty(eventSession)
                 }
             }
             dirtyRunnable = nr
             handler.postDelayed(nr, QUIET_MS)
-        } else if (System.currentTimeMillis() - firstDirtyAt >= MAX_DELAY_MS + COOLDOWN_MS) {
+        } else if (System.currentTimeMillis() - firstDirtyAt >= MAX_DELAY_MS) {
             handler.removeCallbacks(existing)
             dirtyRunnable = null
             firstDirtyAt = 0L
-            if (running) {
-                lastDispatchAt = System.currentTimeMillis()
-                onDirty()
+            dispatchDirty(eventSession)
+        }
+    }
+
+    private fun clearDirtyOnHandler() {
+        dirtyRunnable?.let(handler::removeCallbacks)
+        dirtyRunnable = null
+        firstDirtyAt = 0L
+        dirtyAccumulator.take()
+    }
+
+    private fun dispatchDirty(eventSession: Long) {
+        var shouldDispatch = false
+        val scope = synchronized(lifecycleLock) {
+            if (running && dirtySession == eventSession) {
+                shouldDispatch = true
+                dirtyAccumulator.take()
+            } else {
+                dirtyAccumulator.take()
+                null
             }
         }
+        if (shouldDispatch) onDirty(scope) // callback intentionally outside lifecycleLock
     }
 }

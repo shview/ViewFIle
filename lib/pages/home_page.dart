@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../api/engine_api.dart';
 import '../utils/format.dart';
 import '../utils/index_bootstrap.dart';
+import '../utils/watcher_lifecycle.dart';
 import 'apps_page.dart';
 import 'settings_page.dart';
 import 'tips_page.dart';
@@ -53,6 +54,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String _tier = 'NONE'; // ROOT | SHIZUKU | NONE
   int _lastScanMs = 0;
   int _loadMs = 0;
+  bool _watcherDesiredForeground = true;
 
   // 按应用检索：{pkg, label, dirs}
   Map<String, dynamic>? _appScope;
@@ -221,12 +223,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // 去重由引擎侧健康检查负责（避免空库期误启后无法替换）
   void _ensureWatcher() {
-    if (_hasPerm != true) return;
-    _api.startWatcher(rootIndex: _rootIndex, deepData: _deepData);
+    if (_hasPerm != true || !_watcherDesiredForeground) return;
+    _api.startWatcher(
+      rootIndex: _rootIndex,
+      deepData: _deepData,
+      lifecycleIntent: watcherLifecycleIntents.next(),
+    );
   }
 
   void _maybeStopWatcher() {
-    _api.stopWatcher();
+    _api.stopWatcher(lifecycleIntent: watcherLifecycleIntents.next());
   }
 
   // ---------- 浏览 ----------
@@ -533,17 +539,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      _watcherDesiredForeground = true;
       if (_hasPerm == false) {
         _bootstrap(); // 从系统授权页返回后重新检查
       }
       _ensureWatcher(); // 前台实时监听
     } else if (state == AppLifecycleState.paused) {
+      _watcherDesiredForeground = false;
       _maybeStopWatcher(); // 退出前台即停，不耗电
     }
   }
 
   @override
   void dispose() {
+    // Widget replacement is not an app-background transition. A retiring page
+    // must not stop a watcher just started by its successor; paused owns stop.
+    _watcherDesiredForeground = false;
     WidgetsBinding.instance.removeObserver(this);
     _debounce?.cancel();
     _searchCtl.dispose();

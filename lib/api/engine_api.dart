@@ -13,7 +13,8 @@ class EngineApi {
   Future<void> requestPermission() => _m.invokeMethod('requestPermission');
 
   /// 检测 root（会触发系统的 root 授权框）
-  Future<bool> hasRoot() async => await _m.invokeMethod<bool>('hasRoot') ?? false;
+  Future<bool> hasRoot() async =>
+      await _m.invokeMethod<bool>('hasRoot') ?? false;
 
   /// 检测 Shizuku（已授权返回 true；binder 活着但未授权返回 false）
   Future<bool> hasShizuku() async =>
@@ -33,36 +34,58 @@ class EngineApi {
   Future<int> ensureIndexLoaded() async =>
       await _m.invokeMethod<int>('ensureIndexLoaded') ?? 0;
 
-  Future<bool> needsRescan(
-      {bool rootIndex = true, bool systemIndex = false, bool deepData = false}) async =>
+  Future<bool> needsRescan({
+    bool rootIndex = true,
+    bool systemIndex = false,
+    bool deepData = false,
+  }) async =>
       await _m.invokeMethod<bool>('needsRescan', {
         'rootIndex': rootIndex,
         'systemIndex': systemIndex,
         'deepData': deepData,
-      }) ?? true;
+      }) ??
+      true;
 
-  Future<void> startScan(
-      {bool rootIndex = true, bool systemIndex = false, bool deepData = false}) =>
-      _m.invokeMethod('startScan', {
-        'rootIndex': rootIndex,
-        'systemIndex': systemIndex,
-        'deepData': deepData,
-      });
+  Future<void> startScan({
+    bool rootIndex = true,
+    bool systemIndex = false,
+    bool deepData = false,
+  }) => _m.invokeMethod('startScan', {
+    'rootIndex': rootIndex,
+    'systemIndex': systemIndex,
+    'deepData': deepData,
+  });
 
   /// 打开 app 时的增量对账，返回 {ok, added, removed, updated, elapsedMs}
-  Future<Map<String, dynamic>> startSync(
-      {bool rootIndex = true, bool deepData = false}) async =>
-      Map<String, dynamic>.from(await _m.invokeMethod(
-          'startSync', {'rootIndex': rootIndex, 'deepData': deepData}));
+  Future<Map<String, dynamic>> startSync({
+    bool rootIndex = true,
+    bool deepData = false,
+  }) async => Map<String, dynamic>.from(
+    await _m.invokeMethod('startSync', {
+      'rootIndex': rootIndex,
+      'deepData': deepData,
+    }),
+  );
 
   /// 前台实时监听（变化→自动增量同步，结果走 scanEvents 的 synced 事件）
-  Future<void> startWatcher({bool rootIndex = true, bool deepData = false}) =>
-      _m.invokeMethod('startWatcher', {'rootIndex': rootIndex, 'deepData': deepData});
+  Future<void> startWatcher({
+    bool rootIndex = true,
+    bool deepData = false,
+    int lifecycleIntent = 0,
+  }) => _m.invokeMethod('startWatcher', {
+    'rootIndex': rootIndex,
+    'deepData': deepData,
+    'lifecycleIntent': lifecycleIntent,
+  });
 
-  Future<void> stopWatcher() => _m.invokeMethod('stopWatcher');
+  Future<void> stopWatcher({int lifecycleIntent = 0}) =>
+      _m.invokeMethod('stopWatcher', {'lifecycleIntent': lifecycleIntent});
 
-  Future<List<Map<dynamic, dynamic>>> search(String query,
-      {int limit = 200, List<String>? scopes}) async {
+  Future<List<Map<dynamic, dynamic>>> search(
+    String query, {
+    int limit = 200,
+    List<String>? scopes,
+  }) async {
     final list = await _m.invokeMethod<List<dynamic>>('search', {
       'query': query,
       'limit': limit,
@@ -83,7 +106,9 @@ class EngineApi {
 
   /// 浏览目录：返回 {ok, entries} 或 {ok:false, error}
   Future<Map<String, dynamic>> listDir(String path) async =>
-      Map<String, dynamic>.from(await _m.invokeMethod('listDir', {'path': path}));
+      Map<String, dynamic>.from(
+        await _m.invokeMethod('listDir', {'path': path}),
+      );
 
   /// 打开（系统选择器）。返回 null=已发起，否则为错误信息
   Future<String?> open(List<String> paths) async =>
@@ -95,12 +120,15 @@ class EngineApi {
 
   Future<Map<String, dynamic>> rename(String path, String newName) async =>
       Map<String, dynamic>.from(
-          await _m.invokeMethod('rename', {'path': path, 'newName': newName}));
+        await _m.invokeMethod('rename', {'path': path, 'newName': newName}),
+      );
 
   Future<Map<String, dynamic>> delete(List<String> paths) async =>
       Map<String, dynamic>.from(
-          await _m.invokeMethod('delete', {'paths': paths}));
+        await _m.invokeMethod('delete', {'paths': paths}),
+      );
 
-  Stream<Map<dynamic, dynamic>> scanEvents() =>
-      _scanEvents.receiveBroadcastStream().map((e) => Map<dynamic, dynamic>.from(e));
+  Stream<Map<dynamic, dynamic>> scanEvents() => _scanEvents
+      .receiveBroadcastStream()
+      .map((e) => Map<dynamic, dynamic>.from(e));
 }

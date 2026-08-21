@@ -176,6 +176,15 @@ sortIdx[]  字典序排列（免装箱三路快排，折叠比较排序）
   3. _autoSync 静默增量对账
 
 增量对账 (SyncScanner):
+  watcher 事件默认 dirty scope（最多 256 个父目录）:
+    → D ordinal 聚合后映射为 display parent，去重并补父目录
+    → FUSE 只对账目标父目录；仅新发现子树做首次完整下钻
+    → root 只重列目标父目录；删除/重命名由其父目录直接子项 diff 收敛
+    → dirty 聚合超过 256 立即转 full 并清集合；root 目标超过 16 也转 full，限制 shell 次数
+    → 未路由路径、scope 超限、MediaStore/坏协议走 full
+    → 任一区失败/扫描让位后静默追加最多一次 full recovery；full 再失败保持 pending，
+      等下一事件、生命周期或手动同步触发，不忙循环
+    → 手动同步、启动同步始终 full
   FUSE 区: 始终递归现存子目录（mtime 仅跳过当层 diff）
     → listFiles 任一层失败则 fuseOk=false，其他子树仍 best-effort
     → changed 目录只在 diffChildren 成功后提交 mtime
@@ -188,8 +197,8 @@ sortIdx[]  字典序排列（免装箱三路快排，折叠比较排序）
     → 纯 cap deferred 会后台静默续排一轮；任一处理失败不立即重试
     → 深度上限: /data/data 默认两层，防逐层蔓延
     → 各阶段检查 scanRequested → 扫描请求到达立即让位
-  输出分段 telemetry: fuseElapsedMs/fuseOk + 每个 root area 耗时、变更、
-    deferredDirs/processingOk/massDeleteGuarded
+  输出分段 telemetry: scope/dirtyCount + fuseElapsedMs/fuseOk + 每个 root area
+    耗时、变更、deferredDirs/processingOk/massDeleteGuarded
 
 前台实时监听 (TreeWatcher + vfwatch):
   vfwatch 进程（su/shizuku 拉起）对全部索引目录挂 inotify
@@ -197,12 +206,18 @@ sortIdx[]  字典序排列（免装箱三路快排，折叠比较排序）
   → 事件为 `D <0-based directory ordinal>`；`X`/坏协议/溢出均 fail-closed
   → Kotlin 用启动快照将 ordinal 还原为 dirty directory，事件仅作触发信号
   → 只过滤 ViewFile 自身 databases 目录；不粗放过滤其他 app
-  → 静默 2s → 跑增量对账拿精确结果
-  → 冷却 25s 防同步风暴
+  → reader 只向主 Handler 投递；聚合/停止/dispatch 都在同一 Handler 原子处理
+  → 聚合 dirty parent，静默 2s → 跑 scoped 增量对账拿精确结果
+  → Engine single-flight 合并同步期间的新 dirty，full 请求优先，完成后最多一轮 trailing
+  → event/trailing/recovery 在启动时原子绑定最新前台配置；stop 解绑定配置但保留 pending
+  → 健康复用还要求 MEDIA/SU/SHIZUKU 模式完全一致；权限层或 rootIndex 改变即替换实例
   → 只在目录集合增删时 refresh helper；文件内容更新不重启
   → 所有 TreeWatcher 实例共享唯一进程级 daemon executor
   → start/stop/refresh/fallback 以 owner epoch 串行；旧实例 stop 不推进新 owner epoch，
     仅摘除自身资源且不得 pkill 继任者；pause→resume 的 stop/start 保持投递顺序
+  → Dart 用进程级 `max(clock,last+1)` 分配每次 start/stop 的 lifecycleIntent，
+    页面 dispose 不冒充后台 stop；Engine 以 latest-intent-wins 维护 desiredForeground；
+    stop/ready 握手可抢占，resume 会重试曾回退 MediaStore 的 root transition
   → pkill 仅 rc=0/1 视为已清理；失败保留 cleanup-pending，禁止启动新 native helper，
     fail-closed 回退 MediaStore
   → pkill 使用 app 私有 nativeLibraryDir 绝对路径 + `[l]ibvfwatch\.so` 精确身份，

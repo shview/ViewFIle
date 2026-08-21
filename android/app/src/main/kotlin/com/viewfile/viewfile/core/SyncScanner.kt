@@ -36,6 +36,9 @@ class SyncScanner(
         val fuseElapsedMs: Long,
         val fuseOk: Boolean,
         val rootAreas: List<AreaResult>,
+        val scopeFull: Boolean,
+        val dirtyCount: Int,
+        val completed: Boolean,
     ) {
         val directoryChanged: Boolean get() = directorySetChanged(dirAddedRemoved)
         val rootDeferredDirs: Int get() = rootAreas.sumOf { it.deferredDirs }
@@ -63,6 +66,10 @@ class SyncScanner(
     private var dirAddedRemoved = 0
     private var fuseElapsedMs = 0L
     private var fuseOk = false
+    private var scopeFull = true
+    private var dirtyCount = 0
+    private var completed = true
+    private var scopedRootCallBudget = ScopedRootCallBudget()
     private val areaResults = ArrayList<AreaResult>()
 
     companion object {
@@ -71,14 +78,52 @@ class SyncScanner(
         private val SCAN_YIELD = RuntimeException("__scan_yield__")
     }
 
-    fun sync(fuseRoot: String, rootAreas: List<Area>, skipSubtrees: Set<String> = emptySet()): Result {
+    fun sync(
+        fuseRoot: String,
+        rootAreas: List<Area>,
+        skipSubtrees: Set<String> = emptySet(),
+        dirtyDirectories: Set<String>? = null,
+    ): Result {
         val t0 = System.currentTimeMillis()
         added = 0; removed = 0; updated = 0; dirAddedRemoved = 0
         fuseElapsedMs = 0L; fuseOk = false; areaResults.clear()
+        var scope = planDirtyScope(dirtyDirectories)
+        if (!scope.full) {
+            val routingRoots = listOf(fuseRoot) + rootAreas.map { it.display }
+            val rootTargetCount = scope.targets.count { path ->
+                rootAreas.any { inArea(path, it.display) }
+            }
+            if (!allDirtyTargetsRouted(scope.targets, routingRoots) ||
+                shouldEscalateScopedRoot(rootTargetCount)
+            ) {
+                Log.i("ViewFile/Sync", "dirty scope escalated to full: " +
+                    "routed=${allDirtyTargetsRouted(scope.targets, routingRoots)} " +
+                    "rootTargets=$rootTargetCount")
+                scope = DirtyScopePlan(true, scope.requestedCount, emptyList())
+            }
+        }
+        scopeFull = scope.full
+        dirtyCount = scope.requestedCount
+        completed = true
+        scopedRootCallBudget = ScopedRootCallBudget()
         if (scanRequestedBridge?.invoke() == true) return abortedResult(t0)
         val fuseStart = System.currentTimeMillis()
         try {
-            fuseOk = syncDirFuse(File(fuseRoot), skipSubtrees)
+            fuseOk = if (scope.full) {
+                syncDirFuse(File(fuseRoot), skipSubtrees)
+            } else {
+                val fuseTargets = scope.targets.filter { path ->
+                    inArea(path, fuseRoot) && rootAreas.none { inArea(path, it.display) }
+                }
+                var complete = true
+                for (target in fuseTargets) {
+                    complete = combineFuseTraversalResult(
+                        complete,
+                        syncDirFuseScoped(File(target), skipSubtrees),
+                    )
+                }
+                complete
+            }
         } catch (t: Throwable) {
             Log.w("ViewFile/Sync", "fuse walk failed: ${t.message}")
         } finally {
@@ -91,7 +136,9 @@ class SyncScanner(
             val a0 = added; val r0 = removed; val u0 = updated; val d0 = dirAddedRemoved
             var outcome = RootAreaOutcome(processingOk = false, deferredDirs = 0)
             try {
-                outcome = syncRootArea(area)
+                outcome = if (scope.full) syncRootArea(area) else {
+                    syncRootAreaScoped(area, dirtyTargetsInArea(scope.targets, area.display))
+                }
             } catch (t: Throwable) {
                 if (t === SCAN_YIELD) return abortedResult(t0)
                 Log.w("ViewFile/Sync", "root area ${area.display} failed: ${t.message}")
@@ -110,7 +157,8 @@ class SyncScanner(
                     "in ${areaResult.elapsedMs}ms")
         }
         val r = result(t0)
-        Log.i("ViewFile/Sync", "sync done: +${r.added} -${r.removed} ~${r.updated}, " +
+        Log.i("ViewFile/Sync", "sync done scope=${if (r.scopeFull) "full" else "dirty"} " +
+                "dirty=${r.dirtyCount}: +${r.added} -${r.removed} ~${r.updated}, " +
                 "dirs=${r.dirAddedRemoved} in ${r.elapsedMs}ms")
         return r
     }
@@ -155,18 +203,109 @@ class SyncScanner(
         return complete
     }
 
+    /** Scoped event reconciles only the watched parent; newly discovered subtrees get one full walk. */
+    private fun syncDirFuseScoped(dir: File, skipSubtrees: Set<String>): Boolean {
+        val path = dir.absolutePath
+        if (path in skipSubtrees || !dir.exists()) return true
+        val listed = dir.listFiles()
+        if (!fuseListingAvailable(listed)) return false
+        val pid = index.dirId(path) ?: return false
+        val cur = dir.lastModified()
+        val newDirs = try {
+            diffChildren(path, pid, listed!!.map {
+                Child(it.name, it.isDirectory,
+                    if (it.isDirectory) 0L else it.length(), it.lastModified())
+            })
+        } catch (_: Throwable) {
+            return false
+        }
+        commitDirMtime(path, cur)
+        var complete = true
+        for (newDir in newDirs) {
+            complete = combineFuseTraversalResult(
+                complete,
+                syncDirFuse(File(newDir), skipSubtrees, forceRelist = true),
+            )
+        }
+        return complete
+    }
+
     // ---------- root 区 ----------
 
     private fun inArea(p: String, area: String) = p == area || p.startsWith("$area/")
 
     private fun abortedResult(t0: Long): Result {
         Log.i("ViewFile/Sync", "sync yielded to scan request")
+        completed = false
         return result(t0)
     }
 
     private fun result(t0: Long) = Result(
         added, removed, updated, System.currentTimeMillis() - t0,
-        dirAddedRemoved, fuseElapsedMs, fuseOk, areaResults.toList())
+        dirAddedRemoved, fuseElapsedMs, fuseOk, areaResults.toList(), scopeFull, dirtyCount,
+        completed)
+
+    private fun syncRootAreaScoped(area: Area, initialTargets: List<String>): RootAreaOutcome {
+        if (initialTargets.isEmpty()) {
+            return RootAreaOutcome(processingOk = true, deferredDirs = 0)
+        }
+        val queue = java.util.ArrayDeque(initialTargets)
+        val seen = HashSet<String>()
+        var guarded = false
+        while (queue.isNotEmpty()) {
+            if (scanRequestedBridge?.invoke() == true) throw SCAN_YIELD
+            val path = queue.removeFirst()
+            if (!seen.add(path)) continue
+            if (seen.size > MAX_RELIST_PER_SYNC) {
+                return RootAreaOutcome(false, queue.size + 1, guarded)
+            }
+            val relativeDepth = path.count { it == '/' } - area.display.count { it == '/' }
+            if (area.depth > 0 && relativeDepth >= area.depth) continue
+            if (!scopedRootCallBudget.tryAcquire()) {
+                Log.i("ViewFile/Sync", "dirty root scope exceeded shell-call budget; " +
+                    "escalating next trailing run to full")
+                return RootAreaOutcome(false, queue.size + 1, guarded)
+            }
+            val raw = RootScanner.toRaw(path)
+            val result = PrivShell.run(
+                "if [ -d ${shq(raw)} ]; then " +
+                    "find ${shq(raw)} -mindepth 0 -maxdepth 1 " +
+                    "-exec stat -c '%n|%F|%s|%Y' '{}' +; fi 2>/dev/null"
+            )
+            if (!result.ok) return RootAreaOutcome(false, 0, guarded)
+            val entries = result.out.lineSequence()
+                .mapNotNull(RootScanner::parseStatLine)
+                .toList()
+            if (entries.isEmpty()) continue // deleted target; its queued parent owns the deletion
+            val self = entries.firstOrNull {
+                RootScanner.toDisplay(it.rawPath) == path
+            } ?: return RootAreaOutcome(false, 0, guarded)
+            val pid = index.dirId(path) ?: return RootAreaOutcome(false, 0, guarded)
+            val kids = entries.asSequence()
+                .filter { RootScanner.toDisplay(it.rawPath) != path }
+                .map {
+                    val display = RootScanner.toDisplay(it.rawPath)
+                    Child(display.substringAfterLast('/'), it.isDir, it.size, it.mtimeMs)
+                }.toList()
+            val knownNames = db.rawQuery(
+                "SELECT name FROM entry WHERE parent_id=?",
+                arrayOf(pid.toString()),
+            ).use { cursor ->
+                buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
+            }
+            val actualNames = kids.mapTo(HashSet()) { it.name }
+            val delta = planScopedChildDelta(knownNames, actualNames)
+            if (shouldGuardScopedRelist(delta.removed.size, knownNames.size)) {
+                guarded = true
+                return RootAreaOutcome(false, 0, true)
+            }
+            val newDirs = diffChildren(path, pid, kids)
+            commitDirMtime(path, self.mtimeMs)
+            for (newDir in newDirs) queue.addLast(newDir)
+        }
+        return RootAreaOutcome(processingOk = !guarded, deferredDirs = 0,
+            massDeleteGuarded = guarded)
+    }
 
     private fun syncRootArea(area: Area): RootAreaOutcome {
         val display = area.display

@@ -264,7 +264,10 @@ object Engine {
     /** 打开 app 时的增量对账：目录 mtime 比对 + root 区刷新，完成后重载内存索引 */
     fun syncAsync(rootIndex: Boolean, deepData: Boolean, cb: (Map<String, Any?>) -> Unit) {
         syncAsyncInternal(rootIndex, deepData, allowDeferredContinuation = true,
-            internalContinuation = false, cb = cb)
+            internalContinuation = false, dirtyDirectories = null) { out ->
+            cb(out)
+            retryPendingWatcherSync()
+        }
     }
 
     private fun syncAsyncInternal(
@@ -272,6 +275,7 @@ object Engine {
         deepData: Boolean,
         allowDeferredContinuation: Boolean,
         internalContinuation: Boolean,
+        dirtyDirectories: Set<String>?,
         cb: ((Map<String, Any?>) -> Unit)?,
     ) {
         if (state == State.SCANNING) {
@@ -295,8 +299,8 @@ object Engine {
                 val skip = fuseSkip(rootIndex, areas)
                 val scanner = SyncScanner(db, index)
                 scanner.scanRequestedBridge = { scanRequested }
-                val r = scanner.sync("/storage/emulated/0", areas, skip)
-                continueCapDeferred = r.canAutoContinueRoot
+                val r = scanner.sync("/storage/emulated/0", areas, skip, dirtyDirectories)
+                continueCapDeferred = r.scopeFull && r.canAutoContinueRoot
                 state = State.READY
                 // 无变化不重载索引（大库重载是秒级开销）
                 val changed = r.added + r.removed + r.updated
@@ -315,6 +319,10 @@ object Engine {
                     "fuseOk" to r.fuseOk,
                     "rootDeferredDirs" to r.rootDeferredDirs,
                     "rootAutoContinue" to r.canAutoContinueRoot,
+                    "scope" to if (r.scopeFull) "full" else "dirty",
+                    "dirtyCount" to r.dirtyCount,
+                    "scopeComplete" to isSyncScopeComplete(
+                        r.completed, r.fuseOk, r.rootAreas.map { it.processingOk }),
                     "rootAreas" to r.rootAreas.map { area -> mapOf(
                         "area" to area.area,
                         "added" to area.added,
@@ -353,44 +361,157 @@ object Engine {
             ) {
                 syncAsyncInternal(rootIndex, deepData,
                     allowDeferredContinuation = false,
-                    internalContinuation = true, cb = null)
+                    internalContinuation = true, dirtyDirectories = null, cb = null)
             }
         }
     }
 
     private var watcher: TreeWatcher? = null
     private val watcherLock = Any()
+    private val watcherControlExec = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "vf-watch-engine").apply { isDaemon = true }
+    }
+    private var watcherForegroundState = WatcherForegroundState()
+    private var watcherEnsureQueuedIntent = Long.MIN_VALUE
+    private data class WatcherSyncConfig(
+        val rootIndex: Boolean,
+        val deepData: Boolean,
+        val onSynced: (Map<String, Any?>) -> Unit,
+    )
+    private val watcherSyncRouter = WatcherSyncConfigRouter<WatcherSyncConfig>()
 
     private fun refreshCurrentWatcher() = synchronized(watcherLock) {
         watcher?.refreshRootProcess()
     }
 
     /** 前台实时监听：变化触发增量对账，结果通过 onSynced 回调 */
-    fun startWatcher(rootIndex: Boolean, deepData: Boolean, onSynced: (Map<String, Any?>) -> Unit) {
+    fun startWatcher(
+        rootIndex: Boolean,
+        deepData: Boolean,
+        lifecycleIntent: Long,
+        onSynced: (Map<String, Any?>) -> Unit,
+    ) {
         synchronized(watcherLock) {
-            // 与 stopWatcher 共用短临界区，保证 pause stop 已投递后 resume start 才能替换实例。
-            watcher?.let { w ->
-                if (w.isRunning() && w.watchedDirCount > 0) return
-                w.stop()
-                watcher = null
-            }
-            val tier = PrivShell.tier()
-            val w = TreeWatcher(appContext, index, onDirty = {
-                syncAsync(rootIndex, deepData) { m ->
-                    if (m["ok"] == true) {
-                        onSynced(m)
-                        // 只有 watcher 目录集合真正变化才重启；文件内容更新不自激。
-                        if (m["directoryChanged"] == true) refreshCurrentWatcher()
+            val transition = applyWatcherForegroundIntent(
+                watcherForegroundState, lifecycleIntent, foreground = true)
+            watcherForegroundState = transition.state
+            Log.i("ViewFile/Watch", "foreground start intent=$lifecycleIntent " +
+                    "accepted=${transition.accepted} ensure=${transition.ensureWatcher}")
+            val unhealthy = watcher?.let { !it.isRunning() || it.watchedDirCount == 0 } ?: true
+            if (!transition.accepted || (!transition.ensureWatcher && !unhealthy)) return
+            if (watcherEnsureQueuedIntent == lifecycleIntent) return
+            watcherEnsureQueuedIntent = lifecycleIntent
+            watcherControlExec.execute {
+                try {
+                    ensureWatcherForIntent(rootIndex, deepData, lifecycleIntent, onSynced)
+                } finally {
+                    synchronized(watcherLock) {
+                        if (watcherEnsureQueuedIntent == lifecycleIntent) {
+                            watcherEnsureQueuedIntent = Long.MIN_VALUE
+                        }
                     }
                 }
-            })
-            w.start(tier == PrivShell.Tier.ROOT && rootIndex,
-                    tier == PrivShell.Tier.SHIZUKU && rootIndex)
-            watcher = w
+            }
         }
     }
 
-    fun stopWatcher() = synchronized(watcherLock) {
+    private fun ensureWatcherForIntent(
+        rootIndex: Boolean,
+        deepData: Boolean,
+        lifecycleIntent: Long,
+        onSynced: (Map<String, Any?>) -> Unit,
+    ) {
+        val desiredBeforeProbe = synchronized(watcherLock) {
+            watcherForegroundState.desiredForeground &&
+                watcherForegroundState.latestIntent == lifecycleIntent
+        }
+        if (!desiredBeforeProbe) return
+        val tier = PrivShell.tier() // may probe su; never runs on the platform/main thread
+        synchronized(watcherLock) {
+            if (!watcherForegroundState.desiredForeground ||
+                watcherForegroundState.latestIntent != lifecycleIntent
+            ) return
+            val expectedMode = expectedWatcherMode(
+                rootIndex,
+                rootTier = tier == PrivShell.Tier.ROOT,
+                shizukuTier = tier == PrivShell.Tier.SHIZUKU,
+            )
+            val config = WatcherSyncConfig(rootIndex, deepData, onSynced)
+            val pendingWork = watcherSyncRouter.updateConfig(config, desiredForeground = true)
+            watcher?.let { w ->
+                if (shouldReuseWatcher(
+                        w.isRunning(), w.watchedDirCount, w.mode, expectedMode)
+                ) {
+                    // A root-requested watcher may currently be MediaStore fallback; every
+                    // new foreground intent gets one background root transition retry.
+                    w.refreshRootProcess()
+                    pendingWork?.let(::launchWatcherSync)
+                    return
+                }
+                w.stop()
+                watcher = null
+            }
+            val w = TreeWatcher(appContext, index, expectedMode, onDirty = { dirtyDirectories ->
+                enqueueWatcherSync(dirtyDirectories)
+            })
+            w.start()
+            watcher = w
+            pendingWork?.let(::launchWatcherSync)
+        }
+    }
+
+    private fun enqueueWatcherSync(dirtyDirectories: Set<String>?) {
+        val work = synchronized(watcherLock) {
+            watcherSyncRouter.offer(dirtyDirectories)
+        } ?: return
+        launchWatcherSync(work)
+    }
+
+    private fun launchWatcherSync(work: RoutedWatcherSync<WatcherSyncConfig>) {
+        val launch = work.launch
+        val config = work.config
+        Log.i("ViewFile/Watch", "watcher sync launch scope=" +
+            (launch.dirtyDirectories?.let { "dirty(${it.size})" } ?: "full") +
+            " recovery=${launch.recoveryAttempt}")
+        syncAsyncInternal(config.rootIndex, config.deepData,
+            allowDeferredContinuation = true,
+            internalContinuation = false,
+            dirtyDirectories = launch.dirtyDirectories) { out ->
+            val successfulAndComplete = out["ok"] == true && out["scopeComplete"] == true
+            val completion = synchronized(watcherLock) {
+                watcherSyncRouter.complete(
+                    work,
+                    successfulAndComplete,
+                    allowTrailing = watcherForegroundState.desiredForeground && !scanRequested,
+                )
+            }
+            // The config generation is selected under watcherLock; external callback and
+            // watcher coordinator work stay outside it to keep lifecycle transitions short.
+            if (out["ok"] == true) completion.notifyConfig?.onSynced(out)
+            if (completion.notifyConfig != null && out["directoryChanged"] == true) {
+                refreshCurrentWatcher()
+            }
+            Log.i("ViewFile/Watch", "watcher sync complete ok=$successfulAndComplete " +
+                "trailing=${completion.trailing != null}")
+            completion.trailing?.let(::launchWatcherSync)
+        }
+    }
+
+    private fun retryPendingWatcherSync() {
+        val work = synchronized(watcherLock) {
+            watcherSyncRouter.kick()
+        } ?: return
+        launchWatcherSync(work)
+    }
+
+    fun stopWatcher(lifecycleIntent: Long) = synchronized(watcherLock) {
+        val transition = applyWatcherForegroundIntent(
+            watcherForegroundState, lifecycleIntent, foreground = false)
+        watcherForegroundState = transition.state
+        Log.i("ViewFile/Watch", "foreground stop intent=$lifecycleIntent " +
+                "accepted=${transition.accepted} stop=${transition.stopWatcher}")
+        if (!transition.accepted || !transition.stopWatcher) return@synchronized
+        watcherSyncRouter.updateConfig(null, desiredForeground = false)
         watcher?.stop()
         watcher = null
     }

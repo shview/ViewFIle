@@ -157,7 +157,8 @@ class MainActivity : FlutterActivity() {
                     "startWatcher" -> {
                         val rootIndex = call.argument<Boolean>("rootIndex") ?: true
                         val deepData = call.argument<Boolean>("deepData") ?: false
-                        Engine.startWatcher(rootIndex, deepData) { m ->
+                        val intent = call.argument<Number>("lifecycleIntent")?.toLong() ?: 0L
+                        Engine.startWatcher(rootIndex, deepData, intent) { m ->
                             main.post {
                                 scanSink?.success(mapOf("type" to "synced") + m)
                             }
@@ -167,7 +168,8 @@ class MainActivity : FlutterActivity() {
                     "stopWatcher" -> {
                         // stop 只做短状态更新并把清理投递到 watcher 后台协调器。
                         // 与同一 MethodChannel 上后续的 start 保持调用顺序，避免 pause/resume 丢监听。
-                        Engine.stopWatcher()
+                        val intent = call.argument<Number>("lifecycleIntent")?.toLong() ?: 0L
+                        Engine.stopWatcher(intent)
                         result.success(null)
                     }
                     "open" -> {
