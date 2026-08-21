@@ -33,13 +33,18 @@ object Engine {
     private val scanExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-scan") }
     private val searchExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-search") }
 
-    // 主库连接：全量重建原子替换后重开；全部 DB mutation 仅在 scanExec 执行。
+    // 主库连接不创建占位库：MainActivity 在注册任何 channel handler 前先调用 init。
+    // init 真正幂等，不会关闭仍可能被后台任务使用的现有连接；全量重建时另行换库。
+    // 全部 DB mutation 仅在 scanExec 执行。
     @Volatile
-    var db: SQLiteDatabase = SQLiteDatabase.create(null) // 占位，init 时替换
+    lateinit var db: SQLiteDatabase
         private set
 
+    @Synchronized
     fun init(ctx: Context) {
+        if (this::db.isInitialized) return
         appContext = ctx.applicationContext
+        // 仅在成功返回后 lateinit 才进入 initialized 状态；open 失败可由后续 init 重试。
         db = Db.openDb(appContext)
     }
 

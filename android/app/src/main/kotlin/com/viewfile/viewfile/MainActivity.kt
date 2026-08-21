@@ -25,6 +25,7 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // 必须先初始化 Engine；以下 channel handler 及其异步任务才允许访问 Engine.db。
         Engine.init(this)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "viewfile/engine")
