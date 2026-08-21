@@ -263,16 +263,32 @@ object Engine {
 
     /** 打开 app 时的增量对账：目录 mtime 比对 + root 区刷新，完成后重载内存索引 */
     fun syncAsync(rootIndex: Boolean, deepData: Boolean, cb: (Map<String, Any?>) -> Unit) {
+        syncAsyncInternal(rootIndex, deepData, allowDeferredContinuation = true,
+            internalContinuation = false, cb = cb)
+    }
+
+    private fun syncAsyncInternal(
+        rootIndex: Boolean,
+        deepData: Boolean,
+        allowDeferredContinuation: Boolean,
+        internalContinuation: Boolean,
+        cb: ((Map<String, Any?>) -> Unit)?,
+    ) {
         if (state == State.SCANNING) {
-            cb(mapOf("ok" to false, "error" to "扫描进行中"))
+            if (shouldDeliverSyncCallback(internalContinuation)) {
+                cb?.invoke(mapOf("ok" to false, "error" to "扫描进行中"))
+            } else Log.i("ViewFile/Sync", "internal cap continuation skipped: scanning")
             return
         }
         scanExec.execute {
             // 排队期间来了扫描请求：直接让位（同步随时可重跑，扫描等不起）
             if (scanRequested) {
-                cb(mapOf("ok" to false, "error" to "扫描请求优先"))
+                if (shouldDeliverSyncCallback(internalContinuation)) {
+                    cb?.invoke(mapOf("ok" to false, "error" to "扫描请求优先"))
+                } else Log.i("ViewFile/Sync", "internal cap continuation yielded to scan request")
                 return@execute
             }
+            var continueCapDeferred = false
             val out = try {
                 state = State.SYNCING
                 val areas = if (rootIndex) rootAreas(deepData) else emptyList()
@@ -280,6 +296,7 @@ object Engine {
                 val scanner = SyncScanner(db, index)
                 scanner.scanRequestedBridge = { scanRequested }
                 val r = scanner.sync("/storage/emulated/0", areas, skip)
+                continueCapDeferred = r.canAutoContinueRoot
                 state = State.READY
                 // 无变化不重载索引（大库重载是秒级开销）
                 val changed = r.added + r.removed + r.updated
@@ -291,47 +308,94 @@ object Engine {
                 mapOf(
                     "ok" to true,
                     "added" to r.added, "removed" to r.removed, "updated" to r.updated,
-                    "elapsedMs" to r.elapsedMs, "entries" to index.size(),
+                    "directoryChanged" to r.directoryChanged,
+                    "dirAddedRemoved" to r.dirAddedRemoved,
+                    "elapsedMs" to r.elapsedMs,
+                    "fuseElapsedMs" to r.fuseElapsedMs,
+                    "fuseOk" to r.fuseOk,
+                    "rootDeferredDirs" to r.rootDeferredDirs,
+                    "rootAutoContinue" to r.canAutoContinueRoot,
+                    "rootAreas" to r.rootAreas.map { area -> mapOf(
+                        "area" to area.area,
+                        "added" to area.added,
+                        "removed" to area.removed,
+                        "updated" to area.updated,
+                        "dirAddedRemoved" to area.dirAddedRemoved,
+                        "deferredDirs" to area.deferredDirs,
+                        "processingOk" to area.processingOk,
+                        "massDeleteGuarded" to area.massDeleteGuarded,
+                        "elapsedMs" to area.elapsedMs,
+                        "ok" to area.ok,
+                    ) },
+                    "entries" to index.size(),
                 )
             } catch (t: Throwable) {
                 state = State.IDLE
                 Log.e("ViewFile/Sync", "sync failed", t)
                 mapOf("ok" to false, "error" to (t.message ?: t.toString()))
             }
-            cb(out)
+            if (shouldDeliverSyncCallback(internalContinuation)) {
+                cb?.invoke(out)
+            } else {
+                if (out["ok"] == true) {
+                    Log.i("ViewFile/Sync", "internal cap continuation done: " +
+                            "+${out["added"]} -${out["removed"]} ~${out["updated"]}, " +
+                            "deferred=${out["rootDeferredDirs"]}")
+                    if (out["directoryChanged"] == true) refreshCurrentWatcher()
+                } else {
+                    Log.w("ViewFile/Sync", "internal cap continuation failed: ${out["error"]}")
+                }
+            }
+            // 只为 cap deferred 自动续排一轮；chunk/PID/shell 失败不续排。
+            // 回调期间若新的全量扫描已请求，则立即让位。
+            if (allowDeferredContinuation && continueCapDeferred &&
+                !scanRequested && state == State.READY
+            ) {
+                syncAsyncInternal(rootIndex, deepData,
+                    allowDeferredContinuation = false,
+                    internalContinuation = true, cb = null)
+            }
         }
     }
 
     private var watcher: TreeWatcher? = null
+    private val watcherLock = Any()
+
+    private fun refreshCurrentWatcher() = synchronized(watcherLock) {
+        watcher?.refreshRootProcess()
+    }
 
     /** 前台实时监听：变化触发增量对账，结果通过 onSynced 回调 */
     fun startWatcher(rootIndex: Boolean, deepData: Boolean, onSynced: (Map<String, Any?>) -> Unit) {
-        // 健康检查在引擎侧：已运行且目录映射非空则不重启（空库期误启的 0 目录实例会被替换）
-        watcher?.let { w ->
-            if (w.isRunning() && w.watchedDirCount > 0) return
-        }
-        stopWatcher()
-        val tier = PrivShell.tier()
-        val w = TreeWatcher(appContext, index, onDirty = {
-            syncAsync(rootIndex, deepData) { m ->
-                if (m["ok"] == true) {
-                    onSynced(m)
-                    // 目录集合可能变化（新建目录）：重启特权辅助进程以覆盖
-                    watcher?.refreshRootProcess()
-                }
+        synchronized(watcherLock) {
+            // 与 stopWatcher 共用短临界区，保证 pause stop 已投递后 resume start 才能替换实例。
+            watcher?.let { w ->
+                if (w.isRunning() && w.watchedDirCount > 0) return
+                w.stop()
+                watcher = null
             }
-        })
-        w.start(tier == PrivShell.Tier.ROOT && rootIndex,
-                tier == PrivShell.Tier.SHIZUKU && rootIndex)
-        watcher = w
+            val tier = PrivShell.tier()
+            val w = TreeWatcher(appContext, index, onDirty = {
+                syncAsync(rootIndex, deepData) { m ->
+                    if (m["ok"] == true) {
+                        onSynced(m)
+                        // 只有 watcher 目录集合真正变化才重启；文件内容更新不自激。
+                        if (m["directoryChanged"] == true) refreshCurrentWatcher()
+                    }
+                }
+            })
+            w.start(tier == PrivShell.Tier.ROOT && rootIndex,
+                    tier == PrivShell.Tier.SHIZUKU && rootIndex)
+            watcher = w
+        }
     }
 
-    fun stopWatcher() {
+    fun stopWatcher() = synchronized(watcherLock) {
         watcher?.stop()
         watcher = null
     }
 
-    fun isWatching(): Boolean = watcher?.isRunning() == true
+    fun isWatching(): Boolean = synchronized(watcherLock) { watcher?.isRunning() == true }
 
     /**
      * 写操作（重命名/删除）：与扫描/载入/同步/换库共用 scanExec；

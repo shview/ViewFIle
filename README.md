@@ -6,7 +6,7 @@ Android 平台的即时文件搜索引擎 + 文件管理器，对标 Windows 上
 
 > **交接说明**：本文档面向接手本项目的 AGENT 或开发者。包含完整架构、
 > 全部踩坑记录（每条真机复现过）、操作协议与路线图。读完即可继续开发。
-> 代码量约 4500 行（Kotlin 2900 / Dart 1400 / C 80），单仓库无子模块。
+> 代码量约 5900 行（Kotlin 3520 / Dart 2180 / C 174），单仓库无子模块。
 
 ---
 
@@ -65,10 +65,10 @@ Android 平台的即时文件搜索引擎 + 文件管理器，对标 Windows 上
 │ lib/theme.dart             主题色/明暗切换         │
 │ lib/utils/format.dart      大小/日期/文件类型分类  │
 ├──────────────────────────────────────────────────┤
-│ Kotlin 引擎 (~2900 行) com.viewfile.viewfile.core│
+│ Kotlin 引擎 (~3520 行) com.viewfile.viewfile.core│
 ├──────────────────────────────────────────────────┤
 │ MainActivity.kt    通道绑定（全部后台化，防 ANR） │
-│ Engine.kt          单例：3 线程池(scan/search/ops)│
+│ Engine.kt          单例：2 线程池(scan+mutation/search)│
 │                    状态机 IDLE→SCANNING/SYNCING→READY│
 │                    scanRequested 抢占标志          │
 │ Db.kt              schema v3 + IndexSink 接口     │
@@ -88,12 +88,12 @@ Android 平台的即时文件搜索引擎 + 文件管理器，对标 Windows 上
 │                    + isFuseBlocked 判定           │
 │ FileOps.kt         打开/分享/重命名/删除          │
 │                    root 回退(rm/mv)              │
-│ TreeWatcher.kt     前台实时监听                   │
-│                    + watch limit 条件调大/恢复     │
+│ TreeWatcher.kt     前台实时监听+进程级共享生命周期协调器│
+│                    + owner epoch/Process identity 防跨实例竞态│
 ├──────────────────────────────────────────────────┤
-│ NDK C (~80 行) android/app/src/main/cpp/vfwatch.c│
+│ NDK C (~174 行) android/app/src/main/cpp/vfwatch.c│
 │ root/shizuku 拉起的 inotify 监听进程              │
-│ stdin 喂目录清单→stdout "E" 事件信号              │
+│ stdin 喂目录清单→stdout R 握手 / D ordinal / X 失败│
 │ 打包为 libvfwatch.so (需 useLegacyPackaging=true) │
 └──────────────────────────────────────────────────┘
 ```
@@ -176,22 +176,44 @@ sortIdx[]  字典序排列（免装箱三路快排，折叠比较排序）
   3. _autoSync 静默增量对账
 
 增量对账 (SyncScanner):
-  FUSE 区: 按目录 mtime 递归（未变即剪枝）
+  FUSE 区: 始终递归现存子目录（mtime 仅跳过当层 diff）
+    → listFiles 任一层失败则 fuseOk=false，其他子树仍 best-effort
+    → changed 目录只在 diffChildren 成功后提交 mtime
+      （新目录在成功前 mtime=0，保证下轮重试）
   root 区: find -type d | stat 只 stat 目录
     → 管道 rc≠0 → 整区跳过（不删不重列）
-    → 大规模删除守卫: >2000 且 >20% 已知 → 拒删（管道部分输出）
+    → 大规模删除守卫: >2000 或 >20% 已知 → 拒删并标记 incomplete
     → 变化目录批量重列（300 目录/管道，单轮上限 2000）
+    → 仅 shell+chunk diff 成功后提交 mtime；超额 deferred 保留旧值
+    → 纯 cap deferred 会后台静默续排一轮；任一处理失败不立即重试
     → 深度上限: /data/data 默认两层，防逐层蔓延
     → 各阶段检查 scanRequested → 扫描请求到达立即让位
+  输出分段 telemetry: fuseElapsedMs/fuseOk + 每个 root area 耗时、变更、
+    deferredDirs/processingOk/massDeleteGuarded
 
 前台实时监听 (TreeWatcher + vfwatch):
   vfwatch 进程（su/shizuku 拉起）对全部索引目录挂 inotify
-  → 事件只当触发信号（非精确记账）
+  → stdin 清单以 "." 结束；stdout 先 `R requested installed`
+  → 事件为 `D <0-based directory ordinal>`；`X`/坏协议/溢出均 fail-closed
+  → Kotlin 用启动快照将 ordinal 还原为 dirty directory，事件仅作触发信号
+  → 只过滤 ViewFile 自身 databases 目录；不粗放过滤其他 app
   → 静默 2s → 跑增量对账拿精确结果
   → 冷却 25s 防同步风暴
-  → 退后台即停（pkill 同步清理，防竞态误杀继任者）
-  → watch limit 条件调大（仅不足时），停止时恢复原值
-     （root 隐藏侧信道：/proc/sys/fs/inotify/max_user_watches 可读）
+  → 只在目录集合增删时 refresh helper；文件内容更新不重启
+  → 所有 TreeWatcher 实例共享唯一进程级 daemon executor
+  → start/stop/refresh/fallback 以 owner epoch 串行；旧实例 stop 不推进新 owner epoch，
+    仅摘除自身资源且不得 pkill 继任者；pause→resume 的 stop/start 保持投递顺序
+  → pkill 仅 rc=0/1 视为已清理；失败保留 cleanup-pending，禁止启动新 native helper，
+    fail-closed 回退 MediaStore
+  → pkill 使用 app 私有 nativeLibraryDir 绝对路径 + `[l]ibvfwatch\.so` 精确身份，
+    不匹配自身/其他 app 同名进程；helper 启动前持久记录后端与绝对身份
+  → 新进程按记录预清孤儿；SU 可直接清理；可信历史 Shizuku 记录须 ps 可见并在
+    清理后复核消失；首次安装无记录时也仅在 package-wide ps 明确 ABSENT/CLEARED 后启动
+  → 历史 SU 记录转为 Shizuku 时无法排除更高权限孤儿，直接 fail-closed；ps 不兼容、
+    执行失败、目标清理后仍可见都回退 MediaStore
+  → 数据清除/重装导致无记录时，ROOT 使用严格 package-wide 跨版本身份同时覆盖
+    Android 8 与现代 `/data/app` 布局；失败在 refresh 重试
+  → 应用只读 max_user_watches，绝不修改 sysctl；容量不足回退 MediaStore
 ```
 
 ### 2.6 启动内存预算守卫
@@ -213,7 +235,8 @@ catch OOM → 同样自愈（-1 信号）
 
 ```bash
 flutter pub get
-flutter test                               # 单元测试（3 个）
+flutter test                               # Flutter 单元测试（5 个）
+cd android && ./gradlew :app:testDebugUnitTest --configure-on-demand  # Kotlin 单测
 flutter build apk --release                # 产物 ~22.5MB
 flutter analyze                            # 静态分析
 ```
@@ -279,12 +302,12 @@ md5sum build/app/outputs/flutter-apk/app-release.apk          # 本地对比
 | # | 问题 | 根因 | 修复 |
 |---|---|---|---|
 | 5 | **名字池去重大小小写合并 → 同步键偏移 2/3 → 67s 同步** | `cmpName` 大小写不敏感，Tencent/tencent 合并后路径重建返回错误大小写 | 新增 `cmpNameExact` 逐字节比较（去重专用） |
-| 6 | 同步管道部分输出 → 误删 15.5 万条 | find\|stat 管道部分失败（rc≠0 但有部分输出），缺失目录被当成已删除 | rc≠0 整区跳过 + 大规模删除守卫（>2000 且 >20% 拒删） |
+| 6 | 同步管道部分输出 → 误删 15.5 万条 | find\|stat 管道部分失败（rc≠0 但有部分输出），缺失目录被当成已删除 | rc≠0 整区跳过 + 大规模删除守卫（>2000 或 >20% 拒删） |
 | 7 | 祖先 mtime 清零 → 同步死循环膨胀 | ensureDir 补祖先链时传 mtime=0，真实值被覆盖 → 永远判"变化" | 补链绝不写 mtime（`update=false` 参数） |
 | 8 | journal=OFF 百万级 SQLITE_CORRUPT | 某些设备上 journal=OFF + 大事务导致库损坏 | 构建库改 WAL + 20 万条分批事务 |
 | 9 | 同步逐层蔓延 | 变化目录重列无深度上限 → 下层变化引入更深层 → 最终全量 | 重列遵守 `area.depth` 上限 |
 | 10 | 扫描区重叠 → UNIQUE 冲突 | FUSE 与 root 管道双写 Android 子树 | FUSE 侧 `fuseSkip` 跳过该子树 |
-| 11 | 平行根链（同一路径多个 DB 条目） | ensureDir 补链时 (parent_id,name) 查 DB 前先 INSERT | 同步 ensureDir 改只读（新建目录由全量重建负责） |
+| 11 | 平行根链（同一路径多个 DB 条目） | ensureDir 补链时未先查 (parent_id,name) | ensureDir 先查 DB，仅缺失时补目录行/父链 |
 
 ### 4.3 功能/体验级
 
@@ -299,9 +322,9 @@ md5sum build/app/outputs/flutter-apk/app-release.apk          # 本地对比
 | 18 | 主线程特权检测 ANR | su 探测最长 5s，在主线程阻塞输入 | 所有通道检测全部后台化 |
 | 19 | Shizuku 双 server 授权丢失 | 授权弹窗写一个 server、app 连另一个 | 杀双实例重拉单实例；`pm grant` 直授 |
 | 20 | watcher 空库期 0 目录启动 | 空库时 dirIds 为空，watcher 监听 0 目录且不自愈 | `watchedDirCount > 0` 健康检查 |
-| 21 | 异步 pkill 误杀新 vfwatch | stop 的异步 pkill 线程晚于 refresh 的新进程启动 | 改同步 pkill（在后台线程） |
+| 21 | 异步 pkill 误杀新 vfwatch | 旧 TreeWatcher.stop 与新实例 start 跨实例并发 | 进程级共享 executor 串行，owner epoch+Process identity 拒绝旧任务 |
 | 22 | 扫描请求排队等同步 67s | scanExec 单线程被长同步占住 | `scanRequested` 标志 + 同步各阶段让位 |
-| 23 | root 命令丢系统级 inotify 痕迹 | `/proc/sys/fs/inotify/max_user_watches` 全局可读 | 仅不足时调大 + 停止时恢复原值 |
+| 23 | inotify watch 容量不足 | `/proc/sys/fs/inotify/max_user_watches` 是全局设置 | 只读容量，绝不修改 sysctl；不足时回退 MediaStore |
 
 ---
 
@@ -339,7 +362,7 @@ md5sum build/app/outputs/flutter-apk/app-release.apk          # 本地对比
 - 深度索引 /data/data 默认关闭；开启后 133 万级内存 ~178MB（SoA 稳定）
 - /proc、/sys 不索引；符号链接/socket/设备节点不入索引
 - Shizuku 服务重启后需重新拉起
-- 同步 ensureDir 只读不建——新建目录需等下次全量重建（M4 改进）
+- 增量同步会补建缺失的目录行/父链；对账失败时保留旧 mtime 供下轮重试
 
 ---
 
@@ -350,11 +373,11 @@ md5sum build/app/outputs/flutter-apk/app-release.apk          # 本地对比
 | Flutter | 3.41.6 stable |
 | Dart | 3.11.4 |
 | Android SDK | 36（licenses 已接受） |
-| JDK | OpenJDK 25 |
+| JDK | Android Studio JBR 21（Gradle 门禁） |
 | minSdk | 26（Android 8.0） |
 | targetSdk | 36（Android 16） |
 | 依赖 | shared_preferences, shizuku api/provider 13.1.5, androidx.core |
-| NDK | arm64-v8a + armeabi-v7a，`useLegacyPackaging=true` |
+| NDK | 发布配置 arm64-v8a + armeabi-v7a；Debug 门禁另构建 x86_64，`useLegacyPackaging=true` |
 | OS | Windows + Git Bash；MSYS 路径 `export MSYS_NO_PATHCONV=1` |
 
 ---

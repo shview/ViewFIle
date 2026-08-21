@@ -14,17 +14,56 @@ class SyncScanner(
     private val db: SQLiteDatabase,
     private val index: SearchIndex
 ) {
-    class Result(val added: Int, val removed: Int, val updated: Int, val elapsedMs: Long)
+    data class AreaResult(
+        val area: String,
+        val added: Int,
+        val removed: Int,
+        val updated: Int,
+        val dirAddedRemoved: Int,
+        val deferredDirs: Int,
+        val processingOk: Boolean,
+        val massDeleteGuarded: Boolean,
+        val elapsedMs: Long,
+        val ok: Boolean,
+    )
+
+    class Result(
+        val added: Int,
+        val removed: Int,
+        val updated: Int,
+        val elapsedMs: Long,
+        val dirAddedRemoved: Int,
+        val fuseElapsedMs: Long,
+        val fuseOk: Boolean,
+        val rootAreas: List<AreaResult>,
+    ) {
+        val directoryChanged: Boolean get() = directorySetChanged(dirAddedRemoved)
+        val rootDeferredDirs: Int get() = rootAreas.sumOf { it.deferredDirs }
+        val canAutoContinueRoot: Boolean get() = shouldAutoContinueRoot(rootAreas.map {
+            RootContinuationState(it.deferredDirs, it.processingOk)
+        })
+    }
 
     /** 引擎侧扫描请求探针：同步各阶段检查，true 则中止本轮（Engine.scanAsync 置位） */
     @Volatile
     var scanRequestedBridge: (() -> Boolean)? = null
 
     private class Child(val name: String, val isDir: Boolean, val size: Long, val mtime: Long)
+    private data class RootAreaOutcome(
+        val processingOk: Boolean,
+        val deferredDirs: Int,
+        val massDeleteGuarded: Boolean = false,
+    ) {
+        val complete: Boolean get() = processingOk && deferredDirs == 0
+    }
 
     private var added = 0
     private var removed = 0
     private var updated = 0
+    private var dirAddedRemoved = 0
+    private var fuseElapsedMs = 0L
+    private var fuseOk = false
+    private val areaResults = ArrayList<AreaResult>()
 
     companion object {
         private const val MAX_RELIST_PER_SYNC = 2000
@@ -34,62 +73,86 @@ class SyncScanner(
 
     fun sync(fuseRoot: String, rootAreas: List<Area>, skipSubtrees: Set<String> = emptySet()): Result {
         val t0 = System.currentTimeMillis()
-        added = 0; removed = 0; updated = 0
+        added = 0; removed = 0; updated = 0; dirAddedRemoved = 0
+        fuseElapsedMs = 0L; fuseOk = false; areaResults.clear()
+        if (scanRequestedBridge?.invoke() == true) return abortedResult(t0)
+        val fuseStart = System.currentTimeMillis()
         try {
-            if (scanRequestedBridge?.invoke() == true) return abortedResult(t0)
-            syncDirFuse(File(fuseRoot), skipSubtrees)
+            fuseOk = syncDirFuse(File(fuseRoot), skipSubtrees)
         } catch (t: Throwable) {
             Log.w("ViewFile/Sync", "fuse walk failed: ${t.message}")
+        } finally {
+            fuseElapsedMs = System.currentTimeMillis() - fuseStart
+            Log.i("ViewFile/Sync", "fuse ${if (fuseOk) "ok" else "failed"} in ${fuseElapsedMs}ms")
         }
         for (area in rootAreas) {
             if (scanRequestedBridge?.invoke() == true) return abortedResult(t0)
+            val areaStart = System.currentTimeMillis()
+            val a0 = added; val r0 = removed; val u0 = updated; val d0 = dirAddedRemoved
+            var outcome = RootAreaOutcome(processingOk = false, deferredDirs = 0)
             try {
-                syncRootArea(area)
+                outcome = syncRootArea(area)
             } catch (t: Throwable) {
                 if (t === SCAN_YIELD) return abortedResult(t0)
                 Log.w("ViewFile/Sync", "root area ${area.display} failed: ${t.message}")
             }
+            val areaResult = AreaResult(
+                area.display, added - a0, removed - r0, updated - u0,
+                dirAddedRemoved - d0, outcome.deferredDirs, outcome.processingOk,
+                outcome.massDeleteGuarded,
+                System.currentTimeMillis() - areaStart, outcome.complete)
+            areaResults.add(areaResult)
+            Log.i("ViewFile/Sync", "root area ${area.display} " +
+                    "${if (areaResult.ok) "ok" else if (outcome.processingOk) "deferred" else "failed"}: " +
+                    "+${areaResult.added} -${areaResult.removed} ~${areaResult.updated}, " +
+                    "dirs=${areaResult.dirAddedRemoved}, deferred=${areaResult.deferredDirs} " +
+                    "guarded=${areaResult.massDeleteGuarded} " +
+                    "in ${areaResult.elapsedMs}ms")
         }
-        val r = Result(added, removed, updated, System.currentTimeMillis() - t0)
-        Log.i("ViewFile/Sync", "sync done: +${r.added} -${r.removed} ~${r.updated} in ${r.elapsedMs}ms")
+        val r = result(t0)
+        Log.i("ViewFile/Sync", "sync done: +${r.added} -${r.removed} ~${r.updated}, " +
+                "dirs=${r.dirAddedRemoved} in ${r.elapsedMs}ms")
         return r
     }
 
     // ---------- FUSE 区 ----------
 
-    private fun syncDirFuse(dir: File, skipSubtrees: Set<String>, forceRelist: Boolean = false) {
+    private fun syncDirFuse(
+        dir: File,
+        skipSubtrees: Set<String>,
+        forceRelist: Boolean = false,
+    ): Boolean {
         val path = dir.absolutePath
-        if (path in skipSubtrees) return  // 由 root 管道覆盖的子树，FUSE 视图残缺
-        val children = dir.listFiles() ?: return
+        if (path in skipSubtrees) return true // 由 root 管道覆盖，计划内跳过不是失败
+        val listed = dir.listFiles()
+        if (!fuseListingAvailable(listed)) return false
+        val children = listed!!
         val stored = index.dirMtime(path)
         val cur = dir.lastModified()
         var newDirs: Set<String> = emptySet()
         if (shouldDiffFuseDirectory(stored, cur, forceRelist)) {
-            val pid = index.dirId(path) ?: return  // 区域根外的孤儿（不可达）：跳过
-            if (stored == null) {
-                val id = insertEntry(pid, dir.name, true, 0, cur)
-                if (id != -1L) {
-                    index.markDir(path, id, cur)
-                    added++
-                }
-            } else {
-                db.execSQL("UPDATE entry SET mtime=? WHERE id=?", arrayOf(cur.toString(), pid.toString()))
-                index.markDir(path, pid, cur)
-            }
+            val pid = index.dirId(path) ?: return false // 对账链不完整
             newDirs = diffChildren(path, pid, children.map {
                 Child(it.name, it.isDirectory,
                     if (it.isDirectory) 0L else it.length(), it.lastModified())
             })
+            // diffChildren 抛异常时不会到达此处，旧 mtime（新行为 0）保留供下轮重试。
+            if (shouldCommitFuseMtime(FuseMtimeStage.DIFF_SUCCEEDED)) {
+                commitDirMtime(path, cur)
+            }
         }
         // Android/FUSE 不保证深层变化会更新所有祖先 mtime。即使当前层无需 diff，
         // 也必须下钻一次，才能到达真正变化的父目录。children 已在本层只读取一次。
+        var complete = true
         for (c in children) {
             if (c.isDirectory) {
                 // diffChildren 已记录新目录的当前 mtime；若不强制首轮重列，递归会
                 // 立即命中“mtime 未变”剪枝，从而永久漏掉目录中已有的内容。
-                syncDirFuse(c, skipSubtrees, c.absolutePath in newDirs)
+                val childComplete = syncDirFuse(c, skipSubtrees, c.absolutePath in newDirs)
+                complete = combineFuseTraversalResult(complete, childComplete)
             }
         }
+        return complete
     }
 
     // ---------- root 区 ----------
@@ -98,10 +161,14 @@ class SyncScanner(
 
     private fun abortedResult(t0: Long): Result {
         Log.i("ViewFile/Sync", "sync yielded to scan request")
-        return Result(added, removed, updated, System.currentTimeMillis() - t0)
+        return result(t0)
     }
 
-    private fun syncRootArea(area: Area) {
+    private fun result(t0: Long) = Result(
+        added, removed, updated, System.currentTimeMillis() - t0,
+        dirAddedRemoved, fuseElapsedMs, fuseOk, areaResults.toList())
+
+    private fun syncRootArea(area: Area): RootAreaOutcome {
         val display = area.display
         val depthArg = if (area.depth > 0) " -maxdepth ${area.depth}" else ""
         val actual = HashMap<String, Long>()
@@ -118,7 +185,7 @@ class SyncScanner(
         // 曾因部分失败误删 15.5 万条（find 部分输出被当成"目录已消失"）
         if (!res.ok) {
             Log.w("ViewFile/Sync", "area $display dir-stat rc=${res.code}, skip area")
-            return
+            return RootAreaOutcome(processingOk = false, deferredDirs = 0)
         }
 
         // 库里有、实际没有 → 整树删除。
@@ -131,37 +198,37 @@ class SyncScanner(
             knownInArea++
             if (!actual.containsKey(p)) toDelete.add(p)
         }
-        if (toDelete.size > 2000 && toDelete.size > knownInArea / 5) {
+        var massDeleteGuarded = false
+        if (shouldGuardRootMassDelete(toDelete.size, knownInArea)) {
             Log.w("ViewFile/Sync",
                 "area $display: suspect mass delete ${toDelete.size}/$knownInArea, skip deletions")
             toDelete.clear()
+            massDeleteGuarded = true
         }
         for (p in toDelete) {
             val id = index.dirId(p) ?: continue
-            removed += Db.deleteSubtree(db, id)
+            deleteDirectorySubtree(id)
             index.pruneDirMaps(p)
         }
 
-        // 第一遍：保证目录行存在且 mtime 最新（父先于子）
-        val sortedActual = actual.entries.sortedBy { it.key.length }
-        val changedDirs = ArrayList<String>()
+        // 先计划再写 mtime：pending 目录只补行/父链，保留旧 mtime（新行为 0）。
+        // 否则超过单轮上限或 chunk 失败的目录下轮会被误判为无变化。
+        val sortedActual = actual.entries.sortedWith(
+            compareBy<Map.Entry<String, Long>> { it.key.length }.thenBy { it.key })
+        val changedDirs = sortedActual.filter { index.dirMtime(it.key) != it.value }
+            .map { it.key }
+        val plan = planRootRelists(changedDirs, display, area.depth, MAX_RELIST_PER_SYNC)
         for ((p, m) in sortedActual) {
-            val wasKnown = index.dirMtime(p)
-            ensureDir(p, m)
-            if (wasKnown != m) changedDirs.add(p)
+            val disposition = plan.disposition(p)
+            val commitNow = disposition == null || shouldCommitRootMtime(disposition, false)
+            if (commitNow) ensureDir(p, m) else ensureDir(p, 0, update = false)
         }
-        // 第二遍：变化目录批量重列直接子项（遵守区域深度上限，防止逐层蔓延）
-        val cap = area.depth
-        val areaSlash = display.count { it == '/' }
-        val relistable = if (cap > 0) {
-            changedDirs.filter { (it.count { c -> c == '/' } - areaSlash) < cap }
-        } else changedDirs
-        val capped = relistable.take(MAX_RELIST_PER_SYNC)
-        if (changedDirs.size > capped.size) {
+        if (plan.deferred.isNotEmpty()) {
             Log.i("ViewFile/Sync", "area $display: changed=${changedDirs.size}, " +
-                    "this run=${capped.size} (rest converges next sync)")
+                    "this run=${plan.selected.size}, deferred=${plan.deferred.size}")
         }
-        for (chunk in capped.chunked(300)) {
+        var allRelistsOk = true
+        for (chunk in plan.selected.chunked(300)) {
             if (scanRequestedBridge?.invoke() == true) throw SCAN_YIELD
             // 每个 find 自己批量 stat，并用 && 串联：任一目录重列失败都会成为
             // 整体非零 rc，本 chunk 全部丢弃，不采用部分输出。
@@ -170,7 +237,10 @@ class SyncScanner(
                         "-exec stat -c '%n|%F|%s|%Y' '{}' +"
             }
             val r = PrivShell.run("($finds) 2>/dev/null")
-            if (!r.ok) continue
+            if (!r.ok) {
+                allRelistsOk = false
+                continue
+            }
             val parsedChildren = ArrayList<Pair<String, Child>>()
             r.out.lineSequence().forEach { line ->
                 val e = RootScanner.parseStatLine(line) ?: return@forEach
@@ -181,11 +251,29 @@ class SyncScanner(
             }
             // chunk 成功后每个请求父目录都参与 diff；无输出即空目录，必须清掉旧子项。
             val byParent = groupRelistedChildren(chunk, parsedChildren)
+            var chunkComplete = true
             for ((parent, kids) in byParent) {
-                val pid = index.dirId(parent) ?: continue
+                val pid = index.dirId(parent)
+                if (pid == null) {
+                    chunkComplete = false
+                    break
+                }
                 diffChildren(parent, pid, kids)
             }
+            if (!chunkComplete) {
+                allRelistsOk = false
+                continue
+            }
+            // 只有 shell 和整个 chunk 的 diff 都成功才提交 mtime。
+            if (shouldCommitRootMtime(RootMtimeDisposition.SELECTED, chunkComplete)) {
+                for (parent in chunk) commitDirMtime(parent, actual.getValue(parent))
+            }
         }
+        return RootAreaOutcome(
+            processingOk = allRelistsOk && !massDeleteGuarded,
+            deferredDirs = plan.deferred.size,
+            massDeleteGuarded = massDeleteGuarded,
+        )
     }
 
     /**
@@ -209,23 +297,37 @@ class SyncScanner(
         // 先查 DB (parent_id, name) 防平行链：ensureDir 的内存映射 miss 不代表库里没有
         val name = path.substringAfterLast('/')
         val existing = db.rawQuery(
-            "SELECT id FROM entry WHERE parent_id=? AND name=? AND type=1",
-            arrayOf(pid.toString(), name)).use { c -> if (c.moveToFirst()) c.getLong(0) else -1L }
-        if (existing != -1L) {
-            index.markDir(path, existing, mtime)
-            return existing
+            "SELECT id,mtime FROM entry WHERE parent_id=? AND name=? AND type=1",
+            arrayOf(pid.toString(), name)).use { c ->
+                if (c.moveToFirst()) c.getLong(0) to c.getLong(1) else -1L to 0L
+            }
+        if (existing.first != -1L) {
+            val indexedMtime = if (update) {
+                if (existing.second != mtime) {
+                    db.execSQL("UPDATE entry SET mtime=? WHERE id=?",
+                        arrayOf(mtime.toString(), existing.first.toString()))
+                }
+                mtime
+            } else existing.second
+            index.markDir(path, existing.first, indexedMtime)
+            return existing.first
         }
-        val id = insertEntry(pid, name, true, 0, mtime)
-        if (id == -1L) {
-            // 已存在但内存映射缺失：取回 id，不计新增
-            return db.rawQuery(
-                "SELECT id FROM entry WHERE parent_id=? AND name=?",
-                arrayOf(pid.toString(), path.substringAfterLast('/'))
-            ).use { c -> if (c.moveToFirst()) c.getLong(0) else -1L }
+        val inserted = insertEntry(pid, name, true, 0, mtime)
+        if (inserted.id == -1L) return -1L
+        index.markDir(path, inserted.id, mtime)
+        if (inserted.inserted) {
+            added++
+            dirAddedRemoved++
         }
+        return inserted.id
+    }
+
+    private fun commitDirMtime(path: String, mtime: Long) {
+        val id = index.dirId(path) ?: return
+        if (index.dirMtime(path) == mtime) return
+        db.execSQL("UPDATE entry SET mtime=? WHERE id=?",
+            arrayOf(mtime.toString(), id.toString()))
         index.markDir(path, id, mtime)
-        added++
-        return id
     }
 
     // ---------- 公共 ----------
@@ -243,14 +345,38 @@ class SyncScanner(
             kidNames.add(k.name)
             val known = dbChildren[k.name]
             if (known == null) {
-                val id = insertEntry(pid, k.name, k.isDir, k.size, k.mtime)
-                if (id != -1L) {
+                val storedMtime = if (k.isDir) 0L else k.mtime
+                val inserted = insertEntry(pid, k.name, k.isDir, k.size, storedMtime)
+                if (inserted.id != -1L) {
                     if (k.isDir) {
                         val childPath = "$parentPath/${k.name}"
-                        index.markDir(childPath, id, k.mtime)
+                        index.markDir(childPath, inserted.id, 0L)
                         newDirs.add(childPath)
                     }
+                    if (inserted.inserted) {
+                        added++
+                        if (k.isDir) dirAddedRemoved++
+                    }
+                }
+            } else if (known.second != k.isDir) {
+                // 同名节点在文件/目录之间变更也会改变 watch 集合。
+                val childPath = "$parentPath/${k.name}"
+                if (known.second) {
+                    deleteDirectorySubtree(known.first)
+                    index.pruneDirMaps(childPath)
+                } else {
+                    db.execSQL("DELETE FROM entry WHERE id=?", arrayOf(known.first.toString()))
+                    removed++
+                }
+                val storedMtime = if (k.isDir) 0L else k.mtime
+                val inserted = insertEntry(pid, k.name, k.isDir, k.size, storedMtime)
+                if (inserted.id != -1L && inserted.inserted) {
                     added++
+                    if (k.isDir) {
+                        index.markDir(childPath, inserted.id, 0L)
+                        newDirs.add(childPath)
+                        dirAddedRemoved++
+                    }
                 }
             } else if (!k.isDir) {
                 db.execSQL("UPDATE entry SET size=?,mtime=? WHERE id=?",
@@ -261,7 +387,7 @@ class SyncScanner(
         for ((name, meta) in dbChildren) {
             if (kidNames.contains(name)) continue
             if (meta.second) {
-                removed += Db.deleteSubtree(db, meta.first)
+                deleteDirectorySubtree(meta.first)
                 index.pruneDirMaps("$parentPath/$name")
             } else {
                 db.execSQL("DELETE FROM entry WHERE id=?", arrayOf(meta.first.toString()))
@@ -271,7 +397,11 @@ class SyncScanner(
         return newDirs
     }
 
-    private fun insertEntry(pid: Long, name: String, isDir: Boolean, size: Long, mtime: Long): Long {
+    private data class InsertResult(val id: Long, val inserted: Boolean)
+
+    private fun insertEntry(
+        pid: Long, name: String, isDir: Boolean, size: Long, mtime: Long
+    ): InsertResult {
         val st = db.compileStatement(
             "INSERT OR IGNORE INTO entry(parent_id,name,type,size,mtime) VALUES(?,?,?,?,?)")
         st.bindLong(1, pid)
@@ -282,9 +412,28 @@ class SyncScanner(
         val id = st.executeInsert()
         if (id == -1L) {
             // 已存在（罕见路径交叠）：查回现有 id
-            return db.rawQuery("SELECT id FROM entry WHERE parent_id=? AND name=?",
-                arrayOf(pid.toString(), name)).use { c -> if (c.moveToFirst()) c.getLong(0) else -1L }
+            val existing = db.rawQuery("SELECT id FROM entry WHERE parent_id=? AND name=?",
+                arrayOf(pid.toString(), name)).use {
+                    c -> if (c.moveToFirst()) c.getLong(0) else -1L
+                }
+            return InsertResult(existing, false)
         }
-        return id
+        return InsertResult(id, true)
+    }
+
+    /** 在删除前统计子树中的目录数，不把文件数误当成 watcher 变化。 */
+    private fun deleteDirectorySubtree(id: Long) {
+        val counts = db.rawQuery(
+            "WITH RECURSIVE sub(id,type) AS (" +
+                    "SELECT id,type FROM entry WHERE id=? UNION ALL " +
+                    "SELECT e.id,e.type FROM entry e JOIN sub s ON e.parent_id=s.id) " +
+                    "SELECT COUNT(*),COALESCE(SUM(CASE WHEN type=1 THEN 1 ELSE 0 END),0) FROM sub",
+            arrayOf(id.toString())
+        ).use { c ->
+            if (c.moveToFirst()) c.getInt(0) to c.getInt(1) else 0 to 0
+        }
+        if (counts.first == 0) return
+        removed += Db.deleteSubtree(db, id)
+        dirAddedRemoved += counts.second
     }
 }

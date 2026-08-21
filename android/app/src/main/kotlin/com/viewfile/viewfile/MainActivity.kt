@@ -165,10 +165,10 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
                     "stopWatcher" -> {
-                        Thread {
-                            Engine.stopWatcher()  // 含同步 pkill（可能秒级），不能在主线程
-                            main.post { result.success(null) }
-                        }.start()
+                        // stop 只做短状态更新并把清理投递到 watcher 后台协调器。
+                        // 与同一 MethodChannel 上后续的 start 保持调用顺序，避免 pause/resume 丢监听。
+                        Engine.stopWatcher()
+                        result.success(null)
                     }
                     "open" -> {
                         val paths = call.argument<List<String>>("paths") ?: emptyList()
