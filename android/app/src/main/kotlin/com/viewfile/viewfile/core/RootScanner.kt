@@ -28,6 +28,8 @@ class RootScanner {
             var sinceTick = 0
             val res = PrivShell.runStream(cmd) { line ->
                 val e = parseStatLine(line) ?: run { total.skipped++; return@runStream }
+                // 文件名含换行会把 stat 输出撕成碎片行：非绝对路径的一律丢弃
+                if (!e.rawPath.startsWith("/")) { total.skipped++; return@runStream }
                 val displayPath = mapDisplay(e.rawPath, raw, display)
                 val name = displayPath.substringAfterLast('/')
                 val parent = displayPath.substringBeforeLast('/').ifEmpty { "/" }

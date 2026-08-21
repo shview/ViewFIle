@@ -68,9 +68,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _api.scanEvents().listen(_onScanEvent, onError: (_) {});
-    _loadPrefs();
+    _prefsReady = _loadPrefs();
     _bootstrap();
   }
+
+  Future<void>? _prefsReady;
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
@@ -96,6 +98,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _bootstrap() async {
+    await _prefsReady;  // 必须先拿到真实配置，否则深度开关等会被漏检（走同步收敛的错路）
     final ok = await _api.hasPermission();
     setState(() => _hasPerm = ok);
     if (!ok) return;

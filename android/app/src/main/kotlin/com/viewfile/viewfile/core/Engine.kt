@@ -95,7 +95,9 @@ object Engine {
                 }
                 val am = appContext
                     .getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-                val budget = am.largeMemoryClass * 2600
+                // 深度测试结论：对象模型在 135 万条时超 512MB 堆（同步重载 OOM）。
+                // P2(SoA) 落地前按保守预算拦截，超限自愈回精简模式
+                val budget = am.largeMemoryClass * 2400
                 if (count > budget) {
                     Log.w("ViewFile/Scan",
                         "index $count over budget $budget (heap ${am.largeMemoryClass}MB), auto reset")
