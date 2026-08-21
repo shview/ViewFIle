@@ -180,17 +180,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  bool _watcherStarted = false;
-
+  // 去重由引擎侧健康检查负责（避免空库期误启后无法替换）
   void _ensureWatcher() {
-    if (_watcherStarted || _hasPerm != true) return;
-    _watcherStarted = true;
+    if (_hasPerm != true) return
+    ;
     _api.startWatcher(rootIndex: _rootIndex, deepData: _deepData);
   }
 
   void _maybeStopWatcher() {
-    if (!_watcherStarted) return;
-    _watcherStarted = false;
     _api.stopWatcher();
   }
 

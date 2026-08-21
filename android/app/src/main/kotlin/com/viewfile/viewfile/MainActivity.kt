@@ -164,8 +164,10 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
                     "stopWatcher" -> {
-                        Engine.stopWatcher()
-                        result.success(null)
+                        Thread {
+                            Engine.stopWatcher()  // 含同步 pkill（可能秒级），不能在主线程
+                            main.post { result.success(null) }
+                        }.start()
                     }
                     "open" -> {
                         val paths = call.argument<List<String>>("paths") ?: emptyList()

@@ -4,12 +4,13 @@ import android.database.sqlite.SQLiteDatabase
 import java.util.Arrays
 
 /**
- * 内存索引：启动后从 SQLite 整表载入，按文件名小写排序。
- * 查询 = 多关键词 AND 子串匹配（Everything 默认语义），
- * 顺序扫描已排序数组，结果天然有序。载入与查询可并发（数组整体替换）。
+ * 内存索引 v3：从 entry 表分批载入，利用 parent_id < id 的不变式
+ * 一遍按 parent 链重建完整路径（库内不存路径）。
+ * 同时维护 目录路径 → (id, mtime) 映射供增量同步对账使用。
  */
 class SearchIndex {
     class Entry(
+        val id: Long,
         val path: String,
         val name: String,
         val nameLower: String,
@@ -25,39 +26,94 @@ class SearchIndex {
     private var entries: Array<Entry> = emptyArray()
     private val dirStats = HashMap<String, DirStat>()
 
+    // 增量同步用的目录映射（path → id / mtime）
+    val dirIds = HashMap<String, Long>()
+    val dirMtimes = HashMap<String, Long>()
+
     fun size() = entries.size
 
     fun statsFor(path: String): DirStat? = dirStats[path]
 
-    /** 整表载入并排序；分批读取避免大库撑爆 CursorWindow，统计用深度向上聚合 */
+    /** 删除子树后修剪同步映射（dirStats 随重载重建，无需修剪） */
+    fun pruneDirMaps(prefix: String) {
+        val p = if (prefix.endsWith("/")) prefix else "$prefix/"
+        dirIds.keys.removeIf { it == prefix || it.startsWith(p) }
+        dirMtimes.keys.removeIf { it == prefix || it.startsWith(p) }
+    }
+
+    fun markDir(path: String, id: Long, mtime: Long) {
+        dirIds[path] = id
+        dirMtimes[path] = mtime
+    }
+
+    /** 整表载入：分批读 → parent 链重建路径 → 排序 + 统计 */
     fun load(db: SQLiteDatabase): Int {
         dirStats.clear()
-        val total = db.rawQuery("SELECT COUNT(*) FROM files", null).use { c ->
+        dirIds.clear()
+        dirMtimes.clear()
+        val total = db.rawQuery("SELECT COUNT(*) FROM entry", null).use { c ->
             if (c.moveToFirst()) c.getInt(0) else 0
         }
-        val list = ArrayList<Entry>(total + 16)
-        var lastPath = ""
+        val maxId = db.rawQuery("SELECT COALESCE(MAX(id),0) FROM entry", null).use { c ->
+            if (c.moveToFirst()) c.getLong(0) else 0L
+        }
+        if (total == 0 || maxId == 0L) {
+            entries = emptyArray()
+            return 0
+        }
+        // 按 id 的稀疏数组中间结构（避免 HashMap 装箱开销）
+        val n = (maxId + 1).toInt()
+        val parentIds = LongArray(n)
+        val types = ByteArray(n)          // 0=无 1=文件 2=目录
+        val sizes = LongArray(n)
+        val mtimes = LongArray(n)
+        val names = arrayOfNulls<String>(n)
+        var lastId = 0L
         while (true) {
-            val before = list.size
+            var got = 0
             db.rawQuery(
-                "SELECT path,name,is_dir,size,mtime FROM files WHERE path>? ORDER BY path LIMIT 8000",
-                arrayOf(lastPath)
+                "SELECT id,parent_id,name,type,size,mtime FROM entry WHERE id>? ORDER BY id LIMIT 8000",
+                arrayOf(lastId.toString())
             ).use { c ->
                 while (c.moveToNext()) {
-                    lastPath = c.getString(0)
-                    val name = c.getString(1)
-                    list.add(
-                        Entry(lastPath, name, fastLower(name),
-                            c.getInt(2) == 1, c.getLong(3), c.getLong(4))
-                    )
+                    lastId = c.getLong(0)
+                    val idx = lastId.toInt()
+                    parentIds[idx] = c.getLong(1)
+                    val t = c.getInt(3)
+                    types[idx] = if (t == 1) 2 else 1
+                    sizes[idx] = c.getLong(4)
+                    mtimes[idx] = c.getLong(5)
+                    names[idx] = c.getString(2)
+                    got++
                 }
             }
-            if (list.size == before) break
+            if (got == 0) break
+        }
+
+        val pathOf = arrayOfNulls<String>(n)
+        val list = ArrayList<Entry>(total)
+        // parent_id < id 恒成立：按 id 升序一遍完成路径重建
+        for (idx in 1 until n) {
+            if (types[idx] == 0.toByte()) continue
+            val pid = parentIds[idx]
+            val name = names[idx] ?: continue
+            val path = if (pid == 0L) "/$name"
+                else {
+                    val parentPath = pathOf[pid.toInt()] ?: continue
+                    if (parentPath == "/") "/$name" else "$parentPath/$name"
+                }
+            pathOf[idx] = path
+            val isDir = types[idx] == 2.toByte()
+            list.add(Entry(idx.toLong(), path, name, fastLower(name), isDir, sizes[idx], mtimes[idx]))
+            if (isDir) {
+                dirIds[path] = idx.toLong()
+                dirMtimes[path] = mtimes[idx]
+            }
         }
         val arr = list.toArray(emptyArray<Entry>())
         Arrays.sort(arr, compareBy { it.nameLower })
 
-        // 第一遍：直接子项计数 + 目录父链接
+        // 统计：直接子项 + 深度向上聚合
         val parentOfDir = HashMap<String, String>(arr.size / 4 + 16)
         for (e in arr) {
             val p = e.path.substringBeforeLast('/')
@@ -68,12 +124,10 @@ class SearchIndex {
             if (!e.isDir) s.recSize += e.size
             if (e.isDir) parentOfDir[e.path] = p
         }
-        // 空目录也保证有记录
         for (e in arr) {
             if (e.isDir) dirStats.getOrPut(e.path) { DirStat() }
         }
-        // 第二遍：按深度降序把子树统计累加给父目录（避免 深度×条目 的字符串分配）
-        val withParent = parentOfDir.keys.sortedByDescending { path -> path.count { it == '/' } }
+        val withParent = parentOfDir.keys.sortedByDescending { it.count { ch -> ch == '/' } }
         for (d in withParent) {
             val s = dirStats[d] ?: continue
             val p = parentOfDir[d] ?: continue
@@ -124,8 +178,7 @@ class SearchIndex {
     }
 
     companion object {
-        /** ASCII 快速小写化：String.toLowerCase 在 Android 上是慢路径，
-         *  21 万级条目下差距是秒级；非 ASCII 大写不参与折叠（可接受） */
+        /** ASCII 快速小写化：String.toLowerCase 在 Android 上是慢路径 */
         fun fastLower(s: String): String {
             val chars = s.toCharArray()
             var changed = false

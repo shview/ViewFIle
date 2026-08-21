@@ -2,7 +2,6 @@ package com.viewfile.viewfile.core
 
 import android.content.Context
 import android.database.ContentObserver
-import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
 import android.os.FileObserver
 import android.os.Handler
@@ -26,7 +25,7 @@ import java.io.OutputStreamWriter
  */
 class TreeWatcher(
     private val context: Context,
-    private val db: SQLiteDatabase,
+    private val index: SearchIndex,
     private val onDirty: () -> Unit,
 ) {
     private val handler = Handler(Looper.getMainLooper())
@@ -53,6 +52,9 @@ class TreeWatcher(
     }
 
     @Volatile private var usingShizuku = false
+    /** 本次实例监视的目录数（0 = 空库期误启，需要被替换） */
+    @Volatile var watchedDirCount = 0
+        private set
 
     fun isRunning() = running
 
@@ -69,11 +71,9 @@ class TreeWatcher(
             startMediaObserver()
             return
         }
-        // 目录清单先取出来（同时用于判断是否需要调大上限）
+        // 目录清单取自内存 dirIds（v3 库内无路径；载入后必然可用）
         val dirs = ArrayList<String>(1024)
-        db.rawQuery("SELECT path FROM files WHERE is_dir=1", null).use { c ->
-            while (c.moveToNext()) dirs.add(RootScanner.toRaw(c.getString(0)))
-        }
+        for (p in index.dirIds.keys) dirs.add(RootScanner.toRaw(p))
         if (!useShizuku) ensureWatchLimit(dirs.size)
         try {
             val p = if (useShizuku) {
@@ -95,15 +95,19 @@ class TreeWatcher(
                     Log.w(TAG, "feed dirs failed: ${t.message}")
                 }
             }, "vf-watch-feed").start()
-            // 读事件信号：任何一行 = 有变化
+            // 读事件信号：任何一行 = 有变化；stderr 一并捕获用于诊断
             Thread({
                 try {
                     BufferedReader(InputStreamReader(p.inputStream)).use { r ->
                         while (r.readLine() != null) markDirty()
                     }
                 } catch (_: Throwable) {}
-                Log.w(TAG, "vfwatch exited")
+                val err = try {
+                    p.errorStream.bufferedReader().use { it.readText().take(200) }
+                } catch (_: Throwable) { "" }
+                Log.w(TAG, "vfwatch exited${if (err.isNotBlank()) ": $err" else ""}")
             }, "vf-watch-read").start()
+            watchedDirCount = if (rootMode) dirs.size else Int.MAX_VALUE
             Log.i(TAG, "root watcher started via ${if (useShizuku) "shizuku" else "su"} ($bin, ${dirs.size} dirs)")
         } catch (t: Throwable) {
             Log.w(TAG, "start root watcher failed: ${t.message}, fallback")
@@ -163,12 +167,11 @@ class TreeWatcher(
             rootProc = null
             runCatching { p.destroy() }
         }
-        // destroy 只杀到 su，vfwatch 会成为孤儿进程；按名清理（异步，避免阻塞主线程）
-        Thread({
-            runCatching { SuShell.run("pkill -f libvfwatch.so") }
-            runCatching { ShizukuShell.run("pkill -f libvfwatch.so", 5000) }
-            restoreWatchLimit()
-        }, "vf-watch-kill").start()
+        // destroy 只杀到 su，vfwatch 会成为孤儿进程；按名同步清理。
+        // 必须同步：异步 pkill 会与 refreshRootProcess 的新进程竞态，误杀继任者
+        runCatching { SuShell.run("pkill -f libvfwatch.so", 5000) }
+        runCatching { ShizukuShell.run("pkill -f libvfwatch.so", 5000) }
+        restoreWatchLimit()
     }
 
     fun stop() {

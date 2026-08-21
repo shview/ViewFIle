@@ -12,7 +12,7 @@ class RootScanner {
     class Count(var files: Int = 0, var dirs: Int = 0, var skipped: Int = 0)
 
     fun scanInto(
-        writer: IndexWriter,
+        writer: IndexSink,
         areas: List<Area>,   // rawRoot → displayRoot；depth>0 时限制 find 深度
         onProgress: ((area: String, files: Int, dirs: Int) -> Unit)? = null
     ): Count {

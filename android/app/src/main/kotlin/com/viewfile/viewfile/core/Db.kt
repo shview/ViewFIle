@@ -2,36 +2,67 @@ package com.viewfile.viewfile.core
 
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
+import android.util.Log
 
 /**
- * 索引库。files 表是唯一事实来源；重建索引用 staging 表整体换入，
- * 任意时刻崩溃都不会留下半新半旧的索引。meta 表存扫描配置指纹，
- * 用于判断“配置变了（如开启 root）需要自动重扫”。
+ * 索引库 v3：entry(id, parent_id, name, type, size, mtime)。
+ * 路径不再落库（v2 重复存 path+parent 是库体积的主因，135 万条要 600MB+），
+ * 显示路径由内存层按 parent 链反推。UNIQUE(parent_id,name) 天然覆盖
+ * “按目录取子项”查询，不另建索引；名称搜索全在内存。
+ *
+ * 全量重建在独立的 index-new.db 进行（journal=OFF、无二级索引写入、
+ * 完成后建索引并原子 rename 顶替 index.db），主库不再出现巨型 WAL。
  */
 object Db {
-    private const val COLS =
-        "path TEXT PRIMARY KEY, parent TEXT NOT NULL, name TEXT NOT NULL, " +
-        "is_dir INTEGER NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL"
-    private const val SCHEMA = "v2-worowid" // WITHOUT ROWID：行存进主键树，省一份路径索引
+    private const val TAG = "ViewFile/Db"
+    const val MAIN = "index.db"
+    const val BUILD = "index-new.db"
+    private const val SCHEMA = "v3-parentid"
 
-    fun open(context: Context): SQLiteDatabase {
-        val db = context.openOrCreateDatabase("index.db", Context.MODE_PRIVATE, null)
-        // journal_mode / wal_checkpoint 会返回结果行，A16 起必须走 rawQuery
-        pragma(db, "PRAGMA journal_mode=WAL")
-        db.execSQL("PRAGMA synchronous=NORMAL")
-        db.execSQL("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
-        if (getMeta(db, "schema") != SCHEMA) {
-            // 旧结构（含 rowid 主键树）：整体废弃，首次打开自动全量重建
-            db.execSQL("DROP TABLE IF EXISTS files")
-            db.execSQL("DROP TABLE IF EXISTS files_staging")
-            db.execSQL("DELETE FROM meta WHERE k='scan_cfg'")
-            setMeta(db, "schema", SCHEMA)
+    private const val ENTRY_SQL =
+        "CREATE TABLE entry(" +
+                "id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, name TEXT NOT NULL," +
+                "type INTEGER NOT NULL, size INTEGER NOT NULL DEFAULT 0," +
+                "mtime INTEGER NOT NULL DEFAULT 0)"
+
+    fun openDb(context: Context, name: String = MAIN): SQLiteDatabase {
+        val db = context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null)
+        if (name == MAIN) {
+            pragma(db, "PRAGMA journal_mode=WAL")
+            db.execSQL("PRAGMA synchronous=NORMAL")
+            migrate(db)
         }
-        db.execSQL("CREATE TABLE IF NOT EXISTS files($COLS) WITHOUT ROWID")
-        // 增量同步按 parent 查子项，无索引=全表扫（name 不建索引：搜索全在内存）
-        db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent)")
         return db
     }
+
+    private fun migrate(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        if (getMeta(db, "schema") == SCHEMA) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS entry(" + entryCols() + ")")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_parent_name ON entry(parent_id, name)")
+            return
+        }
+        Log.i(TAG, "schema upgrade -> $SCHEMA (index will be rebuilt)")
+        db.beginTransaction()
+        try {
+            db.execSQL("DROP TABLE IF EXISTS files")
+            db.execSQL("DROP TABLE IF EXISTS files_staging")
+            db.execSQL("DROP TABLE IF EXISTS entry")
+            db.execSQL("DELETE FROM meta")
+            db.execSQL(ENTRY_SQL)
+            db.execSQL("CREATE UNIQUE INDEX idx_entry_parent_name ON entry(parent_id, name)")
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        setMeta(db, "schema", SCHEMA)
+        pragma(db, "PRAGMA wal_checkpoint(TRUNCATE)")
+    }
+
+    private fun entryCols() =
+        "id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, name TEXT NOT NULL," +
+                "type INTEGER NOT NULL, size INTEGER NOT NULL DEFAULT 0," +
+                "mtime INTEGER NOT NULL DEFAULT 0"
 
     private fun pragma(db: SQLiteDatabase, sql: String) {
         db.rawQuery(sql, null).use { it.moveToFirst() }
@@ -46,78 +77,39 @@ object Db {
         db.execSQL("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", arrayOf(key, value))
     }
 
-    fun beginRebuild(db: SQLiteDatabase) {
-        db.execSQL("DROP TABLE IF EXISTS files_staging")
-        db.execSQL("CREATE TABLE files_staging($COLS) WITHOUT ROWID")
-    }
-
-    fun finishRebuild(db: SQLiteDatabase) {
-        db.beginTransaction()
-        try {
-            db.execSQL("DROP TABLE IF EXISTS files")
-            db.execSQL("ALTER TABLE files_staging RENAME TO files")
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-        }
-        db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent)")
-        // VACUUM 在 WAL 模式会把整库重写进 WAL（实测 600MB+），
-        // 因此必须先 VACUUM 再 checkpoint 截断
-        db.execSQL("VACUUM")
-        pragma(db, "PRAGMA wal_checkpoint(TRUNCATE)")
-    }
-
     /** 索引超内存预算/损坏时的自愈：废弃索引，下次自动按当前配置重建 */
     fun resetForRebuild(db: SQLiteDatabase) {
         try {
-            db.execSQL("DROP TABLE IF EXISTS files")
-            db.execSQL("DROP TABLE IF EXISTS files_staging")
+            db.execSQL("DROP TABLE IF EXISTS entry")
+            db.execSQL("CREATE TABLE entry(" + entryCols() + ")")
+            db.execSQL("CREATE UNIQUE INDEX idx_entry_parent_name ON entry(parent_id, name)")
             db.execSQL("DELETE FROM meta WHERE k='scan_cfg'")
             pragma(db, "PRAGMA wal_checkpoint(TRUNCATE)")
         } catch (t: Throwable) {
-            android.util.Log.w("ViewFile/Db", "reset failed: ${t.message}")
+            Log.w(TAG, "reset failed: ${t.message}")
         }
+    }
+
+    /** 删除某目录的整棵子树（含自身），返回删除条数 */
+    fun deleteSubtree(db: SQLiteDatabase, id: Long): Int {
+        val c = db.rawQuery(
+            "WITH RECURSIVE del(id) AS (SELECT ? UNION ALL " +
+                    "SELECT e.id FROM entry e JOIN del ON e.parent_id = del.id) " +
+                    "SELECT COUNT(*) FROM entry WHERE id IN (SELECT id FROM del)",
+            arrayOf(id.toString())
+        )
+        val n = if (c.moveToFirst()) c.getInt(0) else 0
+        c.close()
+        db.execSQL(
+            "DELETE FROM entry WHERE id IN (WITH RECURSIVE del(id) AS (SELECT ? UNION ALL " +
+                    "SELECT e.id FROM entry e JOIN del ON e.parent_id = del.id) SELECT id FROM del)",
+            arrayOf(id.toString())
+        )
+        return n
     }
 }
 
-/** 批量写入器：默认写 staging（全量重建），可指定表做增量写入。
- *  注意：add 必须与 beginTx 在同一线程调用（写事务绑定唯一连接，
- *  跨线程插入会永久等待连接——并行扫描采用“采集入队、单线程落库”）。 */
-class IndexWriter(
-    private val db: SQLiteDatabase,
-    private val table: String = "files_staging"
-) {
-    private val insert = db.compileStatement(
-        "INSERT OR IGNORE INTO $table(path,parent,name,is_dir,size,mtime) VALUES(?,?,?,?,?,?)"
-    )
-    private var pending = 0L
-
-    fun beginTx() {
-        db.execSQL("PRAGMA synchronous=OFF")
-        db.beginTransaction()
-    }
-
-    fun add(path: String, parent: String, name: String, isDir: Boolean, size: Long, mtime: Long) {
-        insert.bindString(1, path)
-        insert.bindString(2, parent)
-        insert.bindString(3, name)
-        insert.bindLong(4, if (isDir) 1 else 0)
-        insert.bindLong(5, size)
-        insert.bindLong(6, mtime)
-        insert.executeInsert()
-        if (++pending >= 20000) {
-            db.setTransactionSuccessful()
-            db.endTransaction()
-            db.beginTransaction()
-            pending = 0
-        }
-    }
-
-    fun finishTx() {
-        try {
-            db.setTransactionSuccessful()
-            db.endTransaction()
-        } catch (_: IllegalStateException) {}
-        db.execSQL("PRAGMA synchronous=NORMAL")
-    }
+/** 扫描器统一输出接口：全量构建（IndexBuilder）与未来的增量写入共用 */
+interface IndexSink {
+    fun add(path: String, parent: String, name: String, isDir: Boolean, size: Long, mtime: Long)
 }

@@ -33,10 +33,14 @@ object Engine {
     private val searchExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-search") }
     private val opsExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-ops") }
 
-    val db: SQLiteDatabase by lazy { Db.open(appContext) }
+    // 主库连接：全量重建原子替换后重开（db 访问全部在 scanExec/opsExec 上串行）
+    @Volatile
+    var db: SQLiteDatabase = SQLiteDatabase.create(null) // 占位，init 时替换
+        private set
 
     fun init(ctx: Context) {
         appContext = ctx.applicationContext
+        db = Db.openDb(appContext)
     }
 
     fun refreshRoot(): Boolean {
@@ -71,6 +75,11 @@ object Engine {
         return cur != scanFingerprint(rootIndex, systemIndex, deepData)
     }
 
+    /** FUSE 走查需跳过的子树（由 root 管道提供完整视图） */
+    private fun fuseSkip(rootIndex: Boolean, areas: List<Area>): Set<String> =
+        if (rootIndex && areas.any { it.display == "/storage/emulated/0/Android" })
+            setOf("/storage/emulated/0/Android") else emptySet()
+
     private fun scanFingerprint(rootIndex: Boolean, systemIndex: Boolean, deepData: Boolean) =
         "root=$rootIndex,sys=$systemIndex,deep=$deepData,tier=${PrivShell.tier()}"
 
@@ -81,7 +90,7 @@ object Engine {
     fun loadIndexAsync(cb: (Int) -> Unit) {
         scanExec.execute {
             try {
-                val count = db.rawQuery("SELECT COUNT(*) FROM files", null).use { c ->
+                val count = db.rawQuery("SELECT COUNT(*) FROM entry", null).use { c ->
                     if (c.moveToFirst()) c.getInt(0) else 0
                 }
                 val am = appContext
@@ -109,9 +118,8 @@ object Engine {
     }
 
     /**
-     * 全量重建：FUSE 扫描 /storage/emulated/0（+ 可选系统分区），
-     * root 开启时追加 /data/media/0/Android（Android/data+obb 解封锁）、
-     * /data/data、/data/local/tmp，统一写入 staging 后换表。
+     * 全量重建（v3）：并行 FUSE 扫描 + root 管道 → IndexBuilder 写独立
+     * index-new.db（journal=OFF 单事务）→ 建索引 → 原子 rename 顶替主库。
      */
     fun scanAsync(
         rootIndex: Boolean,
@@ -133,28 +141,20 @@ object Engine {
             rootGranted = SuShell.getAvailable(refresh = true)
             ShizukuShell.getAvailable(refresh = true)
             state = State.SCANNING
-            var txOpen = false
+            val builder = IndexBuilder(appContext)
             try {
                 val t0 = System.currentTimeMillis()
-                // 防御：上次异常可能让连接残留事务，导致 PRAGMA 报
-                // “Safety level may not be changed inside a transaction”
-                if (db.inTransaction()) {
-                    Log.w("ViewFile/Scan", "stale transaction detected, ending")
-                    db.setTransactionSuccessful()
-                    db.endTransaction()
-                }
-                Db.beginRebuild(db)
-                val writer = IndexWriter(db)
-                writer.beginTx()
-                txOpen = true
+                builder.begin()
                 var files = 0
                 var dirs = 0
 
                 val fuseRoots = mutableListOf("/storage/emulated/0")
                 if (systemIndex) fuseRoots += listOf("/system", "/vendor", "/product", "/odm")
+                // Android 子树改由 root 管道覆盖（FUSE 视图残缺且会重复入库）
+                val skip = fuseSkip(rootIndex, rootAreas(deepData))
                 for (root in fuseRoots) {
                     val t1 = System.currentTimeMillis()
-                    val c = Scanner().scanInto(writer, root) { f, d, cur ->
+                    val c = Scanner().scanInto(builder, root, skip) { f, d, cur ->
                         onProgress(files + f, dirs + d, cur)
                     }
                     files += c.files
@@ -167,21 +167,22 @@ object Engine {
                 val areas = rootAreas(deepData)
                 if (rootIndex && areas.isNotEmpty()) {
                     withRoot = true
-                    val rc = RootScanner().scanInto(writer, areas) { area, f, d ->
+                    val rc = RootScanner().scanInto(builder, areas) { area, f, d ->
                         onProgress(files + f, dirs + d, area)
                     }
                     files += rc.files
                     dirs += rc.dirs
                 }
 
-                writer.finishTx()
-                txOpen = false
-                try {
-                    Db.finishRebuild(db)
-                } catch (t: Throwable) {
-                    // VACUUM 等收尾失败不致命：索引本体已换表完成
-                    Log.w("ViewFile/Scan", "finishRebuild tail failed: ${t.message}")
+                val st = builder.finishAndSwap { fresh ->
+                    if (fresh != null) {
+                        db = fresh
+                    } else {
+                        try { db.close() } catch (_: Throwable) {}
+                    }
                 }
+                files = st.files
+                dirs = st.dirs
                 Db.setMeta(db, "scan_cfg", scanFingerprint(rootIndex, systemIndex, deepData))
 
                 val t2 = System.currentTimeMillis()
@@ -195,12 +196,7 @@ object Engine {
                         "index $n loaded in ${loadMs}ms, root=$withRoot")
                 onDone(r, null)
             } catch (t: Throwable) {
-                if (txOpen) {
-                    try {
-                        db.setTransactionSuccessful() // 写入不完整也先结束事务，避免连接卡死
-                        db.endTransaction()
-                    } catch (_: Throwable) {}
-                }
+                try { builder.abandon() } catch (_: Throwable) {}
                 state = State.IDLE
                 Log.e("ViewFile/Scan", "scan failed", t)
                 onDone(null, t.message ?: t.toString())
@@ -253,7 +249,8 @@ object Engine {
             val out = try {
                 state = State.SCANNING
                 val areas = if (rootIndex) rootAreas(deepData) else emptyList()
-                val r = SyncScanner(db).sync("/storage/emulated/0", areas)
+                val skip = fuseSkip(rootIndex, areas)
+                val r = SyncScanner(db, index).sync("/storage/emulated/0", areas, skip)
                 state = State.READY
                 // 无变化不重载索引（大库重载是秒级开销）
                 val changed = r.added + r.removed + r.updated
@@ -280,9 +277,13 @@ object Engine {
 
     /** 前台实时监听：变化触发增量对账，结果通过 onSynced 回调 */
     fun startWatcher(rootIndex: Boolean, deepData: Boolean, onSynced: (Map<String, Any?>) -> Unit) {
+        // 健康检查在引擎侧：已运行且目录映射非空则不重启（空库期误启的 0 目录实例会被替换）
+        watcher?.let { w ->
+            if (w.isRunning() && w.watchedDirCount > 0) return
+        }
         stopWatcher()
         val tier = PrivShell.tier()
-        val w = TreeWatcher(appContext, db, onDirty = {
+        val w = TreeWatcher(appContext, index, onDirty = {
             syncAsync(rootIndex, deepData) { m ->
                 if (m["ok"] == true) {
                     onSynced(m)

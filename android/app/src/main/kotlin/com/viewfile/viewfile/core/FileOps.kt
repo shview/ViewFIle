@@ -88,32 +88,12 @@ object FileOps {
         }
         if (!renamed) return "重命名失败（存储权限或跨区限制）"
 
-        val oldPath = old.absolutePath
-        val newPath = target.absolutePath
-        val oldSlash = "$oldPath/"
-        val len = oldSlash.length
-        db.beginTransaction()
-        try {
-            // 后代路径
-            db.execSQL(
-                "UPDATE files SET path=?||substr(path,?) WHERE substr(path,1,?)=?",
-                arrayOf<Any>(newPath, len, len, oldSlash)
-            )
-            // 后代的父目录
-            db.execSQL(
-                "UPDATE files SET parent=?||substr(parent,?) WHERE substr(parent,1,?)=?",
-                arrayOf<Any>(newPath, len, len, oldSlash)
-            )
-            // 自身
-            db.execSQL(
-                "UPDATE files SET path=?, name=? WHERE path=?",
-                arrayOf(newPath, clean, oldPath)
-            )
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
+        // v3 结构：重命名只改一行 name（后代经 parent_id 链天然正确）
+        val id = rowId(db, old.absolutePath)
+        if (id != null) {
+            db.execSQL("UPDATE entry SET name=? WHERE id=?", arrayOf(clean, id.toString()))
         }
-        Log.i(TAG, "renamed $oldPath -> $newPath")
+        Log.i(TAG, "renamed ${old.absolutePath} -> ${target.absolutePath}")
         return null
     }
 
@@ -170,11 +150,25 @@ object FileOps {
     }
 
     private fun removeRows(db: SQLiteDatabase, path: String) {
-        val slash = "$path/"
-        db.execSQL(
-            "DELETE FROM files WHERE path=? OR substr(path,1,?)=?",
-            arrayOf<Any>(path, slash.length, slash)
-        )
+        val id = rowId(db, path) ?: return
+        val isDir = Engine.index.dirIds.containsKey(path)
+        if (isDir) {
+            Db.deleteSubtree(db, id)
+            Engine.index.pruneDirMaps(path)
+        } else {
+            db.execSQL("DELETE FROM entry WHERE id=?", arrayOf(id.toString()))
+        }
+    }
+
+    /** 由路径解析 entry.id：目录走内存 dirIds，文件按 (parent_id,name) 查 */
+    private fun rowId(db: SQLiteDatabase, path: String): Long? {
+        Engine.index.dirIds[path]?.let { return it }
+        val parent = path.substringBeforeLast('/').ifEmpty { "/" }
+        val pid = Engine.index.dirIds[parent] ?: return null
+        return db.rawQuery(
+            "SELECT id FROM entry WHERE parent_id=? AND name=?",
+            arrayOf(pid.toString(), path.substringAfterLast('/'))
+        ).use { c -> if (c.moveToFirst()) c.getLong(0) else null }
     }
 
     // ---------- 工具 ----------

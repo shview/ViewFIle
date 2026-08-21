@@ -19,8 +19,9 @@ class Scanner {
     private class Rec(path: String, parent: String, name: String, isDir: Boolean, size: Long, mtime: Long)
 
     fun scanInto(
-        writer: IndexWriter,
+        writer: IndexSink,
         rootPath: String,
+        skipSubtrees: Set<String> = emptySet(),
         onProgress: ((files: Int, dirs: Int, current: String) -> Unit)? = null
     ): Count {
         val count = Count()
@@ -47,6 +48,7 @@ class Scanner {
                 try {
                     while (true) {
                         val dir = stack.pollFirst() ?: break
+                        if (dir.absolutePath in skipSubtrees) continue
                         val children = dir.listFiles() ?: continue
                         for (f in children) {
                             try {
@@ -56,7 +58,7 @@ class Scanner {
                                     if (isDir) 0L else f.length(), f.lastModified()))
                                 if (isDir) {
                                     dirs.incrementAndGet()
-                                    stack.addLast(f)
+                                    if (f.absolutePath !in skipSubtrees) stack.addLast(f)
                                 } else {
                                     files.incrementAndGet()
                                 }
