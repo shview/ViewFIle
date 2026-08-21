@@ -204,7 +204,7 @@ class SearchIndex {
             uniqOff[uc] = upos
             upos += b - a
             var j = i0
-            while (j < dense && cmpName(s, order[j], head) == 0) {
+            while (j < dense && cmpNameExact(s, order[j], head)) {
                 nameRef[order[j]] = uc
                 j++
             }
@@ -338,6 +338,21 @@ class SearchIndex {
             }
         }
         return out
+    }
+
+    /** 精确逐字节比较（去重用——大小写敏感，Tencent ≠ tencent） */
+    private fun cmpNameExact(s: SoA, x: Int, y: Int): Boolean {
+        val ax = s.nameOff[x + 1] - s.nameOff[x]
+        val ay = s.nameOff[y + 1] - s.nameOff[y]
+        if (ax != ay) return false
+        var i = s.nameOff[x]
+        var j = s.nameOff[y]
+        val end = i + ax
+        while (i < end) {
+            if (s.namePool[i] != s.namePool[j]) return false
+            i++; j++
+        }
+        return true
     }
 
     /** 折叠字节序比较 name(x) vs name(y) */

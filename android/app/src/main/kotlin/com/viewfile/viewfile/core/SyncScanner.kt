@@ -16,6 +16,10 @@ class SyncScanner(
 ) {
     class Result(val added: Int, val removed: Int, val updated: Int, val elapsedMs: Long)
 
+    /** 引擎侧扫描请求探针：同步各阶段检查，true 则中止本轮（Engine.scanAsync 置位） */
+    @Volatile
+    var scanRequestedBridge: (() -> Boolean)? = null
+
     private class Child(val name: String, val isDir: Boolean, val size: Long, val mtime: Long)
 
     private var added = 0
@@ -24,20 +28,25 @@ class SyncScanner(
 
     companion object {
         private const val MAX_RELIST_PER_SYNC = 2000
+        /** 内部控制流：同步让位给扫描请求（不视为错误） */
+        private val SCAN_YIELD = RuntimeException("__scan_yield__")
     }
 
     fun sync(fuseRoot: String, rootAreas: List<Area>, skipSubtrees: Set<String> = emptySet()): Result {
         val t0 = System.currentTimeMillis()
         added = 0; removed = 0; updated = 0
         try {
+            if (scanRequestedBridge?.invoke() == true) return abortedResult(t0)
             syncDirFuse(File(fuseRoot), skipSubtrees)
         } catch (t: Throwable) {
             Log.w("ViewFile/Sync", "fuse walk failed: ${t.message}")
         }
         for (area in rootAreas) {
+            if (scanRequestedBridge?.invoke() == true) return abortedResult(t0)
             try {
                 syncRootArea(area)
             } catch (t: Throwable) {
+                if (t === SCAN_YIELD) return abortedResult(t0)
                 Log.w("ViewFile/Sync", "root area ${area.display} failed: ${t.message}")
             }
         }
@@ -79,6 +88,11 @@ class SyncScanner(
 
     private fun inArea(p: String, area: String) = p == area || p.startsWith("$area/")
 
+    private fun abortedResult(t0: Long): Result {
+        Log.i("ViewFile/Sync", "sync yielded to scan request")
+        return Result(added, removed, updated, System.currentTimeMillis() - t0)
+    }
+
     private fun syncRootArea(area: Area) {
         val display = area.display
         val depthArg = if (area.depth > 0) " -maxdepth ${area.depth}" else ""
@@ -91,12 +105,27 @@ class SyncScanner(
             val mtime = (line.substring(i + 1).trim().toLongOrNull() ?: return@runStream) * 1000
             actual[RootScanner.toDisplay(line.substring(0, i))] = mtime
         }
-        if (!res.ok && actual.isEmpty()) return
+        // 管道失败（rc≠0）：结果不可信，本区整体跳过——既不删也不重列。
+        // 曾因部分失败误删 15.5 万条（find 部分输出被当成"目录已消失"）
+        if (!res.ok) {
+            Log.w("ViewFile/Sync", "area $display dir-stat rc=${res.code}, skip area")
+            return
+        }
 
-        // 库里有、实际没有 → 整树删除
+        // 库里有、实际没有 → 整树删除。
+        // 大规模删除守卫：超过已知量 1/5 或绝对值 2000 视为管道异常（部分输出），
+        // 本轮不删，留给全量重建收敛
         val toDelete = ArrayList<String>()
+        var knownInArea = 0
         for (p in index.dirIds.keys) {
-            if (inArea(p, display) && !actual.containsKey(p)) toDelete.add(p)
+            if (!inArea(p, display)) continue
+            knownInArea++
+            if (!actual.containsKey(p)) toDelete.add(p)
+        }
+        if (toDelete.size > 2000 && toDelete.size > knownInArea / 5) {
+            Log.w("ViewFile/Sync",
+                "area $display: suspect mass delete ${toDelete.size}/$knownInArea, skip deletions")
+            toDelete.clear()
         }
         for (p in toDelete) {
             val id = index.dirIds[p] ?: continue
@@ -124,6 +153,7 @@ class SyncScanner(
                     "this run=${capped.size} (rest converges next sync)")
         }
         for (chunk in capped.chunked(300)) {
+            if (scanRequestedBridge?.invoke() == true) throw SCAN_YIELD
             val finds = chunk.joinToString(" ") {
                 "find ${shq(RootScanner.toRaw(it))} -mindepth 1 -maxdepth 1 -print0;"
             }
@@ -162,7 +192,16 @@ class SyncScanner(
         if (path == "/" || path.isEmpty()) return 0L
         val parent = path.substringBeforeLast('/').ifEmpty { "/" }
         val pid = if (parent == path) 0L else ensureDir(parent, 0, update = false)
-        val id = insertEntry(pid, path.substringAfterLast('/'), true, 0, mtime)
+        // 先查 DB (parent_id, name) 防平行链：ensureDir 的内存映射 miss 不代表库里没有
+        val name = path.substringAfterLast('/')
+        val existing = db.rawQuery(
+            "SELECT id FROM entry WHERE parent_id=? AND name=? AND type=1",
+            arrayOf(pid.toString(), name)).use { c -> if (c.moveToFirst()) c.getLong(0) else -1L }
+        if (existing != -1L) {
+            index.markDir(path, existing, mtime)
+            return existing
+        }
+        val id = insertEntry(pid, name, true, 0, mtime)
         if (id == -1L) {
             // 已存在但内存映射缺失：取回 id，不计新增
             return db.rawQuery(

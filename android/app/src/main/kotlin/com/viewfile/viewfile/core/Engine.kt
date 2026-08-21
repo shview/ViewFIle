@@ -11,7 +11,7 @@ import java.util.concurrent.Executors
  * （scan=扫描/载入，search=搜索/浏览，ops=文件写操作）。
  */
 object Engine {
-    enum class State { IDLE, SCANNING, READY }
+    enum class State { IDLE, SCANNING, SYNCING, READY }
 
     @Volatile var state = State.IDLE
         private set
@@ -130,13 +130,17 @@ object Engine {
         onProgress: (files: Int, dirs: Int, current: String) -> Unit,
         onDone: (Result?, String?) -> Unit
     ) {
-        // 前置检查（含 su 探测，最长数秒）全部后台执行，避免阻塞主线程触发 ANR
+        // 前置检查（含 su 探测，最长数秒）全部后台执行，避免阻塞主线程触发 ANR。
+        // scanRequested 让排队中的同步立即让位（单线程队列里同步可能占住几十秒）
+        scanRequested = true
         scanExec.execute {
             if (!File("/storage/emulated/0").canRead()) {
+                scanRequested = false
                 onDone(null, "无法读取外部存储（缺少“所有文件访问”权限）")
                 return@execute
             }
             if (state == State.SCANNING) {
+                scanRequested = false
                 onDone(null, "扫描已在进行中")
                 return@execute
             }
@@ -202,9 +206,16 @@ object Engine {
                 state = State.IDLE
                 Log.e("ViewFile/Scan", "scan failed", t)
                 onDone(null, t.message ?: t.toString())
+            } finally {
+                scanRequested = false
             }
         }
     }
+
+    /** 同步在各阶段检查此标志，扫描请求到达时立即让位 */
+    @Volatile
+    var scanRequested = false
+        private set
 
     fun searchAsync(query: String, limit: Int, scopes: List<String>?, cb: (List<SearchIndex.Hit>) -> Unit) {
         searchExec.execute {
@@ -248,11 +259,18 @@ object Engine {
             return
         }
         scanExec.execute {
+            // 排队期间来了扫描请求：直接让位（同步随时可重跑，扫描等不起）
+            if (scanRequested) {
+                cb(mapOf("ok" to false, "error" to "扫描请求优先"))
+                return@execute
+            }
             val out = try {
-                state = State.SCANNING
+                state = State.SYNCING
                 val areas = if (rootIndex) rootAreas(deepData) else emptyList()
                 val skip = fuseSkip(rootIndex, areas)
-                val r = SyncScanner(db, index).sync("/storage/emulated/0", areas, skip)
+                val scanner = SyncScanner(db, index)
+                scanner.scanRequestedBridge = { scanRequested }
+                val r = scanner.sync("/storage/emulated/0", areas, skip)
                 state = State.READY
                 // 无变化不重载索引（大库重载是秒级开销）
                 val changed = r.added + r.removed + r.updated
