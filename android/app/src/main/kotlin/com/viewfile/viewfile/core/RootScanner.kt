@@ -1,7 +1,7 @@
 package com.viewfile.viewfile.core
 
 /**
- * root 区域扫描：单条 `find -print0 | xargs -0 stat` 管道流式输出
+ * root 区域扫描：单条 `find -exec stat ... {} +` 命令流式输出
  * '路径|类型|大小|mtime秒'，C 速度遍历 + 全元数据。
  * rawPrefix→displayPrefix 映射（如 /data/media/0/Android → /storage/emulated/0/Android）
  * 让 FUSE 隐藏区在索引/浏览里显示为用户熟悉的路径并自动去重。
@@ -21,7 +21,11 @@ class RootScanner {
             val raw = area.raw
             val display = area.display
             val depthArg = if (area.depth > 0) " -maxdepth ${area.depth}" else ""
-            val cmd = "find ${shq(raw)}$depthArg -print0 | xargs -0 -r stat -c '%n|%F|%s|%Y' 2>/dev/null"
+            // 不使用 pipeline：否则 shell 只返回末端 xargs 的 rc，上游 find 失败会
+            // 被掩盖。toybox find(API 26+) 的 -exec ... {} + 能批量 stat 且整体 rc
+            // 直接代表遍历是否完整。换行文件名的既有限制保持不变。
+            val cmd = "find ${shq(raw)}$depthArg " +
+                    "-exec stat -c '%n|%F|%s|%Y' '{}' + 2>/dev/null"
             val areaStart = System.currentTimeMillis()
             var areaFiles = 0
             var areaDirs = 0
@@ -45,8 +49,11 @@ class RootScanner {
                 }
             }
             logScanDone(display, areaFiles, areaDirs, System.currentTimeMillis() - areaStart)
-            if (!res.ok && res.err.isNotBlank()) {
-                android.util.Log.w("ViewFile/Scan", "root scan $raw rc=${res.code} err=${res.err.take(200)}")
+            if (!res.ok) {
+                val detail = res.err.take(200).ifBlank { "rc=${res.code}" }
+                // IndexBuilder 写的是独立构建库；抛出后 Engine 会 abort，不允许把
+                // root 管道的部分输出当成一次成功全量扫描发布。
+                throw IllegalStateException("root scan $raw failed: $detail")
             }
         }
         return total

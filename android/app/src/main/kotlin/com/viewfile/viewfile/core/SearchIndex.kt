@@ -2,6 +2,7 @@ package com.viewfile.viewfile.core
 
 import android.database.sqlite.SQLiteDatabase
 import android.util.Log
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 内存索引 v4（SoA，紧凑结构）：以“名字池 + 平行数组”取代逐条目对象模型，
@@ -14,12 +15,12 @@ import android.util.Log
  */
 class SearchIndex {
     /** 命中投影：密集下标，属性经访问器读取 */
-    class Hit(val idx: Int)
+    class Hit internal constructor(val idx: Int, internal val owner: Snapshot)
 
     /** 目录统计：直接子项数 / 递归条数 / 递归总大小 */
-    class DirStat(var direct: Int = 0, var recCount: Int = 0, var recSize: Long = 0)
+    class DirStat(val direct: Int = 0, val recCount: Int = 0, val recSize: Long = 0)
 
-    private class SoA(val n: Int) {
+    internal class SoA(val n: Int) {
         var nameOff = IntArray(n + 1)   // 载入期原始偏移；去重后变为唯一名偏移
         var nameRef = IntArray(0)       // 去重后：条目 → 唯一名下标
         val parentId = IntArray(n)      // 密集父下标；根 = -1
@@ -34,54 +35,67 @@ class SearchIndex {
         var sortIdx: IntArray? = null
     }
 
-    @Volatile
-    private var soa: SoA? = null
-    private val dirStats = HashMap<String, DirStat>()
-    private val denseStats = HashMap<Int, DirStat>()   // 密集下标 → 统计（目录）
+    /** 一个完整且内部一致的索引代际；load 构建完全部字段后只发布一次。 */
+    internal class Snapshot(
+        val soa: SoA?,
+        val dirIds: ConcurrentHashMap<String, Long>,
+        val dirMtimes: ConcurrentHashMap<String, Long>,
+        val dirDenseIdx: ConcurrentHashMap<Long, Int>,
+        val denseStats: Map<Int, DirStat>
+    )
 
-    // 同步与范围查询映射
-    val dirIds = HashMap<String, Long>()       // path → dbId
-    val dirMtimes = HashMap<String, Long>()    // path → mtime
-    private val dirDenseIdx = HashMap<Long, Int>()  // dbId → 密集下标（仅目录）
+    private val mutationLock = Any()
+    @Volatile private var snapshot = emptySnapshot()
 
-    fun size() = soa?.n ?: 0
+    fun size() = snapshot.soa?.n ?: 0
+    fun dirId(path: String): Long? = snapshot.dirIds[path]
+    fun dirMtime(path: String): Long? = snapshot.dirMtimes[path]
+    fun directoryPaths(): List<String> = snapshot.dirIds.keys.toList()
+    fun containsDir(path: String): Boolean = snapshot.dirIds.containsKey(path)
 
     fun statsFor(path: String): DirStat? {
-        val id = dirIds[path] ?: return null
-        val idx = dirDenseIdx[id] ?: return null
-        return denseStats[idx]
+        val snap = snapshot
+        val id = snap.dirIds[path] ?: return null
+        val idx = snap.dirDenseIdx[id] ?: return null
+        return snap.denseStats[idx]
     }
 
     fun pruneDirMaps(prefix: String) {
-        val p = if (prefix.endsWith("/")) prefix else "$prefix/"
-        dirIds.keys.removeIf { it == prefix || it.startsWith(p) }
-        dirMtimes.keys.removeIf { it == prefix || it.startsWith(p) }
+        synchronized(mutationLock) {
+            val snap = snapshot
+            val p = if (prefix.endsWith("/")) prefix else "$prefix/"
+            snap.dirIds.keys.removeIf { it == prefix || it.startsWith(p) }
+            snap.dirMtimes.keys.removeIf { it == prefix || it.startsWith(p) }
+        }
     }
 
     fun markDir(path: String, id: Long, mtime: Long) {
-        dirIds[path] = id
-        dirMtimes[path] = mtime
-        // dense 下标未知（同步新建目录）：置 -1，下次载入补齐
-        if (!dirDenseIdx.containsKey(id)) dirDenseIdx[id] = -1
+        synchronized(mutationLock) {
+            val snap = snapshot
+            snap.dirIds[path] = id
+            snap.dirMtimes[path] = mtime
+            // dense 下标未知（同步新建目录）：置 -1，下次载入补齐
+            snap.dirDenseIdx.putIfAbsent(id, -1)
+        }
     }
 
     // ---------- 结果访问器 ----------
 
     fun nameOf(h: Hit): String {
-        val s = soa ?: return ""
+        val s = h.owner.soa ?: return ""
         val r = s.nameRef[h.idx]
         val a = s.nameOff[r]
         return String(s.namePool, a, s.nameOff[r + 1] - a, Charsets.UTF_8)
     }
 
-    fun isDirOf(h: Hit): Boolean = soa!!.isDir[h.idx].toInt() == 1
-    fun sizeOf(h: Hit): Long = soa!!.size[h.idx]
-    fun mtimeOf(h: Hit): Long = soa!!.mtime[h.idx]
-    fun idOf(h: Hit): Long = soa!!.entryId[h.idx]
+    fun isDirOf(h: Hit): Boolean = h.owner.soa!!.isDir[h.idx].toInt() == 1
+    fun sizeOf(h: Hit): Long = h.owner.soa!!.size[h.idx]
+    fun mtimeOf(h: Hit): Long = h.owner.soa!!.mtime[h.idx]
+    fun idOf(h: Hit): Long = h.owner.soa!!.entryId[h.idx]
 
     /** 沿 parent 链重建完整显示路径 */
     fun pathOf(h: Hit): String {
-        val s = soa ?: return ""
+        val s = h.owner.soa ?: return ""
         return pathOfIdx(s, h.idx)
     }
 
@@ -101,13 +115,13 @@ class SearchIndex {
 
     // ---------- 载入 ----------
 
-    fun load(db: SQLiteDatabase): Int {
+    fun load(db: SQLiteDatabase): Int = synchronized(mutationLock) {
+        loadLocked(db)
+    }
+
+    /** mutationLock 覆盖整个构建：并发 mark/prune 等新代发布后再执行，不会丢更新。 */
+    private fun loadLocked(db: SQLiteDatabase): Int {
         val t0 = System.currentTimeMillis()
-        dirStats.clear()
-        dirIds.clear()
-        dirMtimes.clear()
-        dirDenseIdx.clear()
-        denseStats.clear()
 
         val total = db.rawQuery("SELECT COUNT(*) FROM entry", null).use { c ->
             if (c.moveToFirst()) c.getInt(0) else 0
@@ -116,7 +130,7 @@ class SearchIndex {
             if (c.moveToFirst()) c.getLong(0) else 0L
         }
         if (total == 0 || maxId == 0L) {
-            soa = null
+            snapshot = emptySnapshot()
             return 0
         }
         val s = SoA(total)
@@ -181,8 +195,6 @@ class SearchIndex {
             s.tout[u] = timer
         }
         for (i in 0 until dense) if (s.parentId[i] == -1) dfs(i)
-        soa = s
-
         // 排序 + 池去重必须先于目录映射：pathOfIdx 依赖去重后的 nameRef/nameOff
         // （曾因顺序颠倒，目录映射读到 IntArray(0) 的 nameRef → length=0; index=0）
         // 免装箱 IntArray 三路快排（按名、折叠大小写）；装箱排序在 5M 时瞬时 +80MB
@@ -218,34 +230,31 @@ class SearchIndex {
         s.nameRef = nameRef
         s.sortIdx = order
 
-        // 目录映射 + 统计（密集空间聚合，只有目录需要路径字符串）
+        // 目录映射 + 统计全部构建在局部变量中，完成前不触碰当前服务代际。
+        val newDirIds = HashMap<String, Long>()
+        val newDirMtimes = HashMap<String, Long>()
+        val newDirDenseIdx = HashMap<Long, Int>()
         for (i in 0 until dense) {
             if (s.isDir[i].toInt() != 1) continue
             val path = pathOfIdx(s, i)
-            dirIds[path] = s.entryId[i]
-            dirMtimes[path] = s.mtime[i]
-            dirDenseIdx[s.entryId[i]] = i
+            newDirIds[path] = s.entryId[i]
+            newDirMtimes[path] = s.mtime[i]
+            newDirDenseIdx[s.entryId[i]] = i
         }
-        for (i in 0 until dense) {
-            val p = s.parentId[i]
-            if (p < 0) continue
-            val st = denseStats.getOrPut(p) { DirStat() }
-            st.direct++
-            st.recCount++
-            if (s.isDir[i].toInt() == 0) st.recSize += s.size[i]
+        val aggregate = aggregateDirectoryStats(s.parentId, s.isDir, s.size, s.tin)
+        val newDenseStats = HashMap<Int, DirStat>(aggregate.size)
+        for ((idx, st) in aggregate) {
+            newDenseStats[idx] = DirStat(st.direct, st.recursiveCount, st.recursiveSize)
         }
-        // 子树向上聚合：按 tout 降序处理目录（父在全部子之后）
-        val dirIdxs = ArrayList<Int>(dirDenseIdx.size)
-        for (i in 0 until dense) if (s.isDir[i].toInt() == 1) dirIdxs.add(i)
-        dirIdxs.sortByDescending { s.tout[it] }
-        for (di in dirIdxs) {
-            val st = denseStats[di] ?: continue
-            val p = s.parentId[di]
-            if (p < 0) continue
-            val ps = denseStats.getOrPut(p) { DirStat() }
-            ps.recCount += st.recCount
-            ps.recSize += st.recSize
-        }
+
+        // 所有数组、排序、名字池、目录映射与统计均已就绪；一次 volatile 发布。
+        snapshot = Snapshot(
+            s,
+            ConcurrentHashMap(newDirIds),
+            ConcurrentHashMap(newDirMtimes),
+            ConcurrentHashMap(newDirDenseIdx),
+            newDenseStats.toMap()
+        )
 
         Log.i("ViewFile/Scan",
             "SoA built: $dense entries, ${uc} uniq names, pool ${(uniqBytes shr 10)}KB, " +
@@ -260,13 +269,14 @@ class SearchIndex {
      * 空关键词 + scopes = 列出范围内条目；按 sortIdx 序取前 limit。
      */
     fun query(raw: String, limit: Int, scopes: List<String>? = null): List<Hit> {
-        val s = soa ?: return emptyList()
+        val snap = snapshot
+        val s = snap.soa ?: return emptyList()
         val n = s.n
         if (n == 0) return emptyList()
 
         val intervals = scopes?.mapNotNull { path ->
-            val id = dirIds[path] ?: return@mapNotNull null
-            val idx = dirDenseIdx[id] ?: return@mapNotNull null
+            val id = snap.dirIds[path] ?: return@mapNotNull null
+            val idx = snap.dirDenseIdx[id] ?: return@mapNotNull null
             if (idx < 0) null else intArrayOf(s.tin[idx], s.tout[idx])
         }
         val hasScope = !intervals.isNullOrEmpty()
@@ -319,7 +329,7 @@ class SearchIndex {
             while (seq.hasNext()) {
                 val i = seq.nextInt()
                 if (inScope(i)) {
-                    out.add(Hit(i))
+                    out.add(Hit(i, snap))
                     if (out.size >= limit) break
                 }
             }
@@ -333,12 +343,20 @@ class SearchIndex {
                 if (!nameContainsFold(i, tok)) { hit = false; break }
             }
             if (hit) {
-                out.add(Hit(i))
+                out.add(Hit(i, snap))
                 if (out.size >= limit) break
             }
         }
         return out
     }
+
+    private fun emptySnapshot() = Snapshot(
+        null,
+        ConcurrentHashMap(),
+        ConcurrentHashMap(),
+        ConcurrentHashMap(),
+        emptyMap()
+    )
 
     /** 精确逐字节比较（去重用——大小写敏感，Tencent ≠ tencent） */
     private fun cmpNameExact(s: SoA, x: Int, y: Int): Boolean {

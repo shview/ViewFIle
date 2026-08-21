@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/engine_api.dart';
 import '../utils/format.dart';
+import '../utils/index_bootstrap.dart';
 import 'apps_page.dart';
 import 'settings_page.dart';
 import 'tips_page.dart';
@@ -60,8 +61,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _selecting = false;
   final Set<String> _selected = {};
 
-  bool get _isSearching => _searchCtl.text.trim().isNotEmpty || _appScope != null;
-  List<Map<dynamic, dynamic>> get _displayList => _isSearching ? _results : _dirEntries;
+  bool get _isSearching =>
+      _searchCtl.text.trim().isNotEmpty || _appScope != null;
+  List<Map<dynamic, dynamic>> get _displayList =>
+      _isSearching ? _results : _dirEntries;
 
   @override
   void initState() {
@@ -98,19 +101,52 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _bootstrap() async {
-    await _prefsReady;  // 必须先拿到真实配置，否则深度开关等会被漏检（走同步收敛的错路）
+    await _prefsReady; // 必须先拿到真实配置，否则深度开关等会被漏检（走同步收敛的错路）
     final ok = await _api.hasPermission();
     setState(() => _hasPerm = ok);
     if (!ok) return;
     final n = await _api.ensureIndexLoaded(); // 先载入索引（目录统计依赖它）
+    final loadDisposition = classifyIndexLoad(n);
+    if (loadDisposition == IndexLoadDisposition.rebuildCompact) {
+      // 原生已清掉超预算/损坏的库；持久关闭深度索引后只尝试一次精简重建，
+      // 避免下次启动继续用原配置重建并再次触发同一保护。
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('deepDataIndex', false);
+      if (!mounted) return;
+      setState(() {
+        _deepData = false;
+        _entries = 0;
+        _statusLine = '索引无法载入或超出内存预算，正在以精简模式重建…';
+      });
+      _loadDir(_currentDir);
+      await _api.startScan(
+        rootIndex: _rootIndex,
+        systemIndex: _systemIndex,
+        deepData: false,
+      );
+      _ensureWatcher();
+      return;
+    }
+    if (!mounted) return;
     setState(() => _entries = n);
     _loadDir(_currentDir);
-    if (n == 0) {
-      await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex, deepData: _deepData);
+    if (loadDisposition == IndexLoadDisposition.rebuildConfigured) {
+      await _api.startScan(
+        rootIndex: _rootIndex,
+        systemIndex: _systemIndex,
+        deepData: _deepData,
+      );
     } else if (await _api.needsRescan(
-        rootIndex: _rootIndex, systemIndex: _systemIndex)) {
+      rootIndex: _rootIndex,
+      systemIndex: _systemIndex,
+      deepData: _deepData,
+    )) {
       // 配置变化（如 root 授权状态变化）→ 自动重扫
-      await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex, deepData: _deepData);
+      await _api.startScan(
+        rootIndex: _rootIndex,
+        systemIndex: _systemIndex,
+        deepData: _deepData,
+      );
     } else {
       _refreshStats();
       _autoSync();
@@ -185,8 +221,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // 去重由引擎侧健康检查负责（避免空库期误启后无法替换）
   void _ensureWatcher() {
-    if (_hasPerm != true) return
-    ;
+    if (_hasPerm != true) return;
     _api.startWatcher(rootIndex: _rootIndex, deepData: _deepData);
   }
 
@@ -208,7 +243,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() {
       _loadingDir = false;
       if (r['ok'] == true) {
-        _dirEntries = List<Map<dynamic, dynamic>>.from(r['entries'] ?? const []);
+        _dirEntries = List<Map<dynamic, dynamic>>.from(
+          r['entries'] ?? const [],
+        );
       } else {
         _dirEntries = const [];
         _dirError = r['error'] as String?;
@@ -236,13 +273,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final dirs = List<String>.from(_appScope!['dirs']);
       setState(() {
         _results = dirs
-            .map((d) => <dynamic, dynamic>{
-                  'path': d,
-                  'name': _appDirLabel(d),
-                  'isDir': true,
-                  'size': 0,
-                  'mtime': 0,
-                })
+            .map(
+              (d) => <dynamic, dynamic>{
+                'path': d,
+                'name': _appDirLabel(d),
+                'isDir': true,
+                'size': 0,
+                'mtime': 0,
+              },
+            )
             .toList();
         _searching = false;
       });
@@ -300,14 +339,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // ---------- 多选 ----------
 
-  void _enterSelection(String path) =>
-      setState(() { _selecting = true; _selected.add(path); });
+  void _enterSelection(String path) => setState(() {
+    _selecting = true;
+    _selected.add(path);
+  });
 
   void _toggle(String path) => setState(() {
-        if (!_selected.remove(path)) {
-          _selected.add(path);
-        }
-      });
+    if (!_selected.remove(path)) {
+      _selected.add(path);
+    }
+  });
 
   void _exitSelection() => setState(() => _exitSelectionRaw());
 
@@ -317,15 +358,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   void _selectAll() => setState(() {
-        _selected.addAll(_displayList.map((e) => e['path'] as String));
-      });
+    _selected.addAll(_displayList.map((e) => e['path'] as String));
+  });
 
   List<Map<dynamic, dynamic>> get _selectedItems => _displayList
       .where((e) => _selected.contains(e['path'] as String?))
       .toList(growable: false);
 
   bool get _allSelectedAreFiles =>
-      _selectedItems.isNotEmpty && _selectedItems.every((e) => e['isDir'] != true);
+      _selectedItems.isNotEmpty &&
+      _selectedItems.every((e) => e['isDir'] != true);
 
   // ---------- 文件操作 ----------
 
@@ -346,8 +388,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _copyPaths(List<String> paths) async {
     await Clipboard.setData(ClipboardData(text: paths.join('\n')));
     if (mounted) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('已复制 ${paths.length} 条路径')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('已复制 ${paths.length} 条路径')));
     }
   }
 
@@ -365,8 +408,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           decoration: const InputDecoration(hintText: '新名称'),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('确定')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('确定'),
+          ),
         ],
       ),
     );
@@ -374,11 +423,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final r = await _api.rename(path, ctl.text);
     if (!mounted) return;
     if (r['ok'] == true) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已重命名')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('已重命名')));
       _rerun();
     } else {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('重命名失败: ${r['error']}')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('重命名失败: ${r['error']}')));
     }
   }
 
@@ -398,10 +450,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           style: const TextStyle(fontSize: 14),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
           FilledButton.tonal(
             style: FilledButton.styleFrom(
-                backgroundColor: Theme.of(context).colorScheme.errorContainer),
+              backgroundColor: Theme.of(context).colorScheme.errorContainer,
+            ),
             onPressed: () => Navigator.pop(context, true),
             child: const Text('删除'),
           ),
@@ -412,14 +468,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final r = await _api.delete(items.map((e) => e['path'] as String).toList());
     if (!mounted) return;
     if (r['ok'] == true) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('已删除 ${r['deleted']} 项')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('已删除 ${r['deleted']} 项')));
       _exitSelection();
       _rerun();
     } else {
       final failedCount = (r['failedCount'] as num?)?.toInt() ?? 0;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('部分失败：已删 ${r['deleted']} 项，失败 $failedCount 项（${r['error']}）')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '部分失败：已删 ${r['deleted']} 项，失败 $failedCount 项（${r['error']}）',
+          ),
+        ),
+      );
       _rerun();
     }
   }
@@ -427,7 +489,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _rescan() async {
     if (_scanning) return;
     // 二次确认：全量重建耗时与库规模成正比
-    final lastSec = _lastScanMs > 0 ? '（上次约 ${(_lastScanMs / 1000).toStringAsFixed(0)} 秒）' : '';
+    final lastSec = _lastScanMs > 0
+        ? '（上次约 ${(_lastScanMs / 1000).toStringAsFixed(0)} 秒）'
+        : '';
     final ok = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -438,8 +502,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           style: const TextStyle(fontSize: 14),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('开始')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('开始'),
+          ),
         ],
       ),
     );
@@ -453,7 +523,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _scanning = true;
       _statusLine = '正在启动扫描…';
     });
-    await _api.startScan(rootIndex: _rootIndex, systemIndex: _systemIndex, deepData: _deepData);
+    await _api.startScan(
+      rootIndex: _rootIndex,
+      systemIndex: _systemIndex,
+      deepData: _deepData,
+    );
   }
 
   @override
@@ -481,7 +555,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      canPop: !_selecting && _appScope == null && !(_currentDir != kSdcard && !_isSearching),
+      canPop:
+          !_selecting &&
+          _appScope == null &&
+          !(_currentDir != kSdcard && !_isSearching),
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
         if (_selecting) {
@@ -518,11 +595,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ),
         title: Text('已选 ${_selected.length} 项'),
         actions: [
-          IconButton(tooltip: '全选当前列表', icon: const Icon(Icons.select_all), onPressed: _selectAll),
+          IconButton(
+            tooltip: '全选当前列表',
+            icon: const Icon(Icons.select_all),
+            onPressed: _selectAll,
+          ),
           IconButton(
             tooltip: '分享',
             icon: const Icon(Icons.share),
-            onPressed: _allSelectedAreFiles ? () => _sharePaths(_selected.toList()) : null,
+            onPressed: _allSelectedAreFiles
+                ? () => _sharePaths(_selected.toList())
+                : null,
           ),
           IconButton(
             tooltip: '复制路径',
@@ -531,7 +614,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
           IconButton(
             tooltip: '删除',
-            icon: Icon(Icons.delete, color: Theme.of(context).colorScheme.error),
+            icon: Icon(
+              Icons.delete,
+              color: Theme.of(context).colorScheme.error,
+            ),
             onPressed: () => _confirmDelete(_selectedItems),
           ),
         ],
@@ -540,8 +626,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final title = _appScope != null
         ? '应用：${_appScope!['label']}'
         : _isSearching
-            ? '搜索${_scopeAll ? '（全盘）' : '（当前目录）'}'
-            : _dirTitle(_currentDir);
+        ? '搜索${_scopeAll ? '（全盘）' : '（当前目录）'}'
+        : _dirTitle(_currentDir);
     return AppBar(
       title: Text(title),
       actions: [
@@ -565,16 +651,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _saveSort();
           },
           itemBuilder: (_) => [
-            CheckedPopupMenuItem(value: 'name', checked: _sortKey == 'name', child: const Text('名称')),
-            CheckedPopupMenuItem(value: 'size', checked: _sortKey == 'size', child: const Text('大小')),
-            CheckedPopupMenuItem(value: 'time', checked: _sortKey == 'time', child: const Text('修改时间')),
+            CheckedPopupMenuItem(
+              value: 'name',
+              checked: _sortKey == 'name',
+              child: const Text('名称'),
+            ),
+            CheckedPopupMenuItem(
+              value: 'size',
+              checked: _sortKey == 'size',
+              child: const Text('大小'),
+            ),
+            CheckedPopupMenuItem(
+              value: 'time',
+              checked: _sortKey == 'time',
+              child: const Text('修改时间'),
+            ),
             const PopupMenuDivider(),
-            CheckedPopupMenuItem(value: 'desc', checked: _sortDesc, child: const Text('降序')),
+            CheckedPopupMenuItem(
+              value: 'desc',
+              checked: _sortDesc,
+              child: const Text('降序'),
+            ),
           ],
         ),
         IconButton(
           tooltip: '上一级',
-          onPressed: (_isSearching || (_currentDir == kSdcard && !_root) || _currentDir == '/')
+          onPressed:
+              (_isSearching ||
+                  (_currentDir == kSdcard && !_root) ||
+                  _currentDir == '/')
               ? null
               : _navigateUp,
           icon: const Icon(Icons.arrow_upward),
@@ -617,7 +722,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       ),
                     const SizedBox(height: 4),
                     Text(
-                      '访问层级：${switch (_tier) { 'ROOT' => 'root（T3）', 'SHIZUKU' => 'Shizuku（T2）', _ => '免 root（T1）' }}',
+                      '访问层级：${switch (_tier) {
+                        'ROOT' => 'root（T3）',
+                        'SHIZUKU' => 'Shizuku（T2）',
+                        _ => '免 root（T1）',
+                      }}',
                       style: theme.textTheme.bodySmall,
                     ),
                   ],
@@ -651,14 +760,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ListTile(
               leading: const Icon(Icons.apps),
               title: const Text('按应用检索'),
-              subtitle: Text('搜某应用的 /data/data 与 Android/data',
-                  style: theme.textTheme.bodySmall),
+              subtitle: Text(
+                '搜某应用的 /data/data 与 Android/data',
+                style: theme.textTheme.bodySmall,
+              ),
               onTap: () async {
                 Navigator.pop(context);
                 final picked = await Navigator.push<Map<String, dynamic>>(
-                    context,
-                    MaterialPageRoute(
-                        builder: (_) => AppsPage(rootAvailable: _root)));
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => AppsPage(rootAvailable: _root),
+                  ),
+                );
                 if (picked != null && mounted) {
                   setState(() => _appScope = picked);
                   _runQuery(_searchCtl.text);
@@ -676,8 +789,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ListTile(
               leading: const Icon(Icons.admin_panel_settings_outlined),
               title: const Text('系统存储权限'),
-              subtitle: Text(_hasPerm == true ? '已授权' : '未授权',
-                  style: theme.textTheme.bodySmall),
+              subtitle: Text(
+                _hasPerm == true ? '已授权' : '未授权',
+                style: theme.textTheme.bodySmall,
+              ),
               onTap: () => _api.requestPermission(),
             ),
             ListTile(
@@ -685,11 +800,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               title: const Text('设置'),
               onTap: () async {
                 Navigator.pop(context);
-                final changed = await Navigator.push<bool>(context,
-                    MaterialPageRoute(builder: (_) => const SettingsPage()));
+                final changed = await Navigator.push<bool>(
+                  context,
+                  MaterialPageRoute(builder: (_) => const SettingsPage()),
+                );
                 if (changed == true) {
                   await _loadPrefs();
-                  if (mounted && await _api.needsRescan(rootIndex: _rootIndex, systemIndex: _systemIndex, deepData: _deepData)) {
+                  if (mounted &&
+                      await _api.needsRescan(
+                        rootIndex: _rootIndex,
+                        systemIndex: _systemIndex,
+                        deepData: _deepData,
+                      )) {
                     _rescan();
                   }
                 }
@@ -698,12 +820,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ListTile(
               leading: const Icon(Icons.tips_and_updates_outlined),
               title: const Text('使用提示与已知限制'),
-              subtitle: Text('访问分层 · 实时性边界 · 操作风险',
-                  style: theme.textTheme.bodySmall),
+              subtitle: Text(
+                '访问分层 · 实时性边界 · 操作风险',
+                style: theme.textTheme.bodySmall,
+              ),
               onTap: () {
                 Navigator.pop(context);
-                Navigator.push(context,
-                    MaterialPageRoute(builder: (_) => const TipsPage()));
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const TipsPage()),
+                );
               },
             ),
             const Divider(height: 1),
@@ -733,11 +859,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             const Icon(Icons.folder_open),
             const SizedBox(width: 12),
             const Expanded(
-              child: Text('需要“所有文件访问”权限才能建立文件索引',
-                  style: TextStyle(fontSize: 14)),
+              child: Text(
+                '需要“所有文件访问”权限才能建立文件索引',
+                style: TextStyle(fontSize: 14),
+              ),
             ),
             FilledButton(
-              onPressed: _hasPerm == null ? null : () => _api.requestPermission(),
+              onPressed: _hasPerm == null
+                  ? null
+                  : () => _api.requestPermission(),
               child: const Text('去授权'),
             ),
           ],
@@ -751,13 +881,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
       child: Row(
         children: [
-          Icon(Icons.sync, size: 16, color: Theme.of(context).colorScheme.primary),
+          Icon(
+            Icons.sync,
+            size: 16,
+            color: Theme.of(context).colorScheme.primary,
+          ),
           const SizedBox(width: 8),
           Expanded(
-            child: Text(_statusLine.isEmpty ? '正在扫描…' : _statusLine,
-                style: Theme.of(context).textTheme.bodySmall,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis),
+            child: Text(
+              _statusLine.isEmpty ? '正在扫描…' : _statusLine,
+              style: Theme.of(context).textTheme.bodySmall,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
         ],
       ),
@@ -777,7 +913,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               decoration: InputDecoration(
                 hintText: _appScope != null
                     ? '在 ${_appScope!['label']} 内搜索…'
-                    : (_entries > 0 ? '在${_scopeAll ? '全盘' : '当前目录'}搜索…' : '等待索引建立…'),
+                    : (_entries > 0
+                          ? '在${_scopeAll ? '全盘' : '当前目录'}搜索…'
+                          : '等待索引建立…'),
                 prefixIcon: const Icon(Icons.search),
                 suffixIcon: _searchCtl.text.isEmpty
                     ? null
@@ -848,17 +986,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 if (i > 0)
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 2),
-                    child: Icon(Icons.chevron_right,
-                        size: 16, color: theme.colorScheme.outline),
+                    child: Icon(
+                      Icons.chevron_right,
+                      size: 16,
+                      color: theme.colorScheme.outline,
+                    ),
                   ),
                 ActionChip(
                   visualDensity: VisualDensity.compact,
-                  label: Text(crumbs[i].$1,
-                      style: i == crumbs.length - 1
-                          ? TextStyle(
-                              color: theme.colorScheme.primary,
-                              fontWeight: FontWeight.bold)
-                          : null),
+                  label: Text(
+                    crumbs[i].$1,
+                    style: i == crumbs.length - 1
+                        ? TextStyle(
+                            color: theme.colorScheme.primary,
+                            fontWeight: FontWeight.bold,
+                          )
+                        : null,
+                  ),
                   onPressed: () => _loadDir(crumbs[i].$2),
                 ),
               ],
@@ -871,7 +1015,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 当前视图的排序副本（浏览模式文件夹置顶；搜索结果纯按所选键；隐藏文件过滤）
   List<Map<dynamic, dynamic>> _sortedView() {
     final list = _displayList
-        .where((e) => _showHidden || !((e['name'] as String? ?? '').startsWith('.')))
+        .where(
+          (e) => _showHidden || !((e['name'] as String? ?? '').startsWith('.')),
+        )
         .toList();
     int sizeOf(Map<dynamic, dynamic> e) => e['isDir'] == true
         ? ((e['dirSize'] as num?)?.toInt() ?? 0)
@@ -881,13 +1027,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         case 'size':
           return sizeOf(a).compareTo(sizeOf(b));
         case 'time':
-          return (((a['mtime'] as num?)?.toInt() ?? 0))
-              .compareTo(((b['mtime'] as num?)?.toInt() ?? 0));
+          return (((a['mtime'] as num?)?.toInt() ?? 0)).compareTo(
+            ((b['mtime'] as num?)?.toInt() ?? 0),
+          );
         default:
-          return ((a['name'] as String? ?? '').toLowerCase())
-              .compareTo((b['name'] as String? ?? '').toLowerCase());
+          return ((a['name'] as String? ?? '').toLowerCase()).compareTo(
+            (b['name'] as String? ?? '').toLowerCase(),
+          );
       }
     }
+
     final searching = _isSearching;
     list.sort((a, b) {
       if (!searching) {
@@ -932,7 +1081,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           children: [
             Text(_dirError!, style: Theme.of(context).textTheme.bodySmall),
             const SizedBox(height: 8),
-            FilledButton.tonal(onPressed: () => _loadDir(_currentDir), child: const Text('重试')),
+            FilledButton.tonal(
+              onPressed: () => _loadDir(_currentDir),
+              child: const Text('重试'),
+            ),
           ],
         ),
       );
@@ -954,8 +1106,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final isDir = e['isDir'] == true;
     final path = e['path'] as String? ?? '';
     final name = e['name'] as String? ?? '';
-    final (label, icon, color) = describe(name, isDir,
-        folderColor: Theme.of(context).colorScheme.primary);
+    final (label, icon, color) = describe(
+      name,
+      isDir,
+      folderColor: Theme.of(context).colorScheme.primary,
+    );
     final selected = _selected.contains(path);
 
     return ListTile(
@@ -965,23 +1120,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           : Icon(icon, color: color),
       title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: browsing
-          ? Text(fmtDate(((e['mtime'] as num?)?.toInt() ?? 0)),
-              maxLines: 1, overflow: TextOverflow.ellipsis)
+          ? Text(
+              fmtDate(((e['mtime'] as num?)?.toInt() ?? 0)),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            )
           : Text(path, maxLines: 1, overflow: TextOverflow.ellipsis),
       trailing: _selecting
           ? null
           : isDir
-              ? Text(_dirTrailing(e),
-                  style: Theme.of(context).textTheme.bodySmall)
-              : Text(fmtSize(((e['size'] as num?)?.toInt() ?? 0)),
-                  style: Theme.of(context).textTheme.bodySmall),
+          ? Text(_dirTrailing(e), style: Theme.of(context).textTheme.bodySmall)
+          : Text(
+              fmtSize(((e['size'] as num?)?.toInt() ?? 0)),
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
       selected: selected,
       onTap: () {
         if (_selecting) {
           _toggle(path);
         } else if (isDir && browsing) {
           _loadDir(path);
-        } else if (isDir && _appScope != null && _searchCtl.text.trim().isEmpty) {
+        } else if (isDir &&
+            _appScope != null &&
+            _searchCtl.text.trim().isEmpty) {
           // 应用检索默认视图：点目录入口 → 进入普通浏览
           setState(() => _appScope = null);
           _loadDir(path);
@@ -997,8 +1158,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final isDir = e['isDir'] == true;
     final path = e['path'] as String? ?? '';
     final name = e['name'] as String? ?? '';
-    final (label, icon, color) = describe(name, isDir,
-        folderColor: Theme.of(context).colorScheme.primary);
+    final (label, icon, color) = describe(
+      name,
+      isDir,
+      folderColor: Theme.of(context).colorScheme.primary,
+    );
     final dirCount = (e['dirCount'] as num?)?.toInt();
     final dirSize = (e['dirSize'] as num?)?.toInt();
     showModalBottomSheet<void>(
@@ -1016,24 +1180,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   Icon(icon, color: color),
                   const SizedBox(width: 10),
                   Expanded(
-                      child: Text(name,
-                          style: Theme.of(context).textTheme.titleMedium,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis)),
+                    child: Text(
+                      name,
+                      style: Theme.of(context).textTheme.titleMedium,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
                 ],
               ),
               const SizedBox(height: 12),
-              Text('类型：$label${isDir ? '' : ' · ${fmtSize(((e['size'] as num?)?.toInt() ?? 0))}'}'),
+              Text(
+                '类型：$label${isDir ? '' : ' · ${fmtSize(((e['size'] as num?)?.toInt() ?? 0))}'}',
+              ),
               if (isDir) ...[
                 const SizedBox(height: 6),
-                Text('子项：${dirCount != null ? '$dirCount 项' : '—'}'
-                    ' · 总大小：${dirSize != null ? fmtSize(dirSize) : '—'}'),
+                Text(
+                  '子项：${dirCount != null ? '$dirCount 项' : '—'}'
+                  ' · 总大小：${dirSize != null ? fmtSize(dirSize) : '—'}',
+                ),
               ],
               const SizedBox(height: 6),
               Text('修改时间：${fmtDate(((e['mtime'] as num?)?.toInt() ?? 0))}'),
               const SizedBox(height: 6),
-              Text('路径：$path',
-                  style: Theme.of(context).textTheme.bodySmall),
+              Text('路径：$path', style: Theme.of(context).textTheme.bodySmall),
               const SizedBox(height: 16),
               OverflowBar(
                 alignment: MainAxisAlignment.spaceEvenly,
@@ -1074,7 +1244,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   ),
                   TextButton.icon(
                     style: TextButton.styleFrom(
-                        foregroundColor: Theme.of(context).colorScheme.error),
+                      foregroundColor: Theme.of(context).colorScheme.error,
+                    ),
                     icon: const Icon(Icons.delete_outline),
                     label: const Text('删除'),
                     onPressed: () {

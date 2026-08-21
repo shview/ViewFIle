@@ -7,6 +7,8 @@ import android.net.Uri
 import android.util.Log
 import androidx.core.content.FileProvider
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.util.ArrayDeque
 
 /**
@@ -67,24 +69,60 @@ object FileOps {
 
     // ---------- 写操作（需 UI 确认） ----------
 
-    /** 返回 null=成功，否则为错误信息。FUSE 失败时回退 root mv */
+    /** 返回 null=成功，否则为错误信息。应用 UID 失败时可安全回退特权 helper。 */
     fun rename(db: SQLiteDatabase, path: String, newName: String): String? {
         val old = File(path)
         val clean = newName.trim()
         if (clean.isEmpty() || clean.contains('/')) return "文件名不合法"
-        if (!old.exists() && !SuShell.getAvailable()) return "文件不存在（可能已被移动）"
+        val tier = PrivShell.tier()
+        val oldVisible = existsNoFollow(old)
+        if (!oldVisible && tier == PrivShell.Tier.NONE) {
+            return "文件不存在（可能已被移动）"
+        }
         if (old.name == clean) return null
         val target = File(old.parentFile, clean)
-        if (target.exists()) return "已存在同名项目"
+        if (existsNoFollow(target)) return "已存在同名项目"
 
-        var renamed = old.exists() && old.renameTo(target)
-        if (!renamed && PrivShell.tier() != PrivShell.Tier.NONE) {
+        val helper = Engine.nativeHelperPath()
+            ?: return "重命名失败（原生安全重命名组件缺失）"
+
+        // 普通可见路径也必须使用内核原子 RENAME_NOREPLACE。ProcessBuilder 传参数
+        // 数组，不经过 shell，路径中的空格、引号和元字符不会被重新解释。
+        var renamed = false
+        var canRetryPrivileged = !oldVisible
+        if (oldVisible) {
+            val direct = try {
+                ShellProcessRunner.run(
+                    ProcessBuilder(*NativeRenameProtocol.arguments(
+                        helper, old.absolutePath, target.absolutePath
+                    ).toTypedArray()).start(),
+                    15000
+                )
+            } catch (t: Throwable) {
+                SuShell.Result(-1, "", t.message ?: t.toString())
+            }
+            when (NativeRenameProtocol.decideDirectResult(
+                direct.code, existsNoFollow(old)
+            )) {
+                NativeRenameProtocol.DirectDecision.SUCCESS -> renamed = true
+                NativeRenameProtocol.DirectDecision.CONFLICT -> return "已存在同名项目"
+                NativeRenameProtocol.DirectDecision.RETRY_PRIVILEGED ->
+                    canRetryPrivileged = true
+                NativeRenameProtocol.DirectDecision.UNCERTAIN ->
+                    return "重命名结果不确定（源路径已变化，请刷新后确认）"
+            }
+        }
+        if (!renamed && canRetryPrivileged && tier != PrivShell.Tier.NONE) {
             val rawOld = RootScanner.toRaw(old.absolutePath)
             val rawNew = RootScanner.toRaw(target.absolutePath)
-            if (PrivShell.needsRealRoot(rawOld) && PrivShell.tier() != PrivShell.Tier.ROOT) {
+            if (PrivShell.needsRealRoot(rawOld) && tier != PrivShell.Tier.ROOT) {
                 return "该位置只有真正的 root 才能修改（Shizuku 不够）"
             }
-            renamed = PrivShell.run("mv ${shq(rawOld)} ${shq(rawNew)}").ok && File(rawNew).exists()
+            // Android 8-10 toybox mv 没有可靠的 -T；调用随 APK 打包的 native
+            // helper，以 renameat2(RENAME_NOREPLACE) 在内核中原子完成冲突判定。
+            val r = PrivShell.run(NativeRenameProtocol.command(helper, rawOld, rawNew))
+            if (!r.ok) return NativeRenameProtocol.errorMessage(r.code)
+            renamed = r.ok
         }
         if (!renamed) return "重命名失败（存储权限或跨区限制）"
 
@@ -96,6 +134,9 @@ object FileOps {
         Log.i(TAG, "renamed ${old.absolutePath} -> ${target.absolutePath}")
         return null
     }
+
+    private fun existsNoFollow(file: File): Boolean =
+        Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)
 
     /** 返回 (成功数, 失败路径列表)。FUSE 失败时回退 root rm */
     fun delete(db: SQLiteDatabase, paths: List<String>): Pair<Int, List<String>> {
@@ -151,7 +192,7 @@ object FileOps {
 
     private fun removeRows(db: SQLiteDatabase, path: String) {
         val id = rowId(db, path) ?: return
-        val isDir = Engine.index.dirIds.containsKey(path)
+        val isDir = Engine.index.containsDir(path)
         if (isDir) {
             Db.deleteSubtree(db, id)
             Engine.index.pruneDirMaps(path)
@@ -162,9 +203,9 @@ object FileOps {
 
     /** 由路径解析 entry.id：目录走内存 dirIds，文件按 (parent_id,name) 查 */
     private fun rowId(db: SQLiteDatabase, path: String): Long? {
-        Engine.index.dirIds[path]?.let { return it }
+        Engine.index.dirId(path)?.let { return it }
         val parent = path.substringBeforeLast('/').ifEmpty { "/" }
-        val pid = Engine.index.dirIds[parent] ?: return null
+        val pid = Engine.index.dirId(parent) ?: return null
         return db.rawQuery(
             "SELECT id FROM entry WHERE parent_id=? AND name=?",
             arrayOf(pid.toString(), path.substringAfterLast('/'))

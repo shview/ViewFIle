@@ -3,16 +3,18 @@ package com.viewfile.viewfile.core
 import android.content.Context
 import android.database.ContentObserver
 import android.net.Uri
-import android.os.FileObserver
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
 import java.io.BufferedReader
 import java.io.BufferedWriter
-import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 前台实时监听（“无常驻”设计的一部分：只在 app 可见期间存在）。
@@ -58,14 +60,9 @@ class TreeWatcher(
 
     fun isRunning() = running
 
-    private fun binaryPath(): String? =
-        context.applicationInfo.nativeLibraryDir
-            ?.let { dir -> File(dir, "libvfwatch.so") }
-            ?.takeIf { it.exists() }?.absolutePath
-
-    /** root 辅助进程监听；仅当默认 watch 上限不足时才临时调大并在停止时恢复 */
+    /** root 辅助进程监听；全局 watch 上限只读检查，绝不由应用修改。 */
     private fun startRootProcess(useShizuku: Boolean) {
-        val bin = binaryPath()
+        val bin = Engine.nativeHelperPath()
         if (bin == null) {
             Log.w(TAG, "libvfwatch.so missing, fallback to media observer")
             startMediaObserver()
@@ -73,8 +70,19 @@ class TreeWatcher(
         }
         // 目录清单取自内存 dirIds（v3 库内无路径；载入后必然可用）
         val dirs = ArrayList<String>(1024)
-        for (p in index.dirIds.keys) dirs.add(RootScanner.toRaw(p))
-        if (!useShizuku) ensureWatchLimit(dirs.size)
+        for (p in index.directoryPaths()) dirs.add(RootScanner.toRaw(p))
+        if (dirs.size > WatcherProtocol.MAX_WATCH) {
+            Log.w(TAG, "watch request exceeds native cap: requested=${dirs.size} " +
+                    "cap=${WatcherProtocol.MAX_WATCH}; fallback to media observer")
+            startMediaObserver()
+            return
+        }
+        if (!hasWatchCapacity(dirs.size, useShizuku)) {
+            startMediaObserver()
+            return
+        }
+        stopMediaObserver()
+        var startupDecision: CountDownLatch? = null
         try {
             val p = if (useShizuku) {
                 ShizukuShell.newProcess(arrayOf(bin))
@@ -83,6 +91,14 @@ class TreeWatcher(
                 ProcessBuilder("su", "-c", "nsenter -t 1 -m " + shq(bin)).start()
             }
             rootProc = p
+            val ready = AtomicReference<WatcherProtocol.Ready?>(null)
+            val firstLine = AtomicReference<String?>(null)
+            val readyLatch = CountDownLatch(1)
+            val decisionLatch = CountDownLatch(1)
+            startupDecision = decisionLatch
+            val accepted = AtomicBoolean(false)
+            val stderr = StringBuffer()
+
             // 喂目录清单（原始路径）
             Thread({
                 try {
@@ -94,56 +110,106 @@ class TreeWatcher(
                 } catch (t: Throwable) {
                     Log.w(TAG, "feed dirs failed: ${t.message}")
                 }
-            }, "vf-watch-feed").start()
-            // 读事件信号：任何一行 = 有变化；stderr 一并捕获用于诊断
+            }, "vf-watch-feed").apply { isDaemon = true }.start()
+
+            // stdout 只有这一个 reader：先完成 ready 握手，再由同一线程分发事件。
             Thread({
                 try {
                     BufferedReader(InputStreamReader(p.inputStream)).use { r ->
-                        while (r.readLine() != null) markDirty()
+                        val line = r.readLine()
+                        firstLine.set(line)
+                        ready.set(WatcherProtocol.parseReady(line))
+                        readyLatch.countDown()
+                        decisionLatch.await()
+                        if (!accepted.get()) return@use
+                        while (true) {
+                            val event = r.readLine() ?: break
+                            if (WatcherProtocol.isEvent(event)) markDirty()
+                        }
+                    }
+                } catch (_: Throwable) {
+                    readyLatch.countDown()
+                }
+                if (accepted.get()) {
+                    Log.w(TAG, "vfwatch exited${if (stderr.isNotBlank()) ": ${stderr.take(200)}" else ""}")
+                }
+            }, "vf-watch-read").apply { isDaemon = true }.start()
+            Thread({
+                try {
+                    p.errorStream.bufferedReader().use { r ->
+                        val buf = CharArray(256)
+                        while (stderr.length < 1000) {
+                            val n = r.read(buf)
+                            if (n < 0) break
+                            stderr.append(buf, 0, minOf(n, 1000 - stderr.length))
+                        }
                     }
                 } catch (_: Throwable) {}
-                val err = try {
-                    p.errorStream.bufferedReader().use { it.readText().take(200) }
-                } catch (_: Throwable) { "" }
-                Log.w(TAG, "vfwatch exited${if (err.isNotBlank()) ": $err" else ""}")
-            }, "vf-watch-read").start()
-            watchedDirCount = if (rootMode) dirs.size else Int.MAX_VALUE
-            Log.i(TAG, "root watcher started via ${if (useShizuku) "shizuku" else "su"} ($bin, ${dirs.size} dirs)")
+            }, "vf-watch-err").apply { isDaemon = true }.start()
+
+            val received = try {
+                readyLatch.await(WatcherProtocol.READY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            val handshake = ready.get()
+            val healthy = received && handshake != null && p.isAlive &&
+                    WatcherProtocol.coversExpected(dirs.size, handshake)
+            if (!healthy) {
+                decisionLatch.countDown()
+                val reason = when {
+                    !received -> "ready timeout"
+                    handshake == null -> "invalid ready handshake: ${firstLine.get()}"
+                    !p.isAlive -> "process exited during ready handshake"
+                    else -> "incomplete coverage: requested=${handshake.requested} " +
+                            "installed=${handshake.installed} expected=${dirs.size}"
+                }
+                Log.w(TAG, "$reason; stopping native watcher and falling back")
+                stopRootProcess()
+                startMediaObserver()
+                return
+            }
+            accepted.set(true)
+            watchedDirCount = handshake.installed
+            decisionLatch.countDown()
+            Log.i(TAG, "root watcher ready via ${if (useShizuku) "shizuku" else "su"} " +
+                    "($bin, requested=${handshake.requested}, installed=${handshake.installed})")
         } catch (t: Throwable) {
             Log.w(TAG, "start root watcher failed: ${t.message}, fallback")
+            startupDecision?.countDown()
+            stopRootProcess()
             startMediaObserver()
         }
     }
 
-    /** 仅当现有上限不足以覆盖 needed 时才调大；记录原值供恢复 */
-    private fun ensureWatchLimit(needed: Int) {
-        try {
-            val cur = SuShell.run("cat /proc/sys/fs/inotify/max_user_watches").out.trim()
-            val curVal = cur.toIntOrNull() ?: return
-            if (curVal >= needed) return  // 默认上限够用：不做任何系统改动
-            if (savedWatchLimit == null) savedWatchLimit = cur
-            SuShell.run("echo ${needed * 2} > /proc/sys/fs/inotify/max_user_watches")
-            Log.i(TAG, "watch limit raised $cur -> ${needed * 2} (will restore on stop)")
+    /** 读取失败也保守回退，避免在容量未知时启动只能覆盖部分目录的 watcher。 */
+    private fun hasWatchCapacity(needed: Int, useShizuku: Boolean): Boolean {
+        val result = try {
+            val command = "cat /proc/sys/fs/inotify/max_user_watches"
+            if (useShizuku) ShizukuShell.run(command) else SuShell.run(command)
         } catch (t: Throwable) {
-            Log.w(TAG, "ensureWatchLimit failed: ${t.message}")
+            Log.w(TAG, "read watch limit failed: ${t.message}; fallback to media observer")
+            return false
         }
-    }
-
-    private var savedWatchLimit: String? = null
-
-    private fun restoreWatchLimit() {
-        savedWatchLimit?.let { orig ->
-            savedWatchLimit = null
-            Thread({
-                runCatching {
-                    SuShell.run("echo $orig > /proc/sys/fs/inotify/max_user_watches")
-                    Log.i(TAG, "watch limit restored to $orig")
-                }
-            }, "vf-watch-restore").start()
+        val current = result.out.trim().toIntOrNull()
+        if (!result.ok || current == null) {
+            Log.w(TAG, "read watch limit failed (rc=${result.code}); fallback to media observer")
+            return false
         }
+        if (current < needed) {
+            Log.w(TAG, "watch limit insufficient: current=$current needed=$needed; " +
+                    "global setting left unchanged, fallback to media observer")
+            return false
+        }
+        return true
     }
 
     private fun startMediaObserver() {
+        if (mediaObserver != null) {
+            watchedDirCount = Int.MAX_VALUE
+            return
+        }
         val obs = object : ContentObserver(handler) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 markDirty()
@@ -152,7 +218,16 @@ class TreeWatcher(
         context.contentResolver.registerContentObserver(
             MediaStore.Files.getContentUri("external"), true, obs)
         mediaObserver = obs
+        // MediaStore observer 不依赖索引中的目录清单，不需要在索引载入后替换。
+        watchedDirCount = Int.MAX_VALUE
         Log.i(TAG, "media store observer started (no-root mode)")
+    }
+
+    private fun stopMediaObserver() {
+        mediaObserver?.let {
+            runCatching { context.contentResolver.unregisterContentObserver(it) }
+        }
+        mediaObserver = null
     }
 
     /** 同步完成后调用：特权模式重启辅助进程以覆盖新增目录 */
@@ -163,6 +238,7 @@ class TreeWatcher(
     }
 
     private fun stopRootProcess() {
+        watchedDirCount = 0
         rootProc?.let { p ->
             rootProc = null
             runCatching { p.destroy() }
@@ -171,14 +247,12 @@ class TreeWatcher(
         // 必须同步：异步 pkill 会与 refreshRootProcess 的新进程竞态，误杀继任者
         runCatching { SuShell.run("pkill -f libvfwatch.so", 5000) }
         runCatching { ShizukuShell.run("pkill -f libvfwatch.so", 5000) }
-        restoreWatchLimit()
     }
 
     fun stop() {
         running = false
         stopRootProcess()
-        mediaObserver?.let { context.contentResolver.unregisterContentObserver(it) }
-        mediaObserver = null
+        stopMediaObserver()
         dirtyRunnable?.let { handler.removeCallbacks(it) }
         dirtyRunnable = null
         Log.i(TAG, "watcher stopped")

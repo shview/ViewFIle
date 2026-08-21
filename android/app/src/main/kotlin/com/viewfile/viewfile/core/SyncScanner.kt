@@ -57,14 +57,14 @@ class SyncScanner(
 
     // ---------- FUSE 区 ----------
 
-    private fun syncDirFuse(dir: File, skipSubtrees: Set<String>) {
+    private fun syncDirFuse(dir: File, skipSubtrees: Set<String>, forceRelist: Boolean = false) {
         val path = dir.absolutePath
         if (path in skipSubtrees) return  // 由 root 管道覆盖的子树，FUSE 视图残缺
         val children = dir.listFiles() ?: return
-        val stored = index.dirMtimes[path]
+        val stored = index.dirMtime(path)
         val cur = dir.lastModified()
-        if (stored != null && stored == cur) return  // 子树未变
-        val pid = index.dirIds[path] ?: return       // 区域根外的孤儿（不可达）：跳过
+        if (!forceRelist && stored != null && stored == cur) return  // 子树未变
+        val pid = index.dirId(path) ?: return       // 区域根外的孤儿（不可达）：跳过
         if (stored == null) {
             val id = insertEntry(pid, dir.name, true, 0, cur)
             if (id != -1L) {
@@ -75,12 +75,16 @@ class SyncScanner(
             db.execSQL("UPDATE entry SET mtime=? WHERE id=?", arrayOf(cur.toString(), pid.toString()))
             index.markDir(path, pid, cur)
         }
-        diffChildren(path, pid, children.map {
+        val newDirs = diffChildren(path, pid, children.map {
             Child(it.name, it.isDirectory,
                 if (it.isDirectory) 0L else it.length(), it.lastModified())
         })
         for (c in children) {
-            if (c.isDirectory) syncDirFuse(c, skipSubtrees)
+            if (c.isDirectory) {
+                // diffChildren 已记录新目录的当前 mtime；若不强制首轮重列，递归会
+                // 立即命中“mtime 未变”剪枝，从而永久漏掉目录中已有的内容。
+                syncDirFuse(c, skipSubtrees, c.absolutePath in newDirs)
+            }
         }
     }
 
@@ -98,7 +102,8 @@ class SyncScanner(
         val depthArg = if (area.depth > 0) " -maxdepth ${area.depth}" else ""
         val actual = HashMap<String, Long>()
         val res = PrivShell.runStream(
-            "find ${shq(area.raw)}$depthArg -type d -print0 | xargs -0 -r stat -c '%n|%Y' 2>/dev/null"
+            "find ${shq(area.raw)}$depthArg -type d " +
+                    "-exec stat -c '%n|%Y' '{}' + 2>/dev/null"
         ) { line ->
             val i = line.lastIndexOf('|')
             if (i <= 0) return@runStream
@@ -117,7 +122,7 @@ class SyncScanner(
         // 本轮不删，留给全量重建收敛
         val toDelete = ArrayList<String>()
         var knownInArea = 0
-        for (p in index.dirIds.keys) {
+        for (p in index.directoryPaths()) {
             if (!inArea(p, display)) continue
             knownInArea++
             if (!actual.containsKey(p)) toDelete.add(p)
@@ -128,7 +133,7 @@ class SyncScanner(
             toDelete.clear()
         }
         for (p in toDelete) {
-            val id = index.dirIds[p] ?: continue
+            val id = index.dirId(p) ?: continue
             removed += Db.deleteSubtree(db, id)
             index.pruneDirMaps(p)
         }
@@ -137,7 +142,7 @@ class SyncScanner(
         val sortedActual = actual.entries.sortedBy { it.key.length }
         val changedDirs = ArrayList<String>()
         for ((p, m) in sortedActual) {
-            val wasKnown = index.dirMtimes[p]
+            val wasKnown = index.dirMtime(p)
             ensureDir(p, m)
             if (wasKnown != m) changedDirs.add(p)
         }
@@ -154,21 +159,26 @@ class SyncScanner(
         }
         for (chunk in capped.chunked(300)) {
             if (scanRequestedBridge?.invoke() == true) throw SCAN_YIELD
-            val finds = chunk.joinToString(" ") {
-                "find ${shq(RootScanner.toRaw(it))} -mindepth 1 -maxdepth 1 -print0;"
+            // 每个 find 自己批量 stat，并用 && 串联：任一目录重列失败都会成为
+            // 整体非零 rc，本 chunk 全部丢弃，不采用部分输出。
+            val finds = chunk.joinToString(" && ") {
+                "find ${shq(RootScanner.toRaw(it))} -mindepth 1 -maxdepth 1 " +
+                        "-exec stat -c '%n|%F|%s|%Y' '{}' +"
             }
-            val r = PrivShell.run("($finds) | xargs -0 -r stat -c '%n|%F|%s|%Y' 2>/dev/null")
+            val r = PrivShell.run("($finds) 2>/dev/null")
             if (!r.ok) continue
-            val byParent = HashMap<String, MutableList<Child>>()
+            val parsedChildren = ArrayList<Pair<String, Child>>()
             r.out.lineSequence().forEach { line ->
                 val e = RootScanner.parseStatLine(line) ?: return@forEach
                 val dp = RootScanner.toDisplay(e.rawPath)
                 val parent = dp.substringBeforeLast('/').ifEmpty { "/" }
-                byParent.getOrPut(parent) { ArrayList() }
-                    .add(Child(dp.substringAfterLast('/'), e.isDir, e.size, e.mtimeMs))
+                parsedChildren.add(parent to
+                        Child(dp.substringAfterLast('/'), e.isDir, e.size, e.mtimeMs))
             }
+            // chunk 成功后每个请求父目录都参与 diff；无输出即空目录，必须清掉旧子项。
+            val byParent = groupRelistedChildren(chunk, parsedChildren)
             for ((parent, kids) in byParent) {
-                val pid = index.dirIds[parent] ?: continue
+                val pid = index.dirId(parent) ?: continue
                 diffChildren(parent, pid, kids)
             }
         }
@@ -180,9 +190,9 @@ class SyncScanner(
      * 造成“永远变化”的死循环（v3 初版线上 bug）。
      */
     private fun ensureDir(path: String, mtime: Long, update: Boolean = true): Long {
-        val known = index.dirIds[path]
+        val known = index.dirId(path)
         if (known != null) {
-            if (update && index.dirMtimes[path] != mtime) {
+            if (update && index.dirMtime(path) != mtime) {
                 db.execSQL("UPDATE entry SET mtime=? WHERE id=?",
                     arrayOf(mtime.toString(), known.toString()))
                 index.markDir(path, known, mtime)
@@ -216,7 +226,9 @@ class SyncScanner(
 
     // ---------- 公共 ----------
 
-    private fun diffChildren(parentPath: String, pid: Long, kids: List<Child>) {
+    /** 对账直接子项，并返回本轮新插入的目录路径（调用方须对它们做首次下钻）。 */
+    private fun diffChildren(parentPath: String, pid: Long, kids: List<Child>): Set<String> {
+        val newDirs = HashSet<String>()
         val dbChildren = HashMap<String, Pair<Long, Boolean>>() // name -> (id, isDir)
         db.rawQuery("SELECT name,id,type FROM entry WHERE parent_id=?", arrayOf(pid.toString()))
             .use { c ->
@@ -229,7 +241,11 @@ class SyncScanner(
             if (known == null) {
                 val id = insertEntry(pid, k.name, k.isDir, k.size, k.mtime)
                 if (id != -1L) {
-                    if (k.isDir) index.markDir("$parentPath/${k.name}", id, k.mtime)
+                    if (k.isDir) {
+                        val childPath = "$parentPath/${k.name}"
+                        index.markDir(childPath, id, k.mtime)
+                        newDirs.add(childPath)
+                    }
                     added++
                 }
             } else if (!k.isDir) {
@@ -248,6 +264,7 @@ class SyncScanner(
                 removed++
             }
         }
+        return newDirs
     }
 
     private fun insertEntry(pid: Long, name: String, isDir: Boolean, size: Long, mtime: Long): Long {

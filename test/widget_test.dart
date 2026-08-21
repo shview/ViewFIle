@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:viewfile/utils/format.dart';
+import 'package:viewfile/utils/index_bootstrap.dart';
 
 void main() {
   test('fmtSize 基本换算', () {
@@ -21,5 +22,11 @@ void main() {
     expect(describe('app.apk', false).$1, '安装包');
     expect(describe('x', true).$1, '文件夹');
     expect(describe('unknown.zzz', false).$1, '文件');
+  });
+
+  test('索引载入结果区分普通空库与内存保护重置', () {
+    expect(classifyIndexLoad(-1), IndexLoadDisposition.rebuildCompact);
+    expect(classifyIndexLoad(0), IndexLoadDisposition.rebuildConfigured);
+    expect(classifyIndexLoad(42), IndexLoadDisposition.ready);
   });
 }

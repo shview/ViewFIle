@@ -5,10 +5,11 @@ import android.database.sqlite.SQLiteDatabase
 import android.util.Log
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * 引擎单例：数据库连接、内存索引、三类后台线程
- * （scan=扫描/载入，search=搜索/浏览，ops=文件写操作）。
+ * 引擎单例：数据库连接、内存索引、两类后台线程。
+ * scanExec 串行承载扫描/载入/同步/换库/文件写，searchExec 只读已发布快照。
  */
 object Engine {
     enum class State { IDLE, SCANNING, SYNCING, READY }
@@ -31,9 +32,8 @@ object Engine {
     private lateinit var appContext: Context
     private val scanExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-scan") }
     private val searchExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-search") }
-    private val opsExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-ops") }
 
-    // 主库连接：全量重建原子替换后重开（db 访问全部在 scanExec/opsExec 上串行）
+    // 主库连接：全量重建原子替换后重开；全部 DB mutation 仅在 scanExec 执行。
     @Volatile
     var db: SQLiteDatabase = SQLiteDatabase.create(null) // 占位，init 时替换
         private set
@@ -42,6 +42,11 @@ object Engine {
         appContext = ctx.applicationContext
         db = Db.openDb(appContext)
     }
+
+    /** APK 中以 lib*.so 名称打包、实际作为可执行 helper 使用的原生程序。 */
+    fun nativeHelperPath(): String? = appContext.applicationInfo.nativeLibraryDir
+        ?.let { dir -> File(dir, "libvfwatch.so") }
+        ?.takeIf { it.exists() }?.absolutePath
 
     fun refreshRoot(): Boolean {
         rootGranted = SuShell.getAvailable(refresh = true)
@@ -132,15 +137,15 @@ object Engine {
     ) {
         // 前置检查（含 su 探测，最长数秒）全部后台执行，避免阻塞主线程触发 ANR。
         // scanRequested 让排队中的同步立即让位（单线程队列里同步可能占住几十秒）
-        scanRequested = true
+        pendingScanRequests.incrementAndGet()
         scanExec.execute {
             if (!File("/storage/emulated/0").canRead()) {
-                scanRequested = false
+                pendingScanRequests.decrementAndGet()
                 onDone(null, "无法读取外部存储（缺少“所有文件访问”权限）")
                 return@execute
             }
             if (state == State.SCANNING) {
-                scanRequested = false
+                pendingScanRequests.decrementAndGet()
                 onDone(null, "扫描已在进行中")
                 return@execute
             }
@@ -207,15 +212,14 @@ object Engine {
                 Log.e("ViewFile/Scan", "scan failed", t)
                 onDone(null, t.message ?: t.toString())
             } finally {
-                scanRequested = false
+                pendingScanRequests.decrementAndGet()
             }
         }
     }
 
-    /** 同步在各阶段检查此标志，扫描请求到达时立即让位 */
-    @Volatile
-    var scanRequested = false
-        private set
+    /** 同步在各阶段检查；计数避免多个排队扫描中前一个完成后错误清掉后一个请求。 */
+    private val pendingScanRequests = AtomicInteger(0)
+    val scanRequested: Boolean get() = pendingScanRequests.get() > 0
 
     fun searchAsync(query: String, limit: Int, scopes: List<String>?, cb: (List<SearchIndex.Hit>) -> Unit) {
         searchExec.execute {
@@ -325,18 +329,22 @@ object Engine {
     fun isWatching(): Boolean = watcher?.isRunning() == true
 
     /**
-     * 写操作（重命名/删除）：串行执行，扫描期间拒绝；
+     * 写操作（重命名/删除）：与扫描/载入/同步/换库共用 scanExec；
+     * 状态在任务真正执行时检查，避免排队期间状态变化造成竞态。
      * 成功后自动重载内存索引，把数据库的最新状态带给 UI。
      */
     fun opAsync(
         cb: (Map<String, Any?>) -> Unit,
         body: () -> Map<String, Any?>
     ) {
-        opsExec.execute {
-            val out = if (state == State.SCANNING) {
-                mapOf("ok" to false, "error" to "索引正在扫描，请稍后再试")
-            } else {
-                try {
+        scanExec.execute {
+            val out = when {
+                // 同步可能刚为 scanAsync 让位；若本操作排在扫描请求之前，也必须
+                // 继续让位，不能在换库前插入一次 DB mutation。
+                scanRequested -> mapOf("ok" to false, "error" to "扫描请求优先，请稍后再试")
+                state == State.SCANNING || state == State.SYNCING ->
+                    mapOf("ok" to false, "error" to "索引正在扫描或同步，请稍后再试")
+                else -> try {
                     body()
                 } catch (t: Throwable) {
                     mapOf("ok" to false, "error" to (t.message ?: t.toString()))

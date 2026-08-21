@@ -6,11 +6,12 @@ import android.os.Looper
 import android.util.Log
 import moe.shizuku.server.IShizukuService
 import rikka.shizuku.Shizuku
-import java.io.BufferedReader
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.InputStreamReader
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 
 /**
@@ -87,19 +88,19 @@ object ShizukuShell {
         }
 
         override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
-            // 读流到 EOF 通常即进程结束；此处用阻塞 waitFor + 看门狗 destroy 兜底
-            val killer = Thread({
-                try {
-                    Thread.sleep(unit.toMillis(timeout))
-                    if (rp.alive()) destroy()
-                } catch (_: InterruptedException) {}
-            })
-            killer.isDaemon = true
-            killer.start()
+            // IRemoteProcess 只有阻塞 waitFor()：放入 daemon waiter，由调用线程
+            // 对 FutureTask 做 timed get。FutureTask 原子裁定截止点，不需要在
+            // alive()/destroy() 与退出之间竞态判断；任意 exit code 按时完成均 true。
+            if (timeout <= 0) return !rp.alive()
+            val task = FutureTask<Int> { rp.waitFor() }
+            Thread(task, "vf-shizuku-wait").apply { isDaemon = true }.start()
             return try {
-                rp.waitFor() == 0
-            } finally {
-                killer.interrupt()
+                task.get(timeout, unit)
+                true
+            } catch (_: TimeoutException) {
+                false // 上层先返回 timeout，再由异步清理线程 best-effort destroy
+            } catch (e: ExecutionException) {
+                throw (e.cause ?: e)
             }
         }
     }
@@ -111,18 +112,7 @@ object ShizukuShell {
 
     fun run(cmd: String, timeoutMs: Long = 15000): SuShell.Result {
         return try {
-            val p = newProcess(arrayOf("sh", "-c", cmd))
-            val errThread = Thread { p.errorStream.bufferedReader().use { it.readText() } }
-            errThread.isDaemon = true
-            errThread.start()
-            val out = p.inputStream.bufferedReader().use { it.readText() }
-            val finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-            if (!finished) {
-                p.destroyForcibly()
-                SuShell.Result(-1, out, "timeout")
-            } else {
-                SuShell.Result(p.exitValue(), out, "")
-            }
+            ShellProcessRunner.run(newProcess(arrayOf("sh", "-c", cmd)), timeoutMs)
         } catch (t: Throwable) {
             SuShell.Result(-1, "", t.message ?: t.toString())
         }
@@ -130,26 +120,8 @@ object ShizukuShell {
 
     fun runStream(cmd: String, timeoutMs: Long = 600000, onLine: (String) -> Unit): SuShell.Result {
         return try {
-            val p = newProcess(arrayOf("sh", "-c", cmd))
-            val errBuilder = StringBuilder()
-            val errThread = Thread {
-                p.errorStream.bufferedReader().forEachLine { errBuilder.appendLine(it) }
-            }
-            errThread.isDaemon = true
-            errThread.start()
-            BufferedReader(InputStreamReader(p.inputStream)).use { r ->
-                while (true) {
-                    val line = r.readLine() ?: break
-                    onLine(line)
-                }
-            }
-            val finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-            if (!finished) {
-                p.destroyForcibly()
-                SuShell.Result(-1, "", "timeout")
-            } else {
-                SuShell.Result(p.exitValue(), "", errBuilder.toString())
-            }
+            ShellProcessRunner.runStream(
+                newProcess(arrayOf("sh", "-c", cmd)), timeoutMs, onLine)
         } catch (t: Throwable) {
             SuShell.Result(-1, "", t.message ?: t.toString())
         }
