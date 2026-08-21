@@ -33,8 +33,12 @@ class RootScanner {
                 val parent = displayPath.substringBeforeLast('/').ifEmpty { "/" }
                 writer.add(displayPath, parent, name, e.isDir, e.size, e.mtimeMs)
                 if (e.isDir) { total.dirs++; areaDirs++ } else { total.files++; areaFiles++ }
-                if (onProgress != null && ++sinceTick >= 20000) {
+                if (++sinceTick >= 50000) {
                     sinceTick = 0
+                    android.util.Log.i("ViewFile/Scan",
+                        "pipe $display +${areaFiles}f +${areaDirs}d ${System.currentTimeMillis() - areaStart}ms")
+                }
+                if (onProgress != null && sinceTick == 25000) {
                     onProgress(display, areaFiles, areaDirs)
                 }
             }

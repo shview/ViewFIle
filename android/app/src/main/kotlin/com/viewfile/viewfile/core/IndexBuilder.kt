@@ -19,6 +19,7 @@ class IndexBuilder(private val context: Context) : IndexSink {
         db.compileStatement("INSERT OR IGNORE INTO entry(parent_id,name,type,size,mtime) VALUES(?,?,?,?,?)")
     }
     private val dirIds = HashMap<String, Long>(1 shl 16)
+    private var chainCalls = 0L
     var files = 0
         private set
     var dirs = 0
@@ -63,7 +64,12 @@ class IndexBuilder(private val context: Context) : IndexSink {
 
     /** 路径链上缺失的祖先目录逐级补建（如首次遇到 /data/data 时补 / 与 /data） */
     private fun ensureDirChain(path: String): Long {
-        if (path == "" || path == ".") return 0L
+        // 防御：无前导斜杠的路径会让 while 循环永不终止（substringBeforeLast 无斜杠时原样返回）
+        if (!path.startsWith("/")) return 0L
+        chainCalls++
+        if (chainCalls <= 5L || chainCalls % 20000L == 1L) {
+            Log.w("ViewFile/Build", "ensureDirChain x$chainCalls last=$path dirIds=${dirIds.size}")
+        }
         // 自根向下补建
         val segs = ArrayList<String>()
         var p = path
