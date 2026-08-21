@@ -6,7 +6,7 @@ import java.io.File
 
 /**
  * 增量同步 v3：按 (parent_id, name) 语义对账。
- * - FUSE 区：递归走 File 树，目录 mtime 未变即跳过子树；
+ * - FUSE 区：递归走完整 File 目录树，mtime 未变仅跳过当前层对账；
  * - root 区：find -type d 只 stat 目录，变化目录批量重列直接子项；
  * - 删除用递归 CTE 整树删除；路径 → id 依赖内存 dirIds（载入时构建）。
  */
@@ -63,22 +63,26 @@ class SyncScanner(
         val children = dir.listFiles() ?: return
         val stored = index.dirMtime(path)
         val cur = dir.lastModified()
-        if (!forceRelist && stored != null && stored == cur) return  // 子树未变
-        val pid = index.dirId(path) ?: return       // 区域根外的孤儿（不可达）：跳过
-        if (stored == null) {
-            val id = insertEntry(pid, dir.name, true, 0, cur)
-            if (id != -1L) {
-                index.markDir(path, id, cur)
-                added++
+        var newDirs: Set<String> = emptySet()
+        if (shouldDiffFuseDirectory(stored, cur, forceRelist)) {
+            val pid = index.dirId(path) ?: return  // 区域根外的孤儿（不可达）：跳过
+            if (stored == null) {
+                val id = insertEntry(pid, dir.name, true, 0, cur)
+                if (id != -1L) {
+                    index.markDir(path, id, cur)
+                    added++
+                }
+            } else {
+                db.execSQL("UPDATE entry SET mtime=? WHERE id=?", arrayOf(cur.toString(), pid.toString()))
+                index.markDir(path, pid, cur)
             }
-        } else {
-            db.execSQL("UPDATE entry SET mtime=? WHERE id=?", arrayOf(cur.toString(), pid.toString()))
-            index.markDir(path, pid, cur)
+            newDirs = diffChildren(path, pid, children.map {
+                Child(it.name, it.isDirectory,
+                    if (it.isDirectory) 0L else it.length(), it.lastModified())
+            })
         }
-        val newDirs = diffChildren(path, pid, children.map {
-            Child(it.name, it.isDirectory,
-                if (it.isDirectory) 0L else it.length(), it.lastModified())
-        })
+        // Android/FUSE 不保证深层变化会更新所有祖先 mtime。即使当前层无需 diff，
+        // 也必须下钻一次，才能到达真正变化的父目录。children 已在本层只读取一次。
         for (c in children) {
             if (c.isDirectory) {
                 // diffChildren 已记录新目录的当前 mtime；若不强制首轮重列，递归会
