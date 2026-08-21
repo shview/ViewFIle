@@ -20,7 +20,8 @@ class SearchIndex {
     class DirStat(var direct: Int = 0, var recCount: Int = 0, var recSize: Long = 0)
 
     private class SoA(val n: Int) {
-        val nameOff = IntArray(n + 1)
+        var nameOff = IntArray(n + 1)   // 载入期原始偏移；去重后变为唯一名偏移
+        var nameRef = IntArray(0)       // 去重后：条目 → 唯一名下标
         val parentId = IntArray(n)      // 密集父下标；根 = -1
         val isDir = ByteArray(n)
         val size = LongArray(n)
@@ -68,8 +69,9 @@ class SearchIndex {
 
     fun nameOf(h: Hit): String {
         val s = soa ?: return ""
-        val a = s.nameOff[h.idx]
-        return String(s.namePool, a, s.nameOff[h.idx + 1] - a, Charsets.UTF_8)
+        val r = s.nameRef[h.idx]
+        val a = s.nameOff[r]
+        return String(s.namePool, a, s.nameOff[r + 1] - a, Charsets.UTF_8)
     }
 
     fun isDirOf(h: Hit): Boolean = soa!!.isDir[h.idx].toInt() == 1
@@ -88,8 +90,9 @@ class SearchIndex {
         var i = idx
         var guard = 0
         while (i >= 0 && guard++ < 256) {
-            val a = s.nameOff[i]
-            parts.add(String(s.namePool, a, s.nameOff[i + 1] - a, Charsets.UTF_8))
+            val r = s.nameRef[i]
+            val a = s.nameOff[r]
+            parts.add(String(s.namePool, a, s.nameOff[r + 1] - a, Charsets.UTF_8))
             i = s.parentId[i]
         }
         parts.reverse()
@@ -210,23 +213,36 @@ class SearchIndex {
         }
 
         // 排序排列（名字升序、不分大小写）
-        val pool = s.namePool
-        val off = s.nameOff
-        val order = Array(dense) { it }
-        order.sortWith { x, y ->
-            var a = off[x]; var b = off[y]
-            val ax = off[x + 1]; val bx = off[y + 1]
-            while (a < ax && b < bx) {
-                var c1 = pool[a].toInt() and 0xFF
-                var c2 = pool[b].toInt() and 0xFF
-                if (c1 in 0x41..0x5A) c1 += 32
-                if (c2 in 0x41..0x5A) c2 += 32
-                if (c1 != c2) return@sortWith c1 - c2
-                a++; b++
+        // 免装箱 IntArray 三路快排（按名、折叠大小写）；装箱排序在 5M 时瞬时 +80MB
+        val order = IntArray(dense) { it }
+        poolSort(s, order, 0, dense - 1)
+
+        // 名字池去重：排序后同名相邻 → 唯一名池 + 引用数组（cache/.log 等重复名占大头）
+        val uniq = ByteArray(s.poolPos)
+        val uniqOff = IntArray(dense + 1)
+        val nameRef = IntArray(dense)
+        var uc = 0
+        var upos = 0
+        var i0 = 0
+        while (i0 < dense) {
+            val head = order[i0]
+            val a = s.nameOff[head]
+            val b = s.nameOff[head + 1]
+            System.arraycopy(s.namePool, a, uniq, upos, b - a)
+            uniqOff[uc] = upos
+            upos += b - a
+            var j = i0
+            while (j < dense && cmpName(s, order[j], head) == 0) {
+                nameRef[order[j]] = uc
+                j++
             }
-            (ax - a) - (bx - b)
+            uc++
+            i0 = j
         }
-        s.sortIdx = order.toIntArray()
+        uniqOff[uc] = upos
+        s.namePool = uniq.copyOf(upos)
+        s.nameOff = uniqOff.copyOf(uc + 1)
+        s.nameRef = nameRef
         Log.i("ViewFile/Scan",
             "SoA built: $dense entries, pool ${(s.poolPos shr 10)}KB, ${System.currentTimeMillis() - t0}ms")
         return dense
@@ -256,8 +272,9 @@ class SearchIndex {
         val out = ArrayList<Hit>(minOf(limit, 256))
 
         fun nameContainsFold(i: Int, tok: ByteArray): Boolean {
-            val a = s.nameOff[i]
-            val b = s.nameOff[i + 1]
+            val r = s.nameRef[i]
+            val a = s.nameOff[r]
+            val b = s.nameOff[r + 1]
             val tlen = tok.size
             if (tlen > b - a) return false
             outer@ for (start in a..b - tlen) {
@@ -316,5 +333,56 @@ class SearchIndex {
             }
         }
         return out
+    }
+
+    /** 折叠字节序比较 name(x) vs name(y) */
+    private fun cmpName(s: SoA, x: Int, y: Int): Int {
+        val pool = s.namePool
+        var a = s.nameOff[x]; var b = s.nameOff[y]
+        val ax = s.nameOff[x + 1]; val bx = s.nameOff[y + 1]
+        while (a < ax && b < bx) {
+            var c1 = pool[a].toInt() and 0xFF
+            var c2 = pool[b].toInt() and 0xFF
+            if (c1 in 0x41..0x5A) c1 += 32
+            if (c2 in 0x41..0x5A) c2 += 32
+            if (c1 != c2) return c1 - c2
+            a++; b++
+        }
+        return (ax - a) - (bx - b)
+    }
+
+    /** 三路快排（重复名多，三路划分显著减少比较） */
+    private fun poolSort(s: SoA, arr: IntArray, loIn: Int, hiIn: Int) {
+        val stack = IntArray(4096)
+        var sp = 0
+        stack[sp++] = loIn; stack[sp++] = hiIn
+        while (sp > 0) {
+            val hi = stack[--sp]
+            val lo = stack[--sp]
+            if (lo >= hi) continue
+            if (hi - lo < 24) {
+                for (i in lo + 1..hi) {
+                    val v = arr[i]; var j = i - 1
+                    while (j >= lo && cmpName(s, arr[j], v) > 0) { arr[j + 1] = arr[j]; j-- }
+                    arr[j + 1] = v
+                }
+                continue
+            }
+            val pivot = arr[lo + (hi - lo) / 2]
+            var lt = lo; var i = lo; var gt = hi
+            while (i <= gt) {
+                val c = cmpName(s, arr[i], pivot)
+                if (c < 0) { val t = arr[lt]; arr[lt] = arr[i]; arr[i] = t; lt++; i++ }
+                else if (c > 0) { val t = arr[gt]; arr[gt] = arr[i]; arr[i] = t; gt-- }
+                else i++
+            }
+            if (lt - lo > hi - gt) {
+                stack[sp++] = lo; stack[sp++] = lt - 1
+                stack[sp++] = gt + 1; stack[sp++] = hi
+            } else {
+                stack[sp++] = gt + 1; stack[sp++] = hi
+                stack[sp++] = lo; stack[sp++] = lt - 1
+            }
+        }
     }
 }
