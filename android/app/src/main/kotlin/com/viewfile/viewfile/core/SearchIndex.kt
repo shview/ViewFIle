@@ -183,6 +183,41 @@ class SearchIndex {
         for (i in 0 until dense) if (s.parentId[i] == -1) dfs(i)
         soa = s
 
+        // 排序 + 池去重必须先于目录映射：pathOfIdx 依赖去重后的 nameRef/nameOff
+        // （曾因顺序颠倒，目录映射读到 IntArray(0) 的 nameRef → length=0; index=0）
+        // 免装箱 IntArray 三路快排（按名、折叠大小写）；装箱排序在 5M 时瞬时 +80MB
+        val order = IntArray(dense) { it }
+        poolSort(s, order, 0, dense - 1)
+
+        // 名字池去重：排序后同名相邻 → 唯一名池 + 引用数组（cache/.log 等重复名占大头）
+        val uniq = ByteArray(s.poolPos)
+        val uniqOff = IntArray(dense + 1)
+        val nameRef = IntArray(dense)
+        var uc = 0
+        var upos = 0
+        var i0 = 0
+        while (i0 < dense) {
+            val head = order[i0]
+            val a = s.nameOff[head]
+            val b = s.nameOff[head + 1]
+            System.arraycopy(s.namePool, a, uniq, upos, b - a)
+            uniqOff[uc] = upos
+            upos += b - a
+            var j = i0
+            while (j < dense && cmpName(s, order[j], head) == 0) {
+                nameRef[order[j]] = uc
+                j++
+            }
+            uc++
+            i0 = j
+        }
+        uniqOff[uc] = upos
+        val uniqBytes = upos
+        s.namePool = uniq.copyOf(upos)
+        s.nameOff = uniqOff.copyOf(uc + 1)
+        s.nameRef = nameRef
+        s.sortIdx = order
+
         // 目录映射 + 统计（密集空间聚合，只有目录需要路径字符串）
         for (i in 0 until dense) {
             if (s.isDir[i].toInt() != 1) continue
@@ -212,39 +247,9 @@ class SearchIndex {
             ps.recSize += st.recSize
         }
 
-        // 排序排列（名字升序、不分大小写）
-        // 免装箱 IntArray 三路快排（按名、折叠大小写）；装箱排序在 5M 时瞬时 +80MB
-        val order = IntArray(dense) { it }
-        poolSort(s, order, 0, dense - 1)
-
-        // 名字池去重：排序后同名相邻 → 唯一名池 + 引用数组（cache/.log 等重复名占大头）
-        val uniq = ByteArray(s.poolPos)
-        val uniqOff = IntArray(dense + 1)
-        val nameRef = IntArray(dense)
-        var uc = 0
-        var upos = 0
-        var i0 = 0
-        while (i0 < dense) {
-            val head = order[i0]
-            val a = s.nameOff[head]
-            val b = s.nameOff[head + 1]
-            System.arraycopy(s.namePool, a, uniq, upos, b - a)
-            uniqOff[uc] = upos
-            upos += b - a
-            var j = i0
-            while (j < dense && cmpName(s, order[j], head) == 0) {
-                nameRef[order[j]] = uc
-                j++
-            }
-            uc++
-            i0 = j
-        }
-        uniqOff[uc] = upos
-        s.namePool = uniq.copyOf(upos)
-        s.nameOff = uniqOff.copyOf(uc + 1)
-        s.nameRef = nameRef
         Log.i("ViewFile/Scan",
-            "SoA built: $dense entries, pool ${(s.poolPos shr 10)}KB, ${System.currentTimeMillis() - t0}ms")
+            "SoA built: $dense entries, ${uc} uniq names, pool ${(uniqBytes shr 10)}KB, " +
+                    "${System.currentTimeMillis() - t0}ms")
         return dense
     }
 
