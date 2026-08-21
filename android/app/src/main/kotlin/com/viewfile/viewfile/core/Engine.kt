@@ -74,10 +74,26 @@ object Engine {
     private fun scanFingerprint(rootIndex: Boolean, systemIndex: Boolean, deepData: Boolean) =
         "root=$rootIndex,sys=$systemIndex,deep=$deepData,tier=${PrivShell.tier()}"
 
-    /** 已有索引则载入内存；返回条目数，并顺带把状态置为 READY */
+    /**
+     * 已有索引则载入内存；返回条目数，-1 = 库超内存预算已自愈重置（调用方
+     * 应以精简模式重建）。每条目堆占用约 400B，按 largeMemoryClass 估算预算。
+     */
     fun loadIndexAsync(cb: (Int) -> Unit) {
         scanExec.execute {
             try {
+                val count = db.rawQuery("SELECT COUNT(*) FROM files", null).use { c ->
+                    if (c.moveToFirst()) c.getInt(0) else 0
+                }
+                val am = appContext
+                    .getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                val budget = am.largeMemoryClass * 2600
+                if (count > budget) {
+                    Log.w("ViewFile/Scan",
+                        "index $count over budget $budget (heap ${am.largeMemoryClass}MB), auto reset")
+                    Db.resetForRebuild(db)
+                    cb(-1)
+                    return@execute
+                }
                 val t0 = System.currentTimeMillis()
                 val n = index.load(db)
                 loadMs = System.currentTimeMillis() - t0
@@ -85,8 +101,9 @@ object Engine {
                 Log.i("ViewFile/Scan", "index loaded: $n entries in ${loadMs}ms")
                 cb(n)
             } catch (t: Throwable) {
-                Log.e("ViewFile/Scan", "loadIndex failed", t)
-                cb(0)
+                Log.e("ViewFile/Scan", "loadIndex failed (${t.javaClass.simpleName}), auto reset", t)
+                Db.resetForRebuild(db)
+                cb(-1)
             }
         }
     }

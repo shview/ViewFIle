@@ -61,9 +61,22 @@ object Db {
             db.endTransaction()
         }
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent)")
-        pragma(db, "PRAGMA wal_checkpoint(TRUNCATE)")
-        // 回收 staging 换表留下的空闲页（WITHOUT ROWID 后库显著变小）
+        // VACUUM 在 WAL 模式会把整库重写进 WAL（实测 600MB+），
+        // 因此必须先 VACUUM 再 checkpoint 截断
         db.execSQL("VACUUM")
+        pragma(db, "PRAGMA wal_checkpoint(TRUNCATE)")
+    }
+
+    /** 索引超内存预算/损坏时的自愈：废弃索引，下次自动按当前配置重建 */
+    fun resetForRebuild(db: SQLiteDatabase) {
+        try {
+            db.execSQL("DROP TABLE IF EXISTS files")
+            db.execSQL("DROP TABLE IF EXISTS files_staging")
+            db.execSQL("DELETE FROM meta WHERE k='scan_cfg'")
+            pragma(db, "PRAGMA wal_checkpoint(TRUNCATE)")
+        } catch (t: Throwable) {
+            android.util.Log.w("ViewFile/Db", "reset failed: ${t.message}")
+        }
     }
 }
 
