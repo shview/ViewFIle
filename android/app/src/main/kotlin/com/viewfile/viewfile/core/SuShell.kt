@@ -17,6 +17,7 @@ internal object ShellProcessRunner {
 
     private sealed interface StreamEvent {
         class Line(val value: String) : StreamEvent
+        class Bytes(val value: ByteArray) : StreamEvent
         class Failure(val error: Throwable) : StreamEvent
         data object Eof : StreamEvent
     }
@@ -25,6 +26,9 @@ internal object ShellProcessRunner {
 
     fun runStream(p: Process, timeoutMs: Long, onLine: (String) -> Unit): SuShell.Result =
         executeStream(p, timeoutMs, onLine)
+
+    fun runBinary(p: Process, timeoutMs: Long, onChunk: (ByteArray, Int) -> Unit): SuShell.Result =
+        executeBinaryStream(p, timeoutMs, onChunk)
 
     private fun execute(p: Process, timeoutMs: Long): SuShell.Result {
         val out = StringBuffer()
@@ -207,6 +211,7 @@ internal object ShellProcessRunner {
                         "stream read failed: ${event.error.message ?: event.error.javaClass.simpleName}")
                 }
                 StreamEvent.Eof -> stdoutDone = true
+                is StreamEvent.Bytes -> Unit
                 null -> Unit
             }
         }
@@ -227,6 +232,129 @@ internal object ShellProcessRunner {
         if (stderrThread.isAlive) closeStreamsAsync(p)
         val resultCode = if (code == 0 && extra != null) -1 else code
         return SuShell.Result(resultCode, "", appendError(err.toString(), extra))
+    }
+
+    /** Binary counterpart of [executeStream]; callbacks stay on the caller thread. */
+    private fun executeBinaryStream(
+        p: Process,
+        timeoutMs: Long,
+        onChunk: (ByteArray, Int) -> Unit,
+    ): SuShell.Result {
+        val queue = ArrayBlockingQueue<StreamEvent>(128)
+        val err = StringBuffer()
+        val stderrFailure = AtomicReference<Throwable?>(null)
+        val cancelled = AtomicBoolean(false)
+        val processDone = CountDownLatch(1)
+        val deadline = System.nanoTime() +
+                TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(0))
+
+        fun offerEvent(event: StreamEvent): Boolean {
+            while (!cancelled.get()) {
+                try {
+                    if (queue.offer(event, 100, TimeUnit.MILLISECONDS)) return true
+                } catch (_: InterruptedException) {
+                    return false
+                }
+            }
+            return false
+        }
+
+        val stdoutThread = Thread({
+            try {
+                p.inputStream.use { input ->
+                    val buffer = ByteArray(8192)
+                    while (!cancelled.get()) {
+                        val length = input.read(buffer)
+                        if (length < 0) break
+                        if (!offerEvent(StreamEvent.Bytes(buffer.copyOf(length)))) break
+                    }
+                }
+                if (!cancelled.get()) offerEvent(StreamEvent.Eof)
+            } catch (t: Throwable) {
+                if (!cancelled.get()) offerEvent(StreamEvent.Failure(t))
+            }
+        }, "vf-shell-binary-out")
+        val stderrThread = Thread({
+            try {
+                p.errorStream.bufferedReader().use { reader ->
+                    val buffer = CharArray(4096)
+                    while (true) {
+                        val length = reader.read(buffer)
+                        if (length < 0) break
+                        err.append(buffer, 0, length)
+                    }
+                }
+            } catch (t: Throwable) {
+                stderrFailure.compareAndSet(null, t)
+            }
+        }, "vf-shell-binary-err")
+        val waiter = Thread({
+            try {
+                p.waitFor()
+            } finally {
+                processDone.countDown()
+            }
+        }, "vf-shell-binary-wait")
+        stdoutThread.isDaemon = true
+        stderrThread.isDaemon = true
+        waiter.isDaemon = true
+        stdoutThread.start()
+        stderrThread.start()
+        waiter.start()
+
+        fun abort(extra: String): SuShell.Result {
+            cancelled.set(true)
+            stdoutThread.interrupt()
+            stderrThread.interrupt()
+            waiter.interrupt()
+            destroyAsync(p)
+            val joinDeadline = System.nanoTime() +
+                    TimeUnit.MILLISECONDS.toNanos(TIMEOUT_DRAIN_WAIT_MS)
+            joinUntil(stdoutThread, joinDeadline)
+            joinUntil(stderrThread, joinDeadline)
+            return SuShell.Result(-1, "", appendError(err.toString(), extra))
+        }
+
+        var stdoutDone = false
+        while (!stdoutDone || processDone.count != 0L) {
+            val left = deadline - System.nanoTime()
+            if (left <= 0) return abort("timeout")
+            val event = try {
+                queue.poll(minOf(left, TimeUnit.MILLISECONDS.toNanos(100)), TimeUnit.NANOSECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return abort("interrupted")
+            }
+            when (event) {
+                is StreamEvent.Bytes -> try {
+                    onChunk(event.value, event.value.size)
+                } catch (t: Throwable) {
+                    return abort("binary callback failed: ${t.message ?: t.javaClass.simpleName}")
+                }
+                is StreamEvent.Failure ->
+                    return abort("binary stream failed: ${event.error.message ?: event.error.javaClass.simpleName}")
+                StreamEvent.Eof -> stdoutDone = true
+                is StreamEvent.Line -> Unit
+                null -> Unit
+            }
+        }
+
+        val drainDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DRAIN_WAIT_MS)
+        joinUntil(stderrThread, drainDeadline)
+        val code = try {
+            p.exitValue()
+        } catch (t: Throwable) {
+            return SuShell.Result(-1, "", appendError(err.toString(), t.message ?: t.toString()))
+        }
+        val failure = stderrFailure.get()
+        val extra = when {
+            failure != null -> "binary stream failed: ${failure.message ?: failure.javaClass.simpleName}"
+            stderrThread.isAlive -> "stream drain timeout"
+            else -> null
+        }
+        if (stderrThread.isAlive) closeStreamsAsync(p)
+        return SuShell.Result(if (code == 0 && extra != null) -1 else code, "",
+            appendError(err.toString(), extra))
     }
 
     private fun joinUntil(thread: Thread, deadlineNanos: Long) {
@@ -322,6 +450,13 @@ object SuShell {
         } catch (t: Throwable) {
             Result(-1, "", t.message ?: t.toString())
         }
+    }
+
+    fun runBinary(cmd: String, timeoutMs: Long = 600000,
+                  onChunk: (ByteArray, Int) -> Unit): Result = try {
+        ShellProcessRunner.runBinary(ProcessBuilder(*suArgs(cmd)).start(), timeoutMs, onChunk)
+    } catch (t: Throwable) {
+        Result(-1, "", t.message ?: t.toString())
     }
 }
 

@@ -7,6 +7,7 @@ import org.junit.Assert.fail
 import org.junit.Test
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.ByteArrayOutputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.util.Collections
@@ -146,6 +147,91 @@ class ShellProcessRunnerTest {
         awaitNoNewShellThreads()
     }
 
+    @Test
+    fun binaryStreamPreservesEveryByteAcrossReadChunks() {
+        val expected = buildList<Byte> {
+            repeat(30_000) { add((it % 251).toByte()) }
+        }.toByteArray()
+        val process = FakeProcess.streaming(stdoutWriter = { out -> out.write(expected) })
+        val actual = ByteArrayOutputStream()
+
+        val result = ShellProcessRunner.runBinary(process, 5_000) { bytes, length ->
+            actual.write(bytes, 0, length)
+        }
+
+        assertEquals(0, result.code)
+        assertTrue(expected.contentEquals(actual.toByteArray()))
+        process.assertWorkersStopped()
+        awaitNoNewShellThreads()
+    }
+
+    @Test
+    fun binaryCallbackFailureDestroysAndNeverCallsBackAfterReturn() {
+        val process = FakeProcess.streaming(stdoutWriter = { out ->
+            repeat(10_000) { out.write(ByteArray(1024) { it.toByte() }) }
+        })
+        val callbacks = AtomicInteger()
+
+        val result = ShellProcessRunner.runBinary(process, 5_000) { _, _ ->
+            if (callbacks.incrementAndGet() == 3) error("binary boom")
+        }
+
+        assertEquals(-1, result.code)
+        assertTrue(result.err.contains("binary callback failed: binary boom"))
+        await("destroy was not called") { process.destroyCalled.get() }
+        val countAtReturn = callbacks.get()
+        Thread.sleep(150)
+        assertEquals(countAtReturn, callbacks.get())
+        assertEquals(3, countAtReturn)
+        process.assertWorkersStopped()
+        awaitNoNewShellThreads()
+    }
+
+    @Test
+    fun binaryNonZeroExitIsPreservedEvenAfterValidOutput() {
+        val process = FakeProcess.streaming(
+            stdoutWriter = { it.write(byteArrayOf(1, 0, 2, 10)) },
+            stderrWriter = { it.write("stat failed".encodeToByteArray()) },
+            exitCode = 17,
+        )
+        val actual = ByteArrayOutputStream()
+
+        val result = ShellProcessRunner.runBinary(process, 2_000) { bytes, length ->
+            actual.write(bytes, 0, length)
+        }
+
+        assertEquals(17, result.code)
+        assertEquals("stat failed", result.err)
+        assertTrue(byteArrayOf(1, 0, 2, 10).contentEquals(actual.toByteArray()))
+        process.assertWorkersStopped()
+        awaitNoNewShellThreads()
+    }
+
+    @Test
+    fun binaryTimeoutCancelsReaderUnderBackpressure() {
+        val process = FakeProcess.streaming(stdoutWriter = { out ->
+            repeat(100_000) { out.write(ByteArray(1024)) }
+        })
+        val callbacks = AtomicInteger()
+        val started = System.nanoTime()
+
+        val result = ShellProcessRunner.runBinary(process, 180) { _, _ ->
+            callbacks.incrementAndGet()
+            Thread.sleep(4)
+        }
+
+        assertEquals(-1, result.code)
+        assertTrue(result.err.contains("timeout"))
+        assertTrue("binary timeout was not bounded", elapsedMillis(started) < 1_500)
+        await("destroy was not called") { process.destroyCalled.get() }
+        val countAtReturn = callbacks.get()
+        Thread.sleep(150)
+        assertEquals(countAtReturn, callbacks.get())
+        assertTrue(countAtReturn > 5)
+        process.assertWorkersStopped()
+        awaitNoNewShellThreads()
+    }
+
     private fun await(message: String, timeoutMs: Long = 1_500, condition: () -> Boolean) {
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         while (!condition() && System.nanoTime() < deadline) Thread.sleep(10)
@@ -157,6 +243,7 @@ class ShellProcessRunnerTest {
             Thread.getAllStackTraces().keys.none {
                 it.isAlive && it.name in setOf(
                     "vf-shell-out", "vf-shell-err", "vf-shell-wait",
+                    "vf-shell-binary-out", "vf-shell-binary-err", "vf-shell-binary-wait",
                     "vf-shell-kill", "vf-shell-close"
                 )
             }

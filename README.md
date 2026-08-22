@@ -137,12 +137,17 @@ CREATE UNIQUE INDEX idx_entry_parent_name ON entry(parent_id, name);
 IndexBuilder.begin()
   → 建独立 index-new.db（WAL + synchronous=OFF + 20万条分批）
   → FUSE 并行扫描（4 worker 采集 + 单线程批量落库）
-  → root 管道扫描（find|stat 流式）
+  → root 管道扫描（绝对 find -print0 | bounded xargs stat，pipefail 二进制流式；
+    每批先输出计数与 NUL 路径，再输出不含路径的固定三字段元数据，换行/竖线/引号路径无歧义）
+      → ColorOS toybox `find -exec ... {} +` 会越过 ARG_MAX 并返回 rc=126；
+        固定每批 256 路径，`set -o pipefail` 保证 find/stat 任一失败都失败
   → finishAndSwap()
       → commit 事务
       → CREATE UNIQUE INDEX（建后索引）
       → wal_checkpoint(TRUNCATE)
       → 关闭旧连接 → 删 index.db* → rename → 重开连接
+  → 任一 root 区失败：回滚活动事务、关闭 statement/DB，幂等删除
+    index-new.db/-wal/-shm/-journal；不 swap，并明确提示深度索引未生效、旧索引保留
 ```
 
 ### 2.4 SoA 内存索引（SearchIndex.kt）

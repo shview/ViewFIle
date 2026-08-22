@@ -126,6 +126,13 @@ object ShizukuShell {
             SuShell.Result(-1, "", t.message ?: t.toString())
         }
     }
+
+    fun runBinary(cmd: String, timeoutMs: Long = 600000,
+                  onChunk: (ByteArray, Int) -> Unit): SuShell.Result = try {
+        ShellProcessRunner.runBinary(newProcess(arrayOf("sh", "-c", cmd)), timeoutMs, onChunk)
+    } catch (t: Throwable) {
+        SuShell.Result(-1, "", t.message ?: t.toString())
+    }
 }
 
 /** 特权命令统一入口：优先 root，其次 Shizuku，最后无特权 */
@@ -158,4 +165,11 @@ object PrivShell {
             Tier.SHIZUKU -> ShizukuShell.runStream(cmd, timeoutMs, onLine)
             Tier.NONE -> SuShell.Result(-1, "", "无可用特权后端（root / Shizuku）")
         }
+
+    fun runBinary(cmd: String, timeoutMs: Long = 600000,
+                  onChunk: (ByteArray, Int) -> Unit): SuShell.Result = when (tier()) {
+        Tier.ROOT -> SuShell.runBinary(cmd, timeoutMs, onChunk)
+        Tier.SHIZUKU -> ShizukuShell.runBinary(cmd, timeoutMs, onChunk)
+        Tier.NONE -> SuShell.Result(-1, "", "无可用特权后端（root / Shizuku）")
+    }
 }

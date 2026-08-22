@@ -20,13 +20,15 @@ class IndexBuilder(private val context: Context) : IndexSink {
     }
     private val dirIds = HashMap<String, Long>(1 shl 16)
     private var chainCalls = 0L
+    private var abandoned = false
     var files = 0
         private set
     var dirs = 0
         private set
 
     fun begin() {
-        context.getDatabasePath(Db.BUILD).let { f -> if (f.exists()) f.delete() }
+        abandoned = false
+        deleteBuildArtifacts(context.getDatabasePath(Db.BUILD))
         db = context.openOrCreateDatabase(Db.BUILD, Context.MODE_PRIVATE, null)
         // journal_mode 返回结果行，必须走 rawQuery（A16 起 execSQL 拒绝带返回行的语句）。
         // 实测 journal=OFF 在百万级构建时触发 SQLITE_CORRUPT，WAL 稳定且构建库用完即删
@@ -114,10 +116,44 @@ class IndexBuilder(private val context: Context) : IndexSink {
 
     class Stats(val files: Int, val dirs: Int, val commitMs: Long, val indexMs: Long, val swapMs: Long)
 
-    /** 扫描失败时丢弃构建库 */
-    fun abandon() {
-        try { db.close() } catch (_: Throwable) {}
-        context.getDatabasePath(Db.BUILD).let { if (it.exists()) it.delete() }
+    data class AbandonReport(val transactionEnded: Boolean, val deleted: Int, val errors: Int)
+
+    /** 扫描失败时回滚活动事务、关闭句柄并 best-effort 删除构建库全部 sidecar。 */
+    fun abandon(): AbandonReport {
+        if (abandoned) {
+            val cleanup = deleteBuildArtifacts(context.getDatabasePath(Db.BUILD))
+            return AbandonReport(false, cleanup.deleted, cleanup.errors)
+        }
+        abandoned = true
+        var ended = false
+        var deleted = 0
+        var errors = 0
+        if (this::db.isInitialized) {
+            try {
+                if (db.isOpen && db.inTransaction()) {
+                    db.endTransaction() // no setTransactionSuccessful: rollback current batch
+                    ended = true
+                }
+            } catch (t: Throwable) {
+                errors++
+                Log.w("ViewFile/Build", "abandon rollback failed: ${t.message}")
+            }
+            if (insert.isInitialized()) {
+                try { insert.value.close() } catch (t: Throwable) {
+                    errors++
+                    Log.w("ViewFile/Build", "abandon statement close failed: ${t.message}")
+                }
+            }
+            try { if (db.isOpen) db.close() } catch (t: Throwable) {
+                errors++
+                Log.w("ViewFile/Build", "abandon db close failed: ${t.message}")
+            }
+        }
+        val cleanup = deleteBuildArtifacts(context.getDatabasePath(Db.BUILD))
+        deleted += cleanup.deleted
+        errors += cleanup.errors
+        Log.i("ViewFile/Build", "abandon endedTx=$ended deleted=$deleted errors=$errors")
+        return AbandonReport(ended, deleted, errors)
     }
 
     /** 提交事务→建索引→原子替换主库。onSwapped(null) 时 Engine 应关闭旧连接。 */
@@ -169,4 +205,19 @@ class IndexBuilder(private val context: Context) : IndexSink {
             "build: $files files + $dirs dirs, commit ${commitMs}ms, index ${indexMs}ms, swap ${swapMs}ms")
         return Stats(files, dirs, commitMs, indexMs, swapMs)
     }
+}
+
+internal fun buildArtifacts(build: File): List<File> =
+    listOf("", "-wal", "-shm", "-journal").map { File(build.path + it) }
+
+internal data class ArtifactCleanup(val deleted: Int, val errors: Int)
+
+internal fun deleteBuildArtifacts(build: File): ArtifactCleanup {
+    var deleted = 0
+    var errors = 0
+    for (file in buildArtifacts(build)) {
+        if (!file.exists()) continue
+        if (file.delete()) deleted++ else errors++
+    }
+    return ArtifactCleanup(deleted, errors)
 }

@@ -78,7 +78,14 @@ class MainActivity : FlutterActivity() {
                             onDone = { r, err ->
                                 main.post {
                                     scanSink?.success(
-                                        if (err != null) mapOf("type" to "error", "error" to err)
+                                        if (err != null) mapOf(
+                                            "type" to "error",
+                                            "error" to err,
+                                            "newIndexPublished" to false,
+                                            "oldIndexRetained" to Engine.lastScanFailureRetainedOldIndex,
+                                            "deepRequested" to deepData,
+                                            "deepApplied" to false,
+                                        )
                                         else mapOf(
                                             "type" to "done",
                                             "files" to r!!.files, "dirs" to r.dirs,

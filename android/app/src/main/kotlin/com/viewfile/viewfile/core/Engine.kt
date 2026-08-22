@@ -28,6 +28,8 @@ object Engine {
         private set
     @Volatile var rootGranted = false
         private set
+    @Volatile var lastScanFailureRetainedOldIndex = true
+        private set
 
     class Result(val files: Int, val dirs: Int, val elapsedMs: Long, val withRoot: Boolean)
 
@@ -103,6 +105,7 @@ object Engine {
      */
     fun loadIndexAsync(cb: (Int) -> Unit) {
         scanExec.execute {
+            lastScanFailureRetainedOldIndex = true
             try {
                 val count = db.rawQuery("SELECT COUNT(*) FROM entry", null).use { c ->
                     if (c.moveToFirst()) c.getInt(0) else 0
@@ -163,6 +166,7 @@ object Engine {
             ShizukuShell.getAvailable(refresh = true)
             state = State.SCANNING
             val builder = IndexBuilder(appContext)
+            var swapAttempted = false
             try {
                 val t0 = System.currentTimeMillis()
                 builder.begin()
@@ -195,6 +199,7 @@ object Engine {
                     dirs += rc.dirs
                 }
 
+                swapAttempted = true
                 val st = builder.finishAndSwap { fresh ->
                     if (fresh != null) {
                         db = fresh
@@ -213,14 +218,27 @@ object Engine {
                 lastScan = r
                 lastScanAt = System.currentTimeMillis()
                 state = State.READY
+                lastScanFailureRetainedOldIndex = false
                 Log.i("ViewFile/Scan", "rebuild done: $files files, $dirs dirs, " +
                         "index $n loaded in ${loadMs}ms, root=$withRoot")
                 onDone(r, null)
             } catch (t: Throwable) {
-                try { builder.abandon() } catch (_: Throwable) {}
+                val abandoned = try { builder.abandon() } catch (cleanup: Throwable) {
+                    Log.e("ViewFile/Build", "abandon failed", cleanup)
+                    null
+                }
                 state = State.IDLE
+                lastScanFailureRetainedOldIndex = !swapAttempted
                 Log.e("ViewFile/Scan", "scan failed", t)
-                onDone(null, t.message ?: t.toString())
+                val cleanupText = abandoned?.let {
+                    "（临时库清理: tx=${it.transactionEnded}, deleted=${it.deleted}, errors=${it.errors}）"
+                } ?: "（临时库清理状态未知）"
+                val retainedText = if (lastScanFailureRetainedOldIndex) {
+                    "新索引未发布，当前仍使用旧索引"
+                } else {
+                    "新索引未发布，旧索引保留状态需复核"
+                }
+                onDone(null, (t.message ?: t.toString()) + "；$retainedText $cleanupText")
             } finally {
                 pendingScanRequests.decrementAndGet()
             }

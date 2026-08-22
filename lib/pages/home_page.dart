@@ -220,7 +220,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } else if (type == 'error') {
       setState(() {
         _scanning = false;
-        _statusLine = '扫描失败: ${e['error']}';
+        final retained = e['oldIndexRetained'] == true;
+        final deep = e['deepRequested'] == true
+            ? '；深度索引未生效，${retained ? '仍保留旧索引' : '旧索引状态需复核'}'
+            : '；新索引未发布，${retained ? '仍保留旧索引' : '旧索引状态需复核'}';
+        _statusLine = '扫描失败: ${e['error']}$deep';
       });
     }
   }
