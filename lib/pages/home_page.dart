@@ -11,6 +11,7 @@ import '../utils/watcher_lifecycle.dart';
 import 'apps_page.dart';
 import 'settings_page.dart';
 import 'dest_picker_page.dart';
+import 'storage_analysis_page.dart';
 import 'tips_page.dart';
 
 const kSdcard = '/storage/emulated/0';
@@ -864,6 +865,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 style: theme.textTheme.bodySmall,
               ),
               onTap: () => _api.requestPermission(),
+            ),
+            ListTile(
+              leading: const Icon(Icons.analytics_outlined),
+              title: const Text('空间分析'),
+              subtitle: Text('按大小可视化', style: theme.textTheme.bodySmall),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                        builder: (_) => StorageAnalysisPage(
+                            initialPath: _currentDir)));
+              },
             ),
             ListTile(
               leading: const Icon(Icons.settings_outlined),
