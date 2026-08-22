@@ -99,6 +99,3 @@ class Scanner {
     companion object { const val TAG = "ViewFile/Scan" }
 }
 
-fun logScanDone(area: String, files: Int, dirs: Int, ms: Long) {
-    Log.i(Scanner.TAG, "scan[$area] done: $files files, $dirs dirs in ${ms}ms")
-}

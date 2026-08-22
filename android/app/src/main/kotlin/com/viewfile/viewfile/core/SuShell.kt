@@ -291,6 +291,8 @@ internal object ShellProcessRunner {
         val waiter = Thread({
             try {
                 p.waitFor()
+            } catch (_: InterruptedException) {
+                // abort() 会 interrupt 本线程取消等待——正常取消路径，不是错误
             } finally {
                 processDone.countDown()
             }
@@ -447,6 +449,48 @@ object SuShell {
     fun runStream(cmd: String, timeoutMs: Long = 600000, onLine: (String) -> Unit): Result {
         return try {
             ShellProcessRunner.runStream(ProcessBuilder(*suArgs(cmd)).start(), timeoutMs, onLine)
+        } catch (t: Throwable) {
+            Result(-1, "", t.message ?: t.toString())
+        }
+    }
+
+    /**
+     * 高吞吐量流式读取（扫描专用）：直接在调用线程读 BufferedReader，
+     * 跳过 ShellProcessRunner 的三线程队列中转（20 万条时队列 park/unpark
+     * 开销是分钟级 vs 直接读取秒级）。超时用 watchdog 线程 destroy 进程。
+     */
+    fun runStreamFast(cmd: String, timeoutMs: Long = 600000, onLine: (String) -> Unit): Result {
+        return try {
+            val p = ProcessBuilder(*suArgs(cmd)).start()
+            val err = StringBuilder()
+            val errThread = Thread({
+                try {
+                    p.errorStream.bufferedReader().forEachLine { err.appendLine(it) }
+                } catch (_: Throwable) {}
+            }, "vf-fast-err")
+            errThread.isDaemon = true
+            errThread.start()
+
+            // 超时看门狗：到时 destroy 进程使 readLine 返回 null
+            val watchdog = Thread({
+                try {
+                    Thread.sleep(timeoutMs)
+                    p.destroyForcibly()
+                } catch (_: InterruptedException) {}
+            }, "vf-fast-watchdog")
+            watchdog.isDaemon = true
+            watchdog.start()
+
+            p.inputStream.bufferedReader().use { r ->
+                while (true) {
+                    val line = r.readLine() ?: break
+                    onLine(line)
+                }
+            }
+            watchdog.interrupt()
+            val finished = p.waitFor(5, TimeUnit.SECONDS)
+            val code = if (finished) p.exitValue() else -1
+            Result(code, "", err.toString())
         } catch (t: Throwable) {
             Result(-1, "", t.message ?: t.toString())
         }
