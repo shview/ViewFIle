@@ -222,10 +222,17 @@ sortIdx[]  字典序排列（免装箱三路快排，折叠比较排序）
     fail-closed 回退 MediaStore
   → pkill 使用 app 私有 nativeLibraryDir 绝对路径 + `[l]ibvfwatch\.so` 精确身份，
     不匹配自身/其他 app 同名进程；helper 启动前持久记录后端与绝对身份
-  → 新进程按记录预清孤儿；SU 可直接清理；可信历史 Shizuku 记录须 ps 可见并在
-    清理后复核消失；首次安装无记录时也仅在 package-wide ps 明确 ABSENT/CLEARED 后启动
-  → 历史 SU 记录转为 Shizuku 时无法排除更高权限孤儿，直接 fail-closed；ps 不兼容、
-    执行失败、目标清理后仍可见都回退 MediaStore
+  → watch-mode helper 启动即以 `PR_SET_NAME` 设置 15 字节专属 comm
+    `vf.viewfile.vfw`；设置失败即退出，rename helper 模式不改名
+  → 新进程按记录预清孤儿；SU 可直接清理；Shizuku 先用 `pidof libvfwatch.so`
+    兼容旧版，再以 `pidof vf.viewfile.vfw` 检测新版，避免旧→新 comm 迁移窗口漏检；
+    两条命令均可靠 absent 才可直接放行
+  → 发现 PID 后以 `/proc/<pid>/exe` 归属到 ViewFile exact/package-wide 路径，
+    只用包专属正则清理并复核；旧通用名无法确认归属时 fail-closed，绝不按通用名 kill
+  → 仅旧通用名命中的 ViewFile PID 还须读取 cmdline：argc=1 才是旧 watcher；
+    明确 `--rename-noreplace` 的短时 rename helper 忽略，不确定则 fail-closed
+  → 历史 SU 记录转为 Shizuku 时无法排除更高权限孤儿，直接 fail-closed；pidof/readlink
+    不兼容、执行失败、目标清理后仍可见都回退 MediaStore
   → 数据清除/重装导致无记录时，ROOT 使用严格 package-wide 跨版本身份同时覆盖
     Android 8 与现代 `/data/app` 布局；失败在 refresh 重试
   → 应用只读 max_user_watches，绝不修改 sysctl；容量不足回退 MediaStore

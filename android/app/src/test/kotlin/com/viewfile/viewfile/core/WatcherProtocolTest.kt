@@ -204,6 +204,77 @@ class WatcherProtocolTest {
     }
 
     @Test
+    fun shizukuPidofPreflightUsesDedicatedAndLegacyNamesFailClosed() {
+        assertEquals(
+            listOf(LEGACY_NATIVE_WATCHER_COMM, NATIVE_WATCHER_COMM),
+            nativeHelperPidofProbeOrder(),
+        )
+        assertEquals(
+            listOf("pidof libvfwatch.so", "pidof vf.viewfile.vfw"),
+            nativeHelperPidofProbeOrder().mapNotNull(::nativeHelperPidofCommand),
+        )
+        assertEquals("pidof vf.viewfile.vfw", nativeHelperPidofCommand(NATIVE_WATCHER_COMM))
+        assertEquals("pidof libvfwatch.so",
+            nativeHelperPidofCommand(LEGACY_NATIVE_WATCHER_COMM))
+        assertNull(nativeHelperPidofCommand("libvfwatch.so; pkill other"))
+
+        val absent = parsePidofProbe(1, "")
+        assertEquals(PidofProbeKind.ABSENT, absent.kind)
+        val found = parsePidofProbe(0, "123 456\n")
+        assertEquals(PidofProbeKind.FOUND, found.kind)
+        assertEquals(setOf(123, 456), found.pids)
+        assertEquals(PidofProbeKind.UNVERIFIABLE, parsePidofProbe(0, "").kind)
+        assertEquals(PidofProbeKind.UNVERIFIABLE, parsePidofProbe(127, "").kind)
+        assertEquals(PidofProbeKind.UNVERIFIABLE, parsePidofProbe(0, "12 bad").kind)
+        assertEquals(emptySet<Int>(), combinePidofCandidates(absent, absent))
+        assertEquals(setOf(123, 456), combinePidofCandidates(found, absent))
+        assertNull(combinePidofCandidates(found, parsePidofProbe(126, "")))
+        assertEquals("readlink /proc/123/exe", nativeHelperReadlinkCommand(123))
+        assertEquals("tr '\\000' '\\n' < /proc/123/cmdline",
+            nativeHelperCmdlineCommand(123))
+        assertNull(nativeHelperReadlinkCommand(0))
+        assertNull(nativeHelperCmdlineCommand(-1))
+        assertEquals(LegacyHelperMode.WATCH, classifyLegacyHelperCmdline("/old/libvfwatch.so\n"))
+        assertEquals(LegacyHelperMode.RENAME, classifyLegacyHelperCmdline(
+            "/new/libvfwatch.so\n--rename-noreplace\n/old\n/new\n"))
+        assertEquals(LegacyHelperMode.UNVERIFIABLE,
+            classifyLegacyHelperCmdline("/new/libvfwatch.so\n--other\n"))
+
+        val exact = nativeHelperIdentityPattern(
+            "/data/app/~~id/com.viewfile.viewfile-AbC/lib/arm64/libvfwatch.so")!!
+        assertEquals(ResolvedHelperIdentity.VIEWFILE, classifyResolvedHelperPath(
+            "/data/app/~~id/com.viewfile.viewfile-AbC/lib/arm64/libvfwatch.so", exact))
+        assertEquals(ResolvedHelperIdentity.VIEWFILE, classifyResolvedHelperPath(
+            "/data/app/com.viewfile.viewfile-old/lib/arm/libvfwatch.so (deleted)", exact))
+        assertEquals(ResolvedHelperIdentity.OTHER_PACKAGE, classifyResolvedHelperPath(
+            "/data/app/com.other.app-x/lib/arm64/libvfwatch.so", exact))
+        assertEquals(ResolvedHelperIdentity.UNVERIFIABLE, classifyResolvedHelperPath("?", exact))
+        assertEquals(ResolvedHelperIdentity.UNVERIFIABLE, classifyResolvedHelperPath(
+            "/data/local/tmp/libvfwatch.so", exact))
+        // The generic legacy name is detection-only: cleanup remains the anchored package regex.
+        assertTrue(nativeHelperPkillCommand(nativeHelperPackageWideIdentityPattern())
+            .contains("com\\.viewfile\\.viewfile"))
+        assertFalse(nativeHelperPkillCommand(nativeHelperPackageWideIdentityPattern()) ==
+            "pkill libvfwatch.so")
+    }
+
+    @Test
+    fun legacyThenDedicatedProbeCannotMissOneWayCommMigration() {
+        fun observed(transition: Int): Set<Int>? {
+            // transition: 0=before legacy probe, 1=between probes, 2=after both probes.
+            var dedicated = transition == 0
+            val legacy = if (dedicated) parsePidofProbe(1, "") else parsePidofProbe(0, "42")
+            if (transition == 1) dedicated = true
+            val named = if (dedicated) parsePidofProbe(0, "42") else parsePidofProbe(1, "")
+            return combinePidofCandidates(named, legacy)
+        }
+
+        assertEquals(setOf(42), observed(0)) // switched before the first (legacy) probe
+        assertEquals(setOf(42), observed(1)) // switched between legacy and dedicated probes
+        assertEquals(setOf(42), observed(2)) // switched after both; legacy probe already hit
+    }
+
+    @Test
     fun firstNativeStartPreflightsOrphanAndRetriesOnlyAfterFailure() {
         val identity = nativeHelperIdentityPattern(
             "/data/app/~~id/com.viewfile.viewfile-AbC/lib/arm64/libvfwatch.so")!!

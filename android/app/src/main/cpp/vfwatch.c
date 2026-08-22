@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/inotify.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 
 #ifndef RENAME_NOREPLACE
@@ -23,6 +24,10 @@
 #define MAX_WATCH 200000
 #define BUF_SZ (1 << 16)
 #define LINE_SZ 4096
+#define WATCH_COMM "vf.viewfile.vfw"
+
+/* Linux task comm is 16 bytes including NUL. Keep this identity exact and stable. */
+_Static_assert(sizeof(WATCH_COMM) <= 16, "vfwatch comm exceeds Linux TASK_COMM_LEN");
 
 struct watch_mapping {
     int wd;
@@ -74,6 +79,12 @@ int main(int argc, char **argv) {
             return rename_noreplace(argv[2], argv[3]);
         fprintf(stderr, "usage: %s --rename-noreplace OLD NEW\n", argv[0]);
         return 64;
+    }
+
+    /* Watch mode only: rename helper mode must retain its ordinary short-lived identity. */
+    if (prctl(PR_SET_NAME, WATCH_COMM, 0, 0, 0) != 0) {
+        fprintf(stderr, "prctl(PR_SET_NAME): %s\n", strerror(errno));
+        return 1;
     }
 
     int fd = inotify_init1(IN_CLOEXEC);

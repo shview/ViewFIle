@@ -620,23 +620,79 @@ class TreeWatcher(
     private fun verifyAndCleanupViaShizuku(
         identityPattern: String,
     ): WatcherVisibilityCleanupResult {
-        fun visible(): Boolean? {
-            val result = runCatching {
-                ShizukuShell.run("ps -A -ww -o ARGS", 5000)
-            }.getOrNull() ?: return null
-            if (!result.ok) return null
-            return result.out.lineSequence().any {
-                nativeHelperIdentityMatches(identityPattern, it)
+        fun inspect(): WatcherPidVisibility {
+            fun probe(comm: String): PidofProbe {
+                val command = nativeHelperPidofCommand(comm)
+                    ?: return PidofProbe(PidofProbeKind.UNVERIFIABLE)
+                val result = runCatching {
+                    ShizukuShell.run(command, 5000)
+                }.getOrNull() ?: return PidofProbe(PidofProbeKind.UNVERIFIABLE)
+                return parsePidofProbe(result.code, result.out)
             }
+
+            val probeOrder = nativeHelperPidofProbeOrder()
+            val legacy = probe(probeOrder[0])
+            val named = probe(probeOrder[1])
+            val candidates = combinePidofCandidates(named, legacy)
+                ?: return WatcherPidVisibility.UNVERIFIABLE
+            if (candidates.isEmpty()) return WatcherPidVisibility.ABSENT
+
+            var viewFileFound = false
+            for (pid in candidates) {
+                val readlinkCommand = nativeHelperReadlinkCommand(pid)
+                    ?: return WatcherPidVisibility.UNVERIFIABLE
+                val resolved = runCatching {
+                    ShizukuShell.run(readlinkCommand, 5000)
+                }.getOrNull() ?: return WatcherPidVisibility.UNVERIFIABLE
+                if (!resolved.ok) return WatcherPidVisibility.UNVERIFIABLE
+                when (classifyResolvedHelperPath(resolved.out, identityPattern)) {
+                    ResolvedHelperIdentity.VIEWFILE -> {
+                        // Current rename operations intentionally keep the legacy comm.
+                        // Only an argc=1 legacy process is an old watcher candidate.
+                        if (pid in legacy.pids && pid !in named.pids) {
+                            val cmdlineCommand = nativeHelperCmdlineCommand(pid)
+                                ?: return WatcherPidVisibility.UNVERIFIABLE
+                            val cmdline = runCatching {
+                                ShizukuShell.run(cmdlineCommand, 5000)
+                            }.getOrNull() ?: return WatcherPidVisibility.UNVERIFIABLE
+                            if (!cmdline.ok) return WatcherPidVisibility.UNVERIFIABLE
+                            when (classifyLegacyHelperCmdline(cmdline.out)) {
+                                LegacyHelperMode.WATCH -> viewFileFound = true
+                                LegacyHelperMode.RENAME -> Unit
+                                LegacyHelperMode.UNVERIFIABLE ->
+                                    return WatcherPidVisibility.UNVERIFIABLE
+                            }
+                        } else {
+                            viewFileFound = true
+                        }
+                    }
+                    ResolvedHelperIdentity.OTHER_PACKAGE -> Unit
+                    ResolvedHelperIdentity.UNVERIFIABLE ->
+                        return WatcherPidVisibility.UNVERIFIABLE
+                }
+            }
+            return if (viewFileFound) WatcherPidVisibility.VIEWFILE
+                else WatcherPidVisibility.ABSENT
         }
-        val before = visible() ?: return WatcherVisibilityCleanupResult.UNVERIFIABLE
-        if (!before) return WatcherVisibilityCleanupResult.ABSENT
+
+        when (inspect()) {
+            WatcherPidVisibility.ABSENT -> return WatcherVisibilityCleanupResult.ABSENT
+            WatcherPidVisibility.UNVERIFIABLE ->
+                return WatcherVisibilityCleanupResult.UNVERIFIABLE
+            WatcherPidVisibility.VIEWFILE -> Unit
+        }
+        // Never kill by the legacy generic comm. The package-wide argv identity is anchored
+        // to com.viewfile.viewfile and cannot target another app with the same basename.
         val killed = killNativeHelpers(
-            WatcherCleanupTarget(WatcherHelperBackend.SHIZUKU, identityPattern))
+            WatcherCleanupTarget(
+                WatcherHelperBackend.SHIZUKU,
+                nativeHelperPackageWideIdentityPattern(),
+            ))
         if (!killed) return WatcherVisibilityCleanupResult.UNVERIFIABLE
-        // rc=0 alone is insufficient across uid boundaries: absence must be observable afterwards.
-        return when (visible()) {
-            false -> WatcherVisibilityCleanupResult.CLEARED
+        // rc=0 alone is insufficient across uid boundaries: both comm identities must be
+        // probed again and any remaining generic pid must still be attributable by /proc/exe.
+        return when (inspect()) {
+            WatcherPidVisibility.ABSENT -> WatcherVisibilityCleanupResult.CLEARED
             else -> WatcherVisibilityCleanupResult.UNVERIFIABLE
         }
     }

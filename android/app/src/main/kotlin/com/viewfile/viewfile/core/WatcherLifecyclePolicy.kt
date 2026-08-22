@@ -80,6 +80,89 @@ internal data class WatcherCleanupTarget(
 
 private const val VIEWFILE_PACKAGE_SEGMENT = "/com.viewfile.viewfile"
 private const val NATIVE_HELPER_BASENAME = "libvfwatch.so"
+internal const val NATIVE_WATCHER_COMM = "vf.viewfile.vfw"
+internal const val LEGACY_NATIVE_WATCHER_COMM = NATIVE_HELPER_BASENAME
+
+/**
+ * Probe the old comm first. PR_SET_NAME only transitions old -> dedicated, so this order
+ * guarantees that a process migrating between the two pidof calls is seen at least once.
+ */
+internal fun nativeHelperPidofProbeOrder(): List<String> = listOf(
+    LEGACY_NATIVE_WATCHER_COMM,
+    NATIVE_WATCHER_COMM,
+)
+
+internal fun nativeHelperPidofCommand(comm: String): String? =
+    comm.takeIf { it.isNotEmpty() && it.length <= 15 && it.all { ch ->
+        ch.isLetterOrDigit() || ch == '.' || ch == '_' || ch == '-'
+    } }?.let { "pidof $it" }
+
+internal enum class PidofProbeKind { ABSENT, FOUND, UNVERIFIABLE }
+
+internal data class PidofProbe(
+    val kind: PidofProbeKind,
+    val pids: Set<Int> = emptySet(),
+)
+
+/** Android toybox pidof: 0 + numeric pid list is found; 1 + empty is absent. */
+internal fun parsePidofProbe(exitCode: Int, stdout: String): PidofProbe {
+    val tokens = stdout.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+    if (exitCode == 1 && tokens.isEmpty()) return PidofProbe(PidofProbeKind.ABSENT)
+    if (exitCode != 0 || tokens.isEmpty()) return PidofProbe(PidofProbeKind.UNVERIFIABLE)
+    val pids = tokens.mapNotNull { it.toIntOrNull()?.takeIf { pid -> pid > 0 } }.toSet()
+    return if (pids.size == tokens.size) PidofProbe(PidofProbeKind.FOUND, pids)
+    else PidofProbe(PidofProbeKind.UNVERIFIABLE)
+}
+
+/** null means either pidof command was not reliable; empty means both proved absent. */
+internal fun combinePidofCandidates(
+    named: PidofProbe,
+    legacy: PidofProbe,
+): Set<Int>? = if (named.kind == PidofProbeKind.UNVERIFIABLE ||
+    legacy.kind == PidofProbeKind.UNVERIFIABLE
+) null else named.pids + legacy.pids
+
+internal fun nativeHelperReadlinkCommand(pid: Int): String? =
+    pid.takeIf { it > 0 }?.let { "readlink /proc/$it/exe" }
+
+internal fun nativeHelperCmdlineCommand(pid: Int): String? =
+    pid.takeIf { it > 0 }?.let { "tr '\\000' '\\n' < /proc/$it/cmdline" }
+
+internal enum class LegacyHelperMode { WATCH, RENAME, UNVERIFIABLE }
+
+internal fun classifyLegacyHelperCmdline(stdout: String): LegacyHelperMode {
+    val args = stdout.lineSequence().filter { it.isNotEmpty() }.toList()
+    if (args.size == 1) return LegacyHelperMode.WATCH
+    if (args.size == 4 && args[1] == "--rename-noreplace") return LegacyHelperMode.RENAME
+    return LegacyHelperMode.UNVERIFIABLE
+}
+
+internal enum class ResolvedHelperIdentity { VIEWFILE, OTHER_PACKAGE, UNVERIFIABLE }
+internal enum class WatcherPidVisibility { ABSENT, VIEWFILE, UNVERIFIABLE }
+
+private val ANY_INSTALLED_PACKAGE_HELPER = Regex(
+    "^/data/app/(~~[-_A-Za-z0-9=]+/)?" +
+        "[-_A-Za-z0-9]+(?:\\.[-_A-Za-z0-9]+)+-[-_A-Za-z0-9=]+/" +
+        "lib/[-_A-Za-z0-9]+/libvfwatch\\.so$",
+)
+
+internal fun classifyResolvedHelperPath(
+    resolvedPath: String,
+    exactIdentityPattern: String,
+): ResolvedHelperIdentity {
+    val normalized = resolvedPath.trim().removeSuffix(" (deleted)")
+    if (!normalized.startsWith('/')) return ResolvedHelperIdentity.UNVERIFIABLE
+    return if (nativeHelperIdentityMatches(exactIdentityPattern, normalized) ||
+        nativeHelperIdentityMatches(nativeHelperPackageWideIdentityPattern(), normalized)
+    ) ResolvedHelperIdentity.VIEWFILE
+    else if (ANY_INSTALLED_PACKAGE_HELPER.matches(normalized)) {
+        ResolvedHelperIdentity.OTHER_PACKAGE
+    } else {
+        // A generic legacy comm outside a recognized package install path cannot be
+        // attributed safely. It must not turn into either ABSENT or a kill target.
+        ResolvedHelperIdentity.UNVERIFIABLE
+    }
+}
 
 /** Android 8 legacy and modern install layouts, with no wildcard crossing path segments. */
 internal fun nativeHelperPackageWideIdentityPattern(): String =
