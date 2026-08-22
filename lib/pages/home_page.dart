@@ -62,6 +62,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // 多选状态（浏览/搜索共用）
   bool _selecting = false;
   final Set<String> _selected = {};
+  StreamSubscription<Map<dynamic, dynamic>>? _scanEventsSubscription;
 
   bool get _isSearching =>
       _searchCtl.text.trim().isNotEmpty || _appScope != null;
@@ -72,7 +73,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _api.scanEvents().listen(_onScanEvent, onError: (_) {});
+    _scanEventsSubscription = _api.scanEvents().listen(
+      _onScanEvent,
+      onError: (_) {},
+    );
     _prefsReady = _loadPrefs();
     _bootstrap();
   }
@@ -557,6 +561,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _watcherDesiredForeground = false;
     WidgetsBinding.instance.removeObserver(this);
     _debounce?.cancel();
+    _scanEventsSubscription?.cancel();
+    _scanEventsSubscription = null;
     _searchCtl.dispose();
     super.dispose();
   }

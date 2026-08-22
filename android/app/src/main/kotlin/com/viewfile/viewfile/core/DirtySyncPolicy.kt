@@ -2,6 +2,19 @@ package com.viewfile.viewfile.core
 
 internal const val MAX_DIRTY_SYNC_SCOPE = 256
 internal const val MAX_SCOPED_ROOT_SHELL_CALLS = 16
+internal const val WATCHER_SETTLE_QUIET_MS = 1800L
+
+internal fun watcherSettleDelayMs(lastDirtyAt: Long, completedAt: Long, now: Long): Long =
+    (maxOf(lastDirtyAt, completedAt) + WATCHER_SETTLE_QUIET_MS - now).coerceAtLeast(0L)
+
+/** null is full scope and dominates; bounded union prevents an unbounded retained settle set. */
+internal fun mergeWatcherScopes(first: Set<String>?, second: Set<String>?): Set<String>? {
+    if (first == null || second == null) return null
+    val merged = LinkedHashSet<String>(first.size + second.size)
+    merged.addAll(first)
+    merged.addAll(second)
+    return merged.takeIf { it.size <= MAX_DIRTY_SYNC_SCOPE }
+}
 
 enum class WatcherMode { MEDIA, SU, SHIZUKU }
 
@@ -151,7 +164,12 @@ internal class DirtyScopeAccumulator(
 internal data class WatcherSyncLaunch(
     val dirtyDirectories: Set<String>?,
     val recoveryAttempt: Boolean,
+    val cause: WatcherSyncCause = WatcherSyncCause.EVENT,
+    val settleCoalesced: Boolean = false,
+    val settleCancelled: Boolean = false,
 )
+
+internal enum class WatcherSyncCause { EVENT, TRAILING, RECOVERY, SETTLE }
 
 /**
  * Single-flight watcher-sync coalescer. Full scope dominates dirty paths.
@@ -167,9 +185,14 @@ internal class WatcherSyncCoalescer {
     fun submit(
         dirtyDirectories: Set<String>?,
         allowLaunch: Boolean = true,
+        cause: WatcherSyncCause = WatcherSyncCause.EVENT,
+        settleCoalesced: Boolean = false,
+        settleCancelled: Boolean = false,
     ): WatcherSyncLaunch? {
         merge(dirtyDirectories)
-        return if (running || !allowLaunch) null else take(recoveryAttempt = false)
+        return if (running || !allowLaunch) null else take(
+            recoveryAttempt = false, cause = cause, settleCoalesced = settleCoalesced,
+            settleCancelled = settleCancelled)
     }
 
     fun complete(
@@ -184,11 +207,16 @@ internal class WatcherSyncCoalescer {
         if (!successfulAndComplete &&
             (launch.recoveryAttempt || launch.dirtyDirectories == null)
         ) return null
-        return take(recoveryAttempt = !successfulAndComplete)
+        return take(
+            recoveryAttempt = !successfulAndComplete,
+            cause = if (successfulAndComplete) WatcherSyncCause.TRAILING
+                else WatcherSyncCause.RECOVERY,
+        )
     }
 
     /** Retry sticky work after a later lifecycle/manual/event trigger. */
-    fun kick(): WatcherSyncLaunch? = if (running) null else take(recoveryAttempt = false)
+    fun kick(): WatcherSyncLaunch? = if (running) null else take(
+        recoveryAttempt = false, cause = WatcherSyncCause.EVENT)
 
     private fun merge(dirtyDirectories: Set<String>?) {
         pending = true
@@ -204,14 +232,20 @@ internal class WatcherSyncCoalescer {
         }
     }
 
-    private fun take(recoveryAttempt: Boolean): WatcherSyncLaunch? {
+    private fun take(
+        recoveryAttempt: Boolean,
+        cause: WatcherSyncCause,
+        settleCoalesced: Boolean = false,
+        settleCancelled: Boolean = false,
+    ): WatcherSyncLaunch? {
         if (!pending) return null
         val scope = if (pendingFull) null else pendingDirty.toSet()
         pending = false
         pendingFull = false
         pendingDirty.clear()
         running = true
-        return WatcherSyncLaunch(scope, recoveryAttempt)
+        return WatcherSyncLaunch(
+            scope, recoveryAttempt, cause, settleCoalesced, settleCancelled)
     }
 
     internal fun isRunning(): Boolean = running
@@ -240,11 +274,19 @@ internal class WatcherSyncConfigRouter<C> {
         return kick()
     }
 
-    fun offer(dirtyDirectories: Set<String>?): RoutedWatcherSync<C>? {
+    fun offer(
+        dirtyDirectories: Set<String>?,
+        cause: WatcherSyncCause = WatcherSyncCause.EVENT,
+        settleCoalesced: Boolean = false,
+        settleCancelled: Boolean = false,
+    ): RoutedWatcherSync<C>? {
         val current = config
         val launch = coalescer.submit(
             dirtyDirectories,
             allowLaunch = desiredForeground && current != null,
+            cause = cause,
+            settleCoalesced = settleCoalesced,
+            settleCancelled = settleCancelled,
         ) ?: return null
         return RoutedWatcherSync(launch, current!!)
     }

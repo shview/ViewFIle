@@ -209,7 +209,11 @@ sortIdx[]  字典序排列（免装箱三路快排，折叠比较排序）
   → reader 只向主 Handler 投递；聚合/停止/dispatch 都在同一 Handler 原子处理
   → 聚合 dirty parent，静默 2s → 跑 scoped 增量对账拿精确结果
   → Engine single-flight 合并同步期间的新 dirty，full 请求优先，完成后最多一轮 trailing
-  → event/trailing/recovery 在启动时原子绑定最新前台配置；stop 解绑定配置但保留 pending
+  → scoped event/trailing 成功且无 trailing 时，按最后 dirty/完成时间静默 1.8s 后做一次
+    同 scope settle；新 dirty 合并并重置 settle，settle 自身成功不续排，失败仅走一次 full recovery
+  → telemetry 标注 cause=event/trailing/recovery/settle，以及 settle 的 scheduled/coalesced/
+    cancelled、scope/count/elapsed；event/trailing/recovery 在启动时原子绑定最新前台配置；
+    stop 解绑定配置并保留待 settle scope，resume 安全吸收后 kick
   → 健康复用还要求 MEDIA/SU/SHIZUKU 模式完全一致；权限层或 rootIndex 改变即替换实例
   → 只在目录集合增删时 refresh helper；文件内容更新不重启
   → 所有 TreeWatcher 实例共享唯一进程级 daemon executor

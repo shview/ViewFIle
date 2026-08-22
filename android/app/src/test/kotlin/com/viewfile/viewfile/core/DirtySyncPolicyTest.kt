@@ -162,6 +162,56 @@ class DirtySyncPolicyTest {
     }
 
     @Test
+    fun burstTrailingSettleAndRecoveryCausesAreFinite() {
+        val coalescer = WatcherSyncCoalescer()
+        val first = coalescer.submit(setOf("/burst"))!!
+        repeat(100) { coalescer.submit(setOf("/burst/file-$it")) }
+        val trailing = coalescer.complete(first, true, allowTrailing = true)!!
+        assertEquals(WatcherSyncCause.TRAILING, trailing.cause)
+        assertEquals(100, trailing.dirtyDirectories!!.size)
+        assertEquals(null, coalescer.complete(trailing, true, allowTrailing = true))
+
+        val settle = coalescer.submit(
+            setOf("/burst"), cause = WatcherSyncCause.SETTLE)!!
+        assertEquals(WatcherSyncCause.SETTLE, settle.cause)
+        val recovery = coalescer.complete(settle, false, allowTrailing = true)!!
+        assertEquals(WatcherSyncCause.RECOVERY, recovery.cause)
+        assertEquals(null, recovery.dirtyDirectories)
+        assertEquals(null, coalescer.complete(recovery, true, allowTrailing = true))
+    }
+
+    @Test
+    fun quietSettleUsesLatestDirtyOrCompletionAndScopedUnionIsBounded() {
+        assertEquals(WATCHER_SETTLE_QUIET_MS,
+            watcherSettleDelayMs(lastDirtyAt = 100, completedAt = 200, now = 200))
+        assertEquals(800,
+            watcherSettleDelayMs(lastDirtyAt = 1_000, completedAt = 200, now = 2_000))
+        assertEquals(setOf("/a", "/b"), mergeWatcherScopes(setOf("/a"), setOf("/b")))
+        assertEquals(null, mergeWatcherScopes(null, setOf("/b")))
+        assertEquals(null, mergeWatcherScopes(
+            (0 until MAX_DIRTY_SYNC_SCOPE).map { "/d$it" }.toSet(), setOf("/overflow")))
+    }
+
+    @Test
+    fun settleFixtureConvergesPartialCreateAndRenameDeleteBursts() {
+        val expected = (0 until 100).map { "file-$it" }.toSet()
+        val firstVisible = (0 until 81).map { "file-$it" }.toSet()
+        val first = planScopedChildDelta(emptySet(), firstVisible)
+        assertEquals(81, first.added.size)
+        val settle = planScopedChildDelta(firstVisible, expected)
+        assertEquals(19, settle.added.size)
+        assertTrue(settle.removed.isEmpty())
+
+        val before = setOf("keep", "old-name", "deleted")
+        val burstPartial = setOf("keep", "new-name", "deleted")
+        val final = setOf("keep", "new-name")
+        assertEquals(setOf("new-name"), planScopedChildDelta(before, burstPartial).added)
+        val settled = planScopedChildDelta(burstPartial, final)
+        assertTrue(settled.added.isEmpty())
+        assertEquals(setOf("deleted"), settled.removed)
+    }
+
+    @Test
     fun rootScopeHasStrictShellCallBoundAndUnknownTargetsAreRejected() {
         assertFalse(shouldEscalateScopedRoot(MAX_SCOPED_ROOT_SHELL_CALLS))
         assertTrue(shouldEscalateScopedRoot(MAX_SCOPED_ROOT_SHELL_CALLS + 1))

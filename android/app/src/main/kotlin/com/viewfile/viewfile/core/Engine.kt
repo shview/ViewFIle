@@ -5,6 +5,8 @@ import android.database.sqlite.SQLiteDatabase
 import android.util.Log
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -140,6 +142,7 @@ object Engine {
         onProgress: (files: Int, dirs: Int, current: String) -> Unit,
         onDone: (Result?, String?) -> Unit
     ) {
+        cancelWatcherSettleForManualWork("scan")
         // 前置检查（含 su 探测，最长数秒）全部后台执行，避免阻塞主线程触发 ANR。
         // scanRequested 让排队中的同步立即让位（单线程队列里同步可能占住几十秒）
         pendingScanRequests.incrementAndGet()
@@ -263,6 +266,7 @@ object Engine {
 
     /** 打开 app 时的增量对账：目录 mtime 比对 + root 区刷新，完成后重载内存索引 */
     fun syncAsync(rootIndex: Boolean, deepData: Boolean, cb: (Map<String, Any?>) -> Unit) {
+        cancelWatcherSettleForManualWork("full-sync")
         syncAsyncInternal(rootIndex, deepData, allowDeferredContinuation = true,
             internalContinuation = false, dirtyDirectories = null) { out ->
             cb(out)
@@ -379,6 +383,60 @@ object Engine {
         val onSynced: (Map<String, Any?>) -> Unit,
     )
     private val watcherSyncRouter = WatcherSyncConfigRouter<WatcherSyncConfig>()
+    private val watcherSettleExec = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "vf-watch-settle").apply { isDaemon = true }
+    }
+    private var watcherSettleFuture: ScheduledFuture<*>? = null
+    private var watcherSettleScope: Set<String>? = null
+    private var watcherSettlePending = false
+    private var watcherSettleGeneration = 0L
+    private var watcherLastDirtyAt = 0L
+
+    private fun cancelWatcherSettleForManualWork(reason: String) = synchronized(watcherLock) {
+        cancelWatcherSettleLocked(retain = false, reason = reason)
+    }
+
+    private fun cancelWatcherSettleLocked(retain: Boolean, reason: String) {
+        if (!watcherSettlePending) return
+        watcherSettleFuture?.cancel(false)
+        watcherSettleFuture = null
+        watcherSettleGeneration++
+        if (!retain) {
+            watcherSettlePending = false
+            watcherSettleScope = null
+        }
+        Log.i("ViewFile/Watch", "settle cancelled reason=$reason retained=$retain")
+    }
+
+    private fun scheduleWatcherSettleLocked(scope: Set<String>, completedAt: Long): Boolean {
+        if (scanRequested) return false
+        watcherSettleFuture?.cancel(false)
+        watcherSettleScope = scope.toSet()
+        watcherSettlePending = true
+        val generation = ++watcherSettleGeneration
+        if (!watcherForegroundState.desiredForeground) {
+            watcherSettleFuture = null
+            Log.i("ViewFile/Watch", "settle retained while paused scope=${scope.size}")
+            return false
+        }
+        val delay = watcherSettleDelayMs(watcherLastDirtyAt, completedAt,
+            System.currentTimeMillis())
+        watcherSettleFuture = watcherSettleExec.schedule({
+            val work = synchronized(watcherLock) {
+                if (!watcherSettlePending || watcherSettleGeneration != generation ||
+                    !watcherForegroundState.desiredForeground || scanRequested
+                ) return@synchronized null
+                val settleScope = watcherSettleScope ?: return@synchronized null
+                watcherSettlePending = false
+                watcherSettleScope = null
+                watcherSettleFuture = null
+                watcherSyncRouter.offer(settleScope, cause = WatcherSyncCause.SETTLE)
+            }
+            work?.let(::launchWatcherSync)
+        }, delay, TimeUnit.MILLISECONDS)
+        Log.i("ViewFile/Watch", "settle scheduled scope=${scope.size} delayMs=$delay")
+        return true
+    }
 
     private fun refreshCurrentWatcher() = synchronized(watcherLock) {
         watcher?.refreshRootProcess()
@@ -437,6 +495,12 @@ object Engine {
                 shizukuTier = tier == PrivShell.Tier.SHIZUKU,
             )
             val config = WatcherSyncConfig(rootIndex, deepData, onSynced)
+            if (watcherSettlePending) {
+                val scope = watcherSettleScope
+                cancelWatcherSettleLocked(retain = false, reason = "resume-kick")
+                watcherSyncRouter.offer(scope, settleCoalesced = true)
+                Log.i("ViewFile/Watch", "settle coalesced reason=resume scope=${scope?.size ?: 0}")
+            }
             val pendingWork = watcherSyncRouter.updateConfig(config, desiredForeground = true)
             watcher?.let { w ->
                 if (shouldReuseWatcher(
@@ -462,7 +526,21 @@ object Engine {
 
     private fun enqueueWatcherSync(dirtyDirectories: Set<String>?) {
         val work = synchronized(watcherLock) {
-            watcherSyncRouter.offer(dirtyDirectories)
+            watcherLastDirtyAt = System.currentTimeMillis()
+            var scope = dirtyDirectories
+            var coalesced = false
+            if (watcherSettlePending) {
+                scope = mergeWatcherScopes(watcherSettleScope, dirtyDirectories)
+                cancelWatcherSettleLocked(retain = false, reason = "new-dirty")
+                coalesced = true
+                Log.i("ViewFile/Watch", "settle coalesced reason=dirty " +
+                    "scope=${scope?.size ?: 0}")
+            }
+            watcherSyncRouter.offer(
+                scope,
+                settleCoalesced = coalesced,
+                settleCancelled = coalesced,
+            )
         } ?: return
         launchWatcherSync(work)
     }
@@ -472,27 +550,44 @@ object Engine {
         val config = work.config
         Log.i("ViewFile/Watch", "watcher sync launch scope=" +
             (launch.dirtyDirectories?.let { "dirty(${it.size})" } ?: "full") +
-            " recovery=${launch.recoveryAttempt}")
+            " cause=${launch.cause.name.lowercase()} recovery=${launch.recoveryAttempt}")
         syncAsyncInternal(config.rootIndex, config.deepData,
             allowDeferredContinuation = true,
             internalContinuation = false,
             dirtyDirectories = launch.dirtyDirectories) { out ->
             val successfulAndComplete = out["ok"] == true && out["scopeComplete"] == true
+            var settleScheduled = false
             val completion = synchronized(watcherLock) {
-                watcherSyncRouter.complete(
+                val completed = watcherSyncRouter.complete(
                     work,
                     successfulAndComplete,
                     allowTrailing = watcherForegroundState.desiredForeground && !scanRequested,
                 )
+                if (successfulAndComplete && completed.trailing == null &&
+                    launch.dirtyDirectories != null &&
+                    launch.cause != WatcherSyncCause.SETTLE &&
+                    launch.cause != WatcherSyncCause.RECOVERY
+                ) {
+                    settleScheduled = scheduleWatcherSettleLocked(
+                        launch.dirtyDirectories, System.currentTimeMillis())
+                }
+                completed
             }
             // The config generation is selected under watcherLock; external callback and
             // watcher coordinator work stay outside it to keep lifecycle transitions short.
-            if (out["ok"] == true) completion.notifyConfig?.onSynced(out)
+            val telemetry = out.toMutableMap().apply {
+                put("cause", launch.cause.name.lowercase())
+                put("settleScheduled", settleScheduled)
+                put("settleCoalesced", launch.settleCoalesced)
+                put("settleCancelled", launch.settleCancelled)
+            }
+            if (out["ok"] == true) completion.notifyConfig?.onSynced(telemetry)
             if (completion.notifyConfig != null && out["directoryChanged"] == true) {
                 refreshCurrentWatcher()
             }
             Log.i("ViewFile/Watch", "watcher sync complete ok=$successfulAndComplete " +
-                "trailing=${completion.trailing != null}")
+                "cause=${launch.cause.name.lowercase()} trailing=${completion.trailing != null} " +
+                "settleScheduled=$settleScheduled elapsedMs=${out["elapsedMs"]}")
             completion.trailing?.let(::launchWatcherSync)
         }
     }
@@ -512,6 +607,7 @@ object Engine {
                 "accepted=${transition.accepted} stop=${transition.stopWatcher}")
         if (!transition.accepted || !transition.stopWatcher) return@synchronized
         watcherSyncRouter.updateConfig(null, desiredForeground = false)
+        cancelWatcherSettleLocked(retain = true, reason = "pause")
         watcher?.stop()
         watcher = null
     }
