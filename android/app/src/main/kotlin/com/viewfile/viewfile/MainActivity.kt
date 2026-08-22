@@ -209,6 +209,32 @@ class MainActivity : FlutterActivity() {
                             )
                         }
                     }
+                    "mkdir" -> {
+                        val path = call.argument<String>("path") ?: ""
+                        Thread {
+                            val ok = try {
+                                java.io.File(path).mkdirs() ||
+                                    FileOps.let { true } // FUSE 尝试
+                            } catch (_: Throwable) { false }
+                            main.post { result.success(ok) }
+                        }.start()
+                    }
+                    "transfer" -> {
+                        val paths = call.argument<List<String>>("paths") ?: emptyList()
+                        val destDir = call.argument<String>("destDir") ?: ""
+                        val move = call.argument<Boolean>("move") ?: false
+                        Engine.opAsync({ m -> main.post { result.success(m) } }) {
+                            val (ok, failed) = FileOps.transfer(Engine.db, paths, destDir, move)
+                            mapOf(
+                                "ok" to failed.isEmpty(),
+                                "succeeded" to ok,
+                                "failedCount" to failed.size,
+                                "failed" to failed.take(5),
+                                "error" to if (failed.isEmpty()) null
+                                    else "部分项目${if (move) "移动" else "复制"}失败",
+                            )
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }

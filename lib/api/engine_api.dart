@@ -128,6 +128,18 @@ class EngineApi {
         await _m.invokeMethod('delete', {'paths': paths}),
       );
 
+  Future<bool> mkdir(String path) async =>
+      await _m.invokeMethod<bool>('mkdir', {'path': path}) ?? false;
+
+  /// 复制/移动到目标目录
+  Future<Map<String, dynamic>> transfer(List<String> paths, String destDir,
+      {required bool move}) async =>
+      Map<String, dynamic>.from(await _m.invokeMethod('transfer', {
+        'paths': paths,
+        'destDir': destDir,
+        'move': move,
+      }));
+
   Stream<Map<dynamic, dynamic>> scanEvents() => _scanEvents
       .receiveBroadcastStream()
       .map((e) => Map<dynamic, dynamic>.from(e));

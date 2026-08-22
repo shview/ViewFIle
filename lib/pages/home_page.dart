@@ -10,6 +10,7 @@ import '../utils/index_bootstrap.dart';
 import '../utils/watcher_lifecycle.dart';
 import 'apps_page.dart';
 import 'settings_page.dart';
+import 'dest_picker_page.dart';
 import 'tips_page.dart';
 
 const kSdcard = '/storage/emulated/0';
@@ -448,6 +449,44 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  // ---------- 复制/移动 ----------
+
+  Future<void> _transferSelected({required bool move}) async {
+    final items = _selectedItems;
+    if (items.isEmpty) return;
+    final dest = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => DestPickerPage(
+          title: move ? '移动到...' : '复制到...',
+          initialDir: _currentDir,
+        ),
+      ),
+    );
+    if (dest == null || !mounted) return;
+    final paths = items.map((e) => e['path'] as String).toList();
+    // 进度提示
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+            '${move ? '移动' : '复制'} ${items.length} 项到 $dest ...'),
+        duration: const Duration(seconds: 2),
+      ));
+    }
+    final r = await _api.transfer(paths, dest, move: move);
+    if (!mounted) return;
+    if (r['ok'] == true) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text("已${move ? '移动' : '复制'} ${r['succeeded']} 项到 $dest")));
+      _exitSelection();
+      _rerun();
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text("部分失败：${r['succeeded']} 成功，${r['failedCount']} 失败")));
+      _rerun();
+    }
+  }
+
   Future<void> _confirmDelete(List<Map<dynamic, dynamic>> items) async {
     if (items.isEmpty) return;
     final fileCount = items.where((e) => e['isDir'] != true).length;
@@ -632,6 +671,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             tooltip: '复制路径',
             icon: const Icon(Icons.content_copy),
             onPressed: () => _copyPaths(_selected.toList()),
+          ),
+          IconButton(
+            tooltip: '复制到...',
+            icon: const Icon(Icons.file_copy_outlined),
+            onPressed: () => _transferSelected(move: false),
+          ),
+          IconButton(
+            tooltip: '移动到...',
+            icon: const Icon(Icons.drive_file_move_outlined),
+            onPressed: () => _transferSelected(move: true),
           ),
           IconButton(
             tooltip: '删除',

@@ -212,6 +212,91 @@ object FileOps {
         ).use { c -> if (c.moveToFirst()) c.getLong(0) else null }
     }
 
+    // ---------- 复制/移动 ----------
+
+    /** 返回 (成功数, 失败路径列表) */
+    fun transfer(db: SQLiteDatabase, paths: List<String>, destDir: String, move: Boolean): Pair<Int, List<String>> {
+        val succeeded = mutableListOf<String>()
+        val failed = mutableListOf<String>()
+        val dest = File(destDir)
+        if (!dest.isDirectory) return 0 to paths
+
+        for (src in paths) {
+            val f = File(src)
+            val target = File(destDir, f.name)
+            if (target.exists()) {
+                failed.add("$src → 已存在同名")
+                continue
+            }
+            val ok = if (move) moveOne(f, target) else copyOne(f, target)
+            if (ok) {
+                succeeded.add(src)
+                // 更新索引：移动=改行，复制=需重建（简化：触发同步）
+                if (move) {
+                    moveRows(db, src, target.absolutePath)
+                }
+            } else {
+                failed.add(src)
+            }
+        }
+        Log.i(TAG, "${if (move) "move" else "copy"}: ok=${succeeded.size} failed=${failed.size}")
+        return succeeded.size to failed
+    }
+
+    private fun moveOne(src: File, target: File): Boolean {
+        // 先尝试 FUSE rename
+        if (src.renameTo(target)) return true
+        // root 回退
+        if (PrivShell.tier() != PrivShell.Tier.NONE) {
+            val rawSrc = RootScanner.toRaw(src.absolutePath)
+            val rawDst = RootScanner.toRaw(target.absolutePath)
+            if (PrivShell.needsRealRoot(rawSrc) && PrivShell.tier() != PrivShell.Tier.ROOT) return false
+            if (PrivShell.run("mv ${shq(rawSrc)} ${shq(rawDst)}").ok && File(rawDst).exists()) return true
+        }
+        // 跨分区：copy + delete
+        return if (copyOne(src, target)) deleteRecursively(src) else false
+    }
+
+    private fun copyOne(src: File, target: File): Boolean {
+        return try {
+            if (src.isDirectory) {
+                if (!target.mkdirs()) return false
+                val children = src.listFiles() ?: return true  // 空/不可读 → 已复制（空）
+                for (child in children) {
+                    if (!copyOne(child, File(target, child.name))) return false
+                }
+                true
+            } else {
+                src.inputStream().use { input ->
+                    target.outputStream().use { output -> input.copyTo(output, 65536) }
+                }
+                true
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "copy failed ${src.absolutePath}: ${t.message}")
+            // root 回退（cp -r 处理目录/特殊文件）
+            if (PrivShell.tier() != PrivShell.Tier.NONE) {
+                val rawSrc = RootScanner.toRaw(src.absolutePath)
+                val rawDst = RootScanner.toRaw(target.absolutePath)
+                PrivShell.run("cp -r ${shq(rawSrc)} ${shq(rawDst)}").ok && File(rawDst).exists()
+            } else false
+        }
+    }
+
+    /** 移动后更新索引行（源→目标，含子树 parent 链） */
+    private fun moveRows(db: SQLiteDatabase, oldPath: String, newPath: String) {
+        val id = rowId(db, oldPath) ?: return
+        val oldName = oldPath.substringAfterLast('/')
+        val newName = newPath.substringAfterLast('/')
+        val newParentPath = newPath.substringBeforeLast('/').ifEmpty { "/" }
+        val newPid = rowId(db, newParentPath) ?: return
+        db.execSQL(
+            "UPDATE entry SET parent_id=?, name=? WHERE id=?",
+            arrayOf(newPid.toString(), newName, id.toString())
+        )
+        Engine.index.pruneDirMaps(oldPath)
+    }
+
     // ---------- 工具 ----------
 
     private fun uriFor(context: Context, f: File): Uri =
