@@ -5,6 +5,7 @@ import android.database.ContentObserver
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import java.io.BufferedReader
@@ -32,6 +33,8 @@ class TreeWatcher(
     val mode: WatcherMode,
     /** null means protocol/MediaStore uncertainty and requires a full sync. */
     private val onDirty: (Set<String>?) -> Unit,
+    private val activitySourceId: Long,
+    private val onDirtyActivity: (WatcherDirtyActivity) -> Unit,
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private val lifecycleLock = Any()
@@ -49,7 +52,6 @@ class TreeWatcher(
 
     companion object {
         private const val TAG = "ViewFile/Watch"
-        private const val QUIET_MS = 2000L       // 事件静默期
         private const val MAX_DELAY_MS = 10000L  // 持续变动时的最长拖延
         private const val HELPER_STATE_PREFS = "vfwatch_helper_state"
         private const val PREF_BACKEND = "backend"
@@ -778,6 +780,8 @@ class TreeWatcher(
 
     private fun markDirtyOnHandler(directory: String?, eventSession: Long) {
         if (!running || dirtySession != eventSession) return
+        // Reuse the already-posted handler callback: no per-event executor task or sync.
+        onDirtyActivity(WatcherDirtyActivity(activitySourceId, SystemClock.elapsedRealtime()))
         dirtyAccumulator.add(directory)
         if (firstDirtyAt == 0L) firstDirtyAt = System.currentTimeMillis()
         val existing = dirtyRunnable
@@ -790,7 +794,7 @@ class TreeWatcher(
                 }
             }
             dirtyRunnable = nr
-            handler.postDelayed(nr, QUIET_MS)
+            handler.postDelayed(nr, WATCHER_DISPATCH_QUIET_MS)
         } else if (System.currentTimeMillis() - firstDirtyAt >= MAX_DELAY_MS) {
             handler.removeCallbacks(existing)
             dirtyRunnable = null

@@ -183,13 +183,46 @@ class DirtySyncPolicyTest {
     @Test
     fun quietSettleUsesLatestDirtyOrCompletionAndScopedUnionIsBounded() {
         assertEquals(WATCHER_SETTLE_QUIET_MS,
-            watcherSettleDelayMs(lastDirtyAt = 100, completedAt = 200, now = 200))
-        assertEquals(800,
-            watcherSettleDelayMs(lastDirtyAt = 1_000, completedAt = 200, now = 2_000))
+            watcherQuietRemainingMs(lastActivityAt = 200, now = 200))
+        assertEquals(500,
+            watcherQuietRemainingMs(lastActivityAt = 1_000, now = 3_000))
         assertEquals(setOf("/a", "/b"), mergeWatcherScopes(setOf("/a"), setOf("/b")))
         assertEquals(null, mergeWatcherScopes(null, setOf("/b")))
         assertEquals(null, mergeWatcherScopes(
             (0 until MAX_DIRTY_SYNC_SCOPE).map { "/d$it" }.toSet(), setOf("/overflow")))
+    }
+
+    @Test
+    fun sustainedRawActivityDefersSettleUntilOneFinalQuietRun() {
+        var lastActivity = 0L
+        var settleRuns = 0
+        // 33 seconds at 50ms/event; a dispatched EVENT every 2s must not make raw activity quiet.
+        for (now in 0L..33_000L step 50L) {
+            lastActivity = acceptWatcherActivityAt(7, 7, lastActivity, now)!!
+            if (now % WATCHER_DISPATCH_QUIET_MS == 0L && now > 0L) {
+                assertTrue(watcherQuietRemainingMs(lastActivity, now) > 0L)
+            }
+        }
+        assertTrue(watcherQuietRemainingMs(lastActivity, 35_499L) > 0L)
+        if (watcherQuietRemainingMs(lastActivity, 35_500L) == 0L) settleRuns++
+        assertEquals(1, settleRuns)
+        // Once consumed there is no periodic task: 95s idle cannot create another run.
+        assertEquals(1, settleRuns)
+    }
+
+    @Test
+    fun timerRaceOldSourceAndPauseResumeUseMonotonicActivity() {
+        val active = 9L
+        var last = acceptWatcherActivityAt(active, active, 0L, 2_499L)!!
+        // Timer for the old 2.5s deadline fires one millisecond later; it must defer.
+        assertEquals(2_499L, watcherQuietRemainingMs(last, 2_500L))
+        // A stale watcher cannot extend the new watcher's deadline.
+        assertEquals(null, acceptWatcherActivityAt(active, 8L, last, 9_000L))
+        assertEquals(0L, watcherQuietRemainingMs(last, 4_999L))
+        // Resume establishes a fresh activity baseline and therefore a fresh quiet interval.
+        last = acceptWatcherActivityAt(active, active, last, 10_000L)!!
+        assertEquals(WATCHER_SETTLE_QUIET_MS,
+            watcherQuietRemainingMs(last, 10_000L))
     }
 
     @Test

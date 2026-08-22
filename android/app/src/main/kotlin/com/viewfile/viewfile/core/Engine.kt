@@ -2,12 +2,14 @@ package com.viewfile.viewfile.core
 
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 引擎单例：数据库连接、内存索引、两类后台线程。
@@ -390,7 +392,12 @@ object Engine {
     private var watcherSettleScope: Set<String>? = null
     private var watcherSettlePending = false
     private var watcherSettleGeneration = 0L
-    private var watcherLastDirtyAt = 0L
+    private var watcherSettleCompletedAt = 0L
+    private var watcherSettleDeferredByActivity = 0
+    private var watcherLastActivityAt = 0L
+    private var watcherActivitySourceGeneration = 0L
+    @Volatile private var watcherActiveActivitySource = Long.MIN_VALUE
+    private val watcherLatestActivitySignal = AtomicReference<WatcherDirtyActivity?>(null)
 
     private fun cancelWatcherSettleForManualWork(reason: String) = synchronized(watcherLock) {
         cancelWatcherSettleLocked(retain = false, reason = reason)
@@ -404,6 +411,7 @@ object Engine {
         if (!retain) {
             watcherSettlePending = false
             watcherSettleScope = null
+            watcherSettleDeferredByActivity = 0
         }
         Log.i("ViewFile/Watch", "settle cancelled reason=$reason retained=$retain")
     }
@@ -413,29 +421,86 @@ object Engine {
         watcherSettleFuture?.cancel(false)
         watcherSettleScope = scope.toSet()
         watcherSettlePending = true
+        watcherSettleCompletedAt = completedAt
+        watcherSettleDeferredByActivity = 0
         val generation = ++watcherSettleGeneration
         if (!watcherForegroundState.desiredForeground) {
             watcherSettleFuture = null
             Log.i("ViewFile/Watch", "settle retained while paused scope=${scope.size}")
             return false
         }
-        val delay = watcherSettleDelayMs(watcherLastDirtyAt, completedAt,
-            System.currentTimeMillis())
+        armWatcherSettleTimerLocked(generation)
+        return true
+    }
+
+    private fun armWatcherSettleTimerLocked(generation: Long) {
+        val now = SystemClock.elapsedRealtime()
+        val lastRelevant = maxOf(watcherLastActivityAt, watcherSettleCompletedAt)
+        val delay = watcherQuietRemainingMs(lastRelevant, now)
         watcherSettleFuture = watcherSettleExec.schedule({
             val work = synchronized(watcherLock) {
                 if (!watcherSettlePending || watcherSettleGeneration != generation ||
                     !watcherForegroundState.desiredForeground || scanRequested
                 ) return@synchronized null
+                val firedAt = SystemClock.elapsedRealtime()
+                val latestSignal = watcherLatestActivitySignal.get()
+                if (latestSignal?.sourceId == watcherActiveActivitySource) {
+                    watcherLastActivityAt = maxOf(
+                        watcherLastActivityAt, latestSignal.atElapsedMs)
+                }
+                val relevantAt = maxOf(watcherLastActivityAt, watcherSettleCompletedAt)
+                val remaining = watcherQuietRemainingMs(relevantAt, firedAt)
+                if (remaining > 0L) {
+                    watcherSettleFuture = null
+                    armWatcherSettleTimerLocked(generation)
+                    return@synchronized null
+                }
                 val settleScope = watcherSettleScope ?: return@synchronized null
+                val deferred = watcherSettleDeferredByActivity
+                val quietAge = (firedAt - relevantAt).coerceAtLeast(0L)
                 watcherSettlePending = false
                 watcherSettleScope = null
                 watcherSettleFuture = null
-                watcherSyncRouter.offer(settleScope, cause = WatcherSyncCause.SETTLE)
+                watcherSettleDeferredByActivity = 0
+                watcherSyncRouter.offer(
+                    settleScope,
+                    cause = WatcherSyncCause.SETTLE,
+                    settleDeferredByActivity = deferred,
+                    quietAgeMs = quietAge,
+                    quietRemainingMs = 0L,
+                )
             }
             work?.let(::launchWatcherSync)
         }, delay, TimeUnit.MILLISECONDS)
-        Log.i("ViewFile/Watch", "settle scheduled scope=${scope.size} delayMs=$delay")
-        return true
+        Log.i("ViewFile/Watch", "settle scheduled scope=${watcherSettleScope?.size ?: 0} " +
+            "delayMs=$delay deferred=$watcherSettleDeferredByActivity")
+    }
+
+    private fun onWatcherDirtyActivity(activity: WatcherDirtyActivity) {
+        watcherLatestActivitySignal.updateAndGet { previous ->
+            if (activity.sourceId != watcherActiveActivitySource) previous
+            else if (previous?.sourceId == activity.sourceId &&
+                previous.atElapsedMs >= activity.atElapsedMs
+            ) previous else activity
+        }
+        synchronized(watcherLock) {
+            val acceptedAt = acceptWatcherActivityAt(
+                watcherActiveActivitySource,
+                activity.sourceId,
+                watcherLastActivityAt,
+                activity.atElapsedMs,
+            ) ?: return@synchronized
+            watcherLastActivityAt = acceptedAt
+            if (watcherSettlePending && watcherSettleDeferredByActivity < Int.MAX_VALUE) {
+                watcherSettleDeferredByActivity++
+            }
+        }
+    }
+
+    private fun resumeWatcherSettleLocked() {
+        if (!watcherSettlePending || watcherSettleFuture != null || scanRequested) return
+        watcherLastActivityAt = SystemClock.elapsedRealtime()
+        armWatcherSettleTimerLocked(watcherSettleGeneration)
     }
 
     private fun refreshCurrentWatcher() = synchronized(watcherLock) {
@@ -495,12 +560,6 @@ object Engine {
                 shizukuTier = tier == PrivShell.Tier.SHIZUKU,
             )
             val config = WatcherSyncConfig(rootIndex, deepData, onSynced)
-            if (watcherSettlePending) {
-                val scope = watcherSettleScope
-                cancelWatcherSettleLocked(retain = false, reason = "resume-kick")
-                watcherSyncRouter.offer(scope, settleCoalesced = true)
-                Log.i("ViewFile/Watch", "settle coalesced reason=resume scope=${scope?.size ?: 0}")
-            }
             val pendingWork = watcherSyncRouter.updateConfig(config, desiredForeground = true)
             watcher?.let { w ->
                 if (shouldReuseWatcher(
@@ -509,28 +568,44 @@ object Engine {
                     // A root-requested watcher may currently be MediaStore fallback; every
                     // new foreground intent gets one background root transition retry.
                     w.refreshRootProcess()
+                    resumeWatcherSettleLocked()
                     pendingWork?.let(::launchWatcherSync)
                     return
                 }
                 w.stop()
                 watcher = null
             }
-            val w = TreeWatcher(appContext, index, expectedMode, onDirty = { dirtyDirectories ->
-                enqueueWatcherSync(dirtyDirectories)
-            })
+            val activitySource = ++watcherActivitySourceGeneration
+            watcherActiveActivitySource = activitySource
+            watcherLastActivityAt = SystemClock.elapsedRealtime()
+            watcherLatestActivitySignal.set(
+                WatcherDirtyActivity(activitySource, watcherLastActivityAt))
+            val w = TreeWatcher(
+                appContext,
+                index,
+                expectedMode,
+                onDirty = { dirtyDirectories -> enqueueWatcherSync(dirtyDirectories) },
+                activitySourceId = activitySource,
+                onDirtyActivity = ::onWatcherDirtyActivity,
+            )
             w.start()
             watcher = w
+            resumeWatcherSettleLocked()
             pendingWork?.let(::launchWatcherSync)
         }
     }
 
     private fun enqueueWatcherSync(dirtyDirectories: Set<String>?) {
         val work = synchronized(watcherLock) {
-            watcherLastDirtyAt = System.currentTimeMillis()
             var scope = dirtyDirectories
             var coalesced = false
+            var deferredByActivity = 0
+            var quietAge = 0L
             if (watcherSettlePending) {
                 scope = mergeWatcherScopes(watcherSettleScope, dirtyDirectories)
+                deferredByActivity = watcherSettleDeferredByActivity
+                quietAge = (SystemClock.elapsedRealtime() -
+                    maxOf(watcherLastActivityAt, watcherSettleCompletedAt)).coerceAtLeast(0L)
                 cancelWatcherSettleLocked(retain = false, reason = "new-dirty")
                 coalesced = true
                 Log.i("ViewFile/Watch", "settle coalesced reason=dirty " +
@@ -540,6 +615,9 @@ object Engine {
                 scope,
                 settleCoalesced = coalesced,
                 settleCancelled = coalesced,
+                settleDeferredByActivity = deferredByActivity,
+                quietAgeMs = quietAge,
+                quietRemainingMs = if (coalesced) WATCHER_SETTLE_QUIET_MS else 0L,
             )
         } ?: return
         launchWatcherSync(work)
@@ -569,7 +647,7 @@ object Engine {
                     launch.cause != WatcherSyncCause.RECOVERY
                 ) {
                     settleScheduled = scheduleWatcherSettleLocked(
-                        launch.dirtyDirectories, System.currentTimeMillis())
+                        launch.dirtyDirectories, SystemClock.elapsedRealtime())
                 }
                 completed
             }
@@ -580,6 +658,9 @@ object Engine {
                 put("settleScheduled", settleScheduled)
                 put("settleCoalesced", launch.settleCoalesced)
                 put("settleCancelled", launch.settleCancelled)
+                put("settleDeferredByActivity", launch.settleDeferredByActivity)
+                put("quietAgeMs", launch.quietAgeMs)
+                put("quietRemainingMs", launch.quietRemainingMs)
             }
             if (out["ok"] == true) completion.notifyConfig?.onSynced(telemetry)
             if (completion.notifyConfig != null && out["directoryChanged"] == true) {
@@ -608,6 +689,8 @@ object Engine {
         if (!transition.accepted || !transition.stopWatcher) return@synchronized
         watcherSyncRouter.updateConfig(null, desiredForeground = false)
         cancelWatcherSettleLocked(retain = true, reason = "pause")
+        watcherActiveActivitySource = Long.MIN_VALUE
+        watcherLatestActivitySignal.set(null)
         watcher?.stop()
         watcher = null
     }

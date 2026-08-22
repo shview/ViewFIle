@@ -2,10 +2,20 @@ package com.viewfile.viewfile.core
 
 internal const val MAX_DIRTY_SYNC_SCOPE = 256
 internal const val MAX_SCOPED_ROOT_SHELL_CALLS = 16
-internal const val WATCHER_SETTLE_QUIET_MS = 1800L
+internal const val WATCHER_DISPATCH_QUIET_MS = 2000L
+internal const val WATCHER_SETTLE_QUIET_MS = WATCHER_DISPATCH_QUIET_MS + 500L
 
-internal fun watcherSettleDelayMs(lastDirtyAt: Long, completedAt: Long, now: Long): Long =
-    (maxOf(lastDirtyAt, completedAt) + WATCHER_SETTLE_QUIET_MS - now).coerceAtLeast(0L)
+data class WatcherDirtyActivity(val sourceId: Long, val atElapsedMs: Long)
+
+internal fun watcherQuietRemainingMs(lastActivityAt: Long, now: Long): Long =
+    (lastActivityAt + WATCHER_SETTLE_QUIET_MS - now).coerceAtLeast(0L)
+
+internal fun acceptWatcherActivityAt(
+    activeSource: Long,
+    signalSource: Long,
+    previousAt: Long,
+    signalAt: Long,
+): Long? = if (activeSource == signalSource) maxOf(previousAt, signalAt) else null
 
 /** null is full scope and dominates; bounded union prevents an unbounded retained settle set. */
 internal fun mergeWatcherScopes(first: Set<String>?, second: Set<String>?): Set<String>? {
@@ -167,6 +177,9 @@ internal data class WatcherSyncLaunch(
     val cause: WatcherSyncCause = WatcherSyncCause.EVENT,
     val settleCoalesced: Boolean = false,
     val settleCancelled: Boolean = false,
+    val settleDeferredByActivity: Int = 0,
+    val quietAgeMs: Long = 0L,
+    val quietRemainingMs: Long = 0L,
 )
 
 internal enum class WatcherSyncCause { EVENT, TRAILING, RECOVERY, SETTLE }
@@ -188,11 +201,17 @@ internal class WatcherSyncCoalescer {
         cause: WatcherSyncCause = WatcherSyncCause.EVENT,
         settleCoalesced: Boolean = false,
         settleCancelled: Boolean = false,
+        settleDeferredByActivity: Int = 0,
+        quietAgeMs: Long = 0L,
+        quietRemainingMs: Long = 0L,
     ): WatcherSyncLaunch? {
         merge(dirtyDirectories)
         return if (running || !allowLaunch) null else take(
             recoveryAttempt = false, cause = cause, settleCoalesced = settleCoalesced,
-            settleCancelled = settleCancelled)
+            settleCancelled = settleCancelled,
+            settleDeferredByActivity = settleDeferredByActivity,
+            quietAgeMs = quietAgeMs,
+            quietRemainingMs = quietRemainingMs)
     }
 
     fun complete(
@@ -237,6 +256,9 @@ internal class WatcherSyncCoalescer {
         cause: WatcherSyncCause,
         settleCoalesced: Boolean = false,
         settleCancelled: Boolean = false,
+        settleDeferredByActivity: Int = 0,
+        quietAgeMs: Long = 0L,
+        quietRemainingMs: Long = 0L,
     ): WatcherSyncLaunch? {
         if (!pending) return null
         val scope = if (pendingFull) null else pendingDirty.toSet()
@@ -245,7 +267,8 @@ internal class WatcherSyncCoalescer {
         pendingDirty.clear()
         running = true
         return WatcherSyncLaunch(
-            scope, recoveryAttempt, cause, settleCoalesced, settleCancelled)
+            scope, recoveryAttempt, cause, settleCoalesced, settleCancelled,
+            settleDeferredByActivity, quietAgeMs, quietRemainingMs)
     }
 
     internal fun isRunning(): Boolean = running
@@ -279,6 +302,9 @@ internal class WatcherSyncConfigRouter<C> {
         cause: WatcherSyncCause = WatcherSyncCause.EVENT,
         settleCoalesced: Boolean = false,
         settleCancelled: Boolean = false,
+        settleDeferredByActivity: Int = 0,
+        quietAgeMs: Long = 0L,
+        quietRemainingMs: Long = 0L,
     ): RoutedWatcherSync<C>? {
         val current = config
         val launch = coalescer.submit(
@@ -287,6 +313,9 @@ internal class WatcherSyncConfigRouter<C> {
             cause = cause,
             settleCoalesced = settleCoalesced,
             settleCancelled = settleCancelled,
+            settleDeferredByActivity = settleDeferredByActivity,
+            quietAgeMs = quietAgeMs,
+            quietRemainingMs = quietRemainingMs,
         ) ?: return null
         return RoutedWatcherSync(launch, current!!)
     }
