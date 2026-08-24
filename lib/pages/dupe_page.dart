@@ -13,8 +13,9 @@ class DupePage extends StatefulWidget {
 }
 
 class _DupeGroup {
-  _DupeGroup(this.size);
+  _DupeGroup(this.size, {this.verified = false});
   final int size;
+  bool verified; // false = 大小相同的候选（指纹比对中）
   final files = <Map<dynamic, dynamic>>[];
 }
 
@@ -61,50 +62,60 @@ class _DupePageState extends State<DupePage> {
         bySize.putIfAbsent(s, () => []).add(e);
       }
       fetched += page.length;
-      setState(() => _progress = fetched / total);
+      if (mounted) setState(() => _progress = fetched / total);
     }
     _scanned = fetched;
 
-    // 大小相同 → 候选组
+    // 阶段一：大小相同的候选组立即上屏（后台逐组精筛，界面实时收敛）
     final candidates = [
       for (final e in bySize.entries)
         if (e.value.length >= 2) e.value
     ];
-    if (candidates.isEmpty || !mounted) {
-      setState(() => _phase = null);
-      return;
-    }
-
-    // 头 1MB MD5 精筛
+    if (!mounted) return;
     setState(() {
-      _phase = 'hash';
-      _progress = null;
+      _phase = null;
+      _groups = [
+            for (final c in candidates)
+              _DupeGroup((c.first['size'] as num?)?.toInt() ?? 0)
+                ..files.addAll(c),
+          ]..sort((a, b) => b.size.compareTo(a.size));
     });
+    _refine();
+  }
+
+  /// 阶段二：逐组比对头 1MB 指纹，把候选组替换为确认重复组（无重复则移除）
+  Future<void> _refine() async {
+    setState(() => _phase = 'hash');
+    final total = _groups.length;
     var done = 0;
-    final groups = <_DupeGroup>[];
-    var cnt = 0;
-    for (final cand in candidates) {
+    for (final g in List<_DupeGroup>.of(_groups)) {
+      if (!mounted) return;
       final byHead = <String, List<Map<dynamic, dynamic>>>{};
-      for (final e in cand) {
-        final r = await _api.hashHead(e['path'] as String);
-        final h = r['ok'] == true ? r['md5'] as String? : 'err-${cnt++}';
-        byHead.putIfAbsent(h ?? '?', () => []).add(e);
-        done++;
-        if (done % 5 == 0 && mounted) {
-          setState(() => _progress = done / _scanned.clamp(1, done));
-        }
+      var seq = 0;
+      for (final f in g.files) {
+        final r = await _api.hashHead(f['path'] as String);
+        final h = r['ok'] == true ? r['md5'] as String? : 'err-${seq++}';
+        byHead.putIfAbsent(h ?? '?', () => []).add(f);
       }
-      for (final g in byHead.values) {
-        if (g.length >= 2) {
-          final grp = _DupeGroup((g.first['size'] as num?)?.toInt() ?? 0);
-          grp.files.addAll(g);
-          groups.add(grp);
+      done++;
+      if (!mounted) return;
+      setState(() {
+        _progress = total == 0 ? null : done / total;
+        final refined = <_DupeGroup>[
+          for (final v in byHead.values)
+            if (v.length >= 2)
+              _DupeGroup(g.size, verified: true)..files.addAll(v),
+        ];
+        final i = _groups.indexOf(g);
+        if (refined.isEmpty) {
+          _groups.removeAt(i);
+        } else {
+          _groups.replaceRange(i, i + 1, refined);
         }
-      }
+        _dupBytes = _groups.fold<int>(
+            0, (s, g2) => s + g2.size * (g2.files.length - 1));
+      });
     }
-    groups.sort((a, b) => b.size.compareTo(a.size));
-    _dupBytes = groups.fold<int>(
-        0, (s, g) => s + g.size * (g.files.length - 1));
     if (mounted) setState(() => _phase = null);
   }
 
@@ -225,10 +236,17 @@ class _DupePageState extends State<DupePage> {
     return ExpansionTile(
       dense: true,
       title: Text(
-          '${g.files.first['name']} × ${g.files.length} · 每份 ${fmtSize(g.size)}'),
-      subtitle: Text('可释放 ${fmtSize(g.size * (g.files.length - 1))}',
-          style: TextStyle(
-              fontSize: 11, color: theme.colorScheme.outline)),
+        '${g.files.first['name']} × ${g.files.length} · 每份 ${fmtSize(g.size)}'
+        '${g.verified ? '' : ' · 比对中…'}',
+        style: TextStyle(
+            fontSize: 13,
+            color: g.verified ? null : theme.colorScheme.outline),
+      ),
+      subtitle: Text(
+        g.verified ? '可释放 ${fmtSize(g.size * (g.files.length - 1))}' : '大小相同的候选，正在比对指纹',
+        style: TextStyle(
+            fontSize: 11, color: theme.colorScheme.outline),
+      ),
       children: [
         for (final f in g.files)
           ListTile(

@@ -280,11 +280,12 @@ object Engine {
         sortDesc: Boolean,
         category: String?,
         hideDot: Boolean,
+        caseSensitive: Boolean,
         cb: (id: Int, total: Int, ms: Double) -> Unit
     ) {
         searchExec.execute {
             val t0 = System.nanoTime()
-            val r = index.queryResult(query, Int.MAX_VALUE, scopes, category, hideDot)
+            val r = index.queryResult(query, Int.MAX_VALUE, scopes, category, hideDot, caseSensitive)
             if (sortKey != "name" || sortDesc) {
                 index.sortResult(r, sortKey, sortDesc)
             }
@@ -388,12 +389,11 @@ object Engine {
                 val r = scanner.sync("/storage/emulated/0", areas, skip, dirtyDirectories)
                 continueCapDeferred = r.scopeFull && r.canAutoContinueRoot
                 state = State.READY
-                // 无变化不重载索引（大库重载是秒级开销）
+                // 无变化不重载索引（大库重载是秒级开销）；有变化也走节流：
+                // watcher 高频事件（每几秒 ±2 文件）不该每次都触发 3-4s 的 SoA 重建
                 val changed = r.added + r.removed + r.updated
                 if (changed > 0) {
-                    val t0 = System.currentTimeMillis()
-                    index.load(db).also { session = null } // 新快照发布：旧会话（钉住旧 SoA）立即失效
-                    loadMs = System.currentTimeMillis() - t0
+                    scheduleSyncReload()
                 }
                 mapOf(
                     "ok" to true,
@@ -798,6 +798,31 @@ object Engine {
                 mapOf("ok" to false, "error" to (t.message ?: t.toString()))
             }
             cb(out)
+        }
+    }
+
+    // ---------- 同步触发的索引重载节流 ----------
+    // 3 秒静默窗口：窗口内新的同步请求会重置计时，避免连续 SoA 重建
+    // 把 scanExec 队列堵住（用户文件操作因此排队半分钟的实测事故）
+    private val syncReloadScheduler =
+        Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "vf-sync-reload") }
+    private var pendingSyncReload: ScheduledFuture<*>? = null
+
+    private fun scheduleSyncReload() {
+        synchronized(syncReloadScheduler) {
+            pendingSyncReload?.cancel(false)
+            pendingSyncReload = syncReloadScheduler.schedule({
+                // 排进 scanExec：与写操作/换库串行，避免并发 load
+                scanExec.execute {
+                    try {
+                        val t0 = System.currentTimeMillis()
+                        index.load(db).also { session = null }
+                        loadMs = System.currentTimeMillis() - t0
+                    } catch (t: Throwable) {
+                        Log.w("ViewFile/Ops", "deferred index reload failed", t)
+                    }
+                }
+            }, 3, TimeUnit.SECONDS)
         }
     }
 

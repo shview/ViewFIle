@@ -1,4 +1,5 @@
 import 'dart:io' as io;
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -47,7 +48,6 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
   void dispose() {
     _searchCtl.dispose();
     _scrollCtl.dispose();
-    _hScroll.dispose();
     super.dispose();
   }
 
@@ -97,6 +97,19 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
       _truncated = truncated && !binary;
       _text = binary ? '' : text!;
       _lines = binary ? const [] : _splitLines(text!);
+      if (!binary) {
+        // 最长行宽度（横向滑动上限）：只测最长的那一行
+        var longest = '';
+        for (final l in _lines) {
+          if (l.length > longest.length) longest = l;
+        }
+        final tp = TextPainter(
+          text: TextSpan(text: longest, style: _mono),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        _maxLineWidth = tp.width;
+        _hOffset = 0;
+      }
     });
   }
 
@@ -272,69 +285,78 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
     _matchKeys.clear();
     final matchLines = <int>{for (final m in _matches) m.$1};
 
-    // 横向滑动：所有行共用一个横向 ScrollController（行间联动），
-    // 外层 ListView 承担纵向
+    // 整文档联动的横向滑动：内容整体 Transform 平移 + 横向拖拽。
+    // （每行各自 ScrollView 会各行各滑；共用 controller 在多 position 下行为不定）
+    final vw = MediaQuery.sizeOf(context).width;
+    final hMax = math.max(0.0, _maxLineWidth + 24 - vw);
+    if (_hOffset > hMax) _hOffset = hMax;
+
     return SelectionArea(
-      child: ListView.builder(
-        controller: _scrollCtl,
-        itemCount: _lines.length,
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        itemBuilder: (context, i) {
-          final line = _lines[i].isEmpty ? ' ' : _lines[i];
-          final spans = <InlineSpan>[];
-          if (matchLines.contains(i)) {
-            final key = _matchKeys.putIfAbsent(i, () => GlobalKey());
-            final ms = [
-              for (final m in _matches)
-                if (m.$1 == i) m,
-            ];
-            var pos = 0;
-            for (final (li, s, e) in ms) {
-              if (s > pos) spans.add(TextSpan(text: line.substring(pos, s)));
-              final isCurrent = _matches[_currentMatch] == (li, s, e);
-              spans.add(TextSpan(
-                text: line.substring(s, e),
-                style: TextStyle(
-                  backgroundColor: isCurrent ? _currentColor(theme) : _hitColor(theme),
-                ),
-              ));
-              pos = e;
+      child: GestureDetector(
+        behavior: HitTestBehavior.deferToChild,
+        onHorizontalDragUpdate: hMax <= 0
+            ? null
+            : (d) => setState(() {
+                  _hOffset = (_hOffset - d.delta.dx).clamp(0.0, hMax);
+                }),
+        child: ListView.builder(
+          controller: _scrollCtl,
+          itemCount: _lines.length,
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          itemBuilder: (context, i) {
+            if (matchLines.contains(i)) {
+              final key = _matchKeys.putIfAbsent(i, () => GlobalKey());
+              final ms = [
+                for (final m in _matches)
+                  if (m.$1 == i) m,
+              ];
+              final spans = <InlineSpan>[];
+              var pos = 0;
+              for (final (li, s, e) in ms) {
+                if (s > pos) {
+                  spans.add(TextSpan(text: _lines[i].substring(pos, s)));
+                }
+                final isCurrent = _matches[_currentMatch] == (li, s, e);
+                spans.add(TextSpan(
+                  text: _lines[i].substring(s, e),
+                  style: TextStyle(
+                    backgroundColor: isCurrent
+                        ? theme.colorScheme.primary.withValues(alpha: 0.55)
+                        : theme.colorScheme.tertiaryContainer,
+                  ),
+                ));
+                pos = e;
+              }
+              if (pos < _lines[i].length) {
+                spans.add(TextSpan(text: _lines[i].substring(pos)));
+              }
+              return _lineWidget(i, spans, key: key);
             }
-            if (pos < line.length) {
-              spans.add(TextSpan(text: line.substring(pos)));
-            }
-            return SizedBox(
-              key: key,
-              height: 18,
-              child: SingleChildScrollView(
-                controller: _hScroll,
-                scrollDirection: Axis.horizontal,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Text.rich(TextSpan(style: _mono, children: spans),
-                      softWrap: false),
-                ),
-              ),
-            );
-          }
-          return SizedBox(
-            height: 18,
-            child: SingleChildScrollView(
-              controller: _hScroll,
-              scrollDirection: Axis.horizontal,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Text(line, style: _mono, softWrap: false),
-              ),
-            ),
-          );
-        },
+            return _lineWidget(i, null);
+          },
+        ),
       ),
     );
   }
 
-  final _hScroll = ScrollController();
+  double _hOffset = 0;
+  double _maxLineWidth = 0;
 
-  Color _hitColor(ThemeData t) => t.colorScheme.tertiaryContainer;
-  Color _currentColor(ThemeData t) => t.colorScheme.primary.withValues(alpha: 0.55);
+  Widget _lineWidget(int i, List<InlineSpan>? spans, {Key? key}) {
+    final line = _lines[i].isEmpty ? ' ' : _lines[i];
+    final text = spans == null
+        ? Text(line, style: _mono, softWrap: false)
+        : Text.rich(TextSpan(style: _mono, children: spans), softWrap: false);
+    return SizedBox(
+      key: key,
+      height: 18,
+      child: Transform.translate(
+        offset: Offset(-_hOffset, 0),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: text,
+        ),
+      ),
+    );
+  }
 }

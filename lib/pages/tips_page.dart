@@ -12,36 +12,125 @@ class TipsPage extends StatelessWidget {
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
-          _Section(theme, '存储访问分层', [
+          _Section(theme, '搜索', [
+            _Tip(
+              theme,
+              Icons.search,
+              '即时搜索与高级配置',
+              '点击主界面搜索框进入搜索页：输入即出结果；页内可配置搜索范围'
+                  '（当前目录 / 全盘 / 当前界面）、区分大小写、文件类型、大小与'
+                  '时间过滤，还可以直接使用搜索语法。',
+            ),
+            _Tip(
+              theme,
+              Icons.terminal,
+              '搜索语法',
+              '关键词后可拼过滤条件：大小如 >10mb、<500kb、1mb..50mb；时间如 '
+                  'today、thisweek、>2024-01-01；多个条件与关键词空格分隔、'
+                  '全部同时满足。例如「日志 >100mb thismonth」。',
+            ),
+            _Tip(
+              theme,
+              Icons.filter_alt,
+              '结果中逐层收敛',
+              '点击结果里显示的路径行，可把搜索范围立即缩小到该文件所在的'
+                  '文件夹，反复点击可层层逼近目标；「当前界面」范围则在当前'
+                  '结果列表内继续过滤。',
+            ),
+            _Tip(
+              theme,
+              Icons.history,
+              '搜索历史',
+              '按键盘搜索键或点开结果会记录关键词（最多 20 条），聚焦搜索框'
+                  '时下拉展示，可单条删除或清空。',
+            ),
+          ]),
+          _Section(theme, '文件操作', [
+            _Tip(
+              theme,
+              Icons.delete_outline,
+              '回收站',
+              '删除默认移入回收站（侧边栏进入），可随时恢复到原路径或清空；'
+                  '确认框里也可选择永久删除。压缩包内的条目只能永久删除。',
+            ),
+            _Tip(
+              theme,
+              Icons.folder_zip,
+              '压缩包浏览',
+              '点击 zip / rar 压缩包直接进入内部层级（面包屑可跳转、返回键'
+                  '逐级退出），内部文件支持打开、预览、播放与校验。rar5 加密'
+                  '包暂不支持。',
+            ),
+            _Tip(
+              theme,
+              Icons.fingerprint,
+              '完整性校验',
+              '文件详情里的「校验」计算 MD5 / SHA1 / SHA256（单遍读取，带进度'
+                  '百分比），结果可长按选中复制。',
+            ),
+            _Tip(
+              theme,
+              Icons.drive_file_move,
+              '复制 / 移动 / 重命名',
+              '多选后底部操作栏可批量复制或移动到任意目录（支持新建文件夹）；'
+                  '受系统保护的区域会自动改用已授权的更高权限执行。',
+            ),
+          ]),
+          _Section(theme, '清理工具', [
+            _Tip(
+              theme,
+              Icons.analytics_outlined,
+              '空间分析',
+              'WizTree 式树形展开：每项显示占父文件夹的百分比，按大小降序；'
+                  '可切换饼图逐级下钻。支持长按多选批量清理。',
+            ),
+            _Tip(
+              theme,
+              Icons.find_in_page_outlined,
+              '大文件查重',
+              '先按大小分组找出候选，再比对每份文件前 1MB 指纹确认重复；'
+                  '阈值可自定（默认 10MB）。选中后移入回收站，「选中新出的'
+                  '重复」自动保留每组最早的一份。',
+            ),
+            _Tip(
+              theme,
+              Icons.android_outlined,
+              'APK 管理',
+              '全盘安装包按应用分组、按占用排序，多版本标红；「全选旧版本」'
+                  '按修改时间保留最新一份，其余一键清理。',
+            ),
+          ]),
+          _Section(theme, '存储访问', [
             _Tip(
               theme,
               Icons.verified,
-              '免 root（当前 T1）',
-              '可索引和浏览内部存储（/sdcard）全部常规文件。',
+              '免 root',
+              '授予「所有文件访问」后可索引和浏览内部存储全部常规文件。',
             ),
             _Tip(
               theme,
               Icons.lock_outline,
-              '系统封锁区（重要限制）',
+              '系统封锁区',
               'Android 11 起系统在 FUSE 层对所有应用隐藏 Android/data 与 '
-                  'Android/obb——即使授予“所有文件访问”也一样。免 root 模式下这两个'
-                  '目录及其中的文件不在索引与浏览范围内。',
-            ),
-            _Tip(
-              theme,
-              Icons.key,
-              'root（T3）',
-              '授权后可索引 /data/data、/data/local/tmp 并解锁 Android/data、'
-                  'Android/obb；删除/重命名会自动改用 root 权限执行。',
+                  'Android/obb——即使授予「所有文件访问」也一样。需要 Shizuku '
+                  '或 root 才能纳入索引与浏览。',
             ),
             _Tip(
               theme,
               Icons.phonelink_setup,
-              'Shizuku（T2，已支持）',
-              '面向无 root 用户：Shizuku 以 shell 身份运行，可读取 Android/data、'
-                  'Android/obb 与 /data/local/tmp；但不能读 /data/data（应用私有'
-                  '数据，仅真 root 可见）。需要先在 Shizuku 应用中启动服务并在'
-                  '设置页授权。',
+              'Shizuku',
+              '无需 root 的折中方案：以 shell 身份运行，可读 Android/data、'
+                  'Android/obb 与 /data/local/tmp；应用私有目录 /data/data '
+                  '仍然不可见（仅真 root 可读）。先在 Shizuku 应用中启动服务，'
+                  '再到本应用设置页授权。',
+            ),
+            _Tip(
+              theme,
+              Icons.key,
+              'root',
+              '可索引 /data/data（可选深度索引）、/data/local/tmp，并解锁全部'
+                  '封锁区；文件操作在需要时自动改用 root 执行。重装应用后 '
+                  'root 管理器会重新请求授权。',
             ),
           ]),
           _Section(theme, '索引与实时性', [
@@ -49,101 +138,47 @@ class TipsPage extends StatelessWidget {
               theme,
               Icons.bolt,
               '打开时自动增量',
-              '每次打开 app 自动做一次增量对账（目录修改时间比对，只重扫变化'
-                  '的子树），新建/删除的文件无需手动重建索引。',
+              '每次打开自动做增量对账（目录修改时间比对，只重扫变化的子树），'
+                  '新建/删除的文件无需手动重建索引。',
             ),
             _Tip(
               theme,
               Icons.visibility,
               '前台实时监听',
-              'app 在前台期间监听文件变化，静默 2 秒后自动同步；切到后台立即'
-                  '停止监听，不消耗电量（无常驻设计）。root 模式通过一个以 root '
-                  '运行的原生辅助进程监听（含系统隐藏目录）。若系统 inotify 上限'
-                  '不足或监听启动失败，会自动回退到 MediaStore 监听；应用不会修改'
-                  '系统参数。',
+              '前台期间监听文件变化，静默片刻后自动同步，界面无缝刷新；'
+                  '切到后台立即停止，不耗电。root 模式会在需要时临时提高系统'
+                  '监听上限并在停止时恢复原值。',
             ),
             _Tip(
               theme,
               Icons.edit_off,
-              '同名文件的内容修改（已知缺陷）',
-              '文件被原地修改（文件名不变）不会触发所在目录的 mtime 变化，'
-                  '其大小/修改时间要等下一次全量重建（右上角刷新）才会刷新；'
-                  '文件名搜索不受影响。',
+              '同名文件的内容修改（已知边界）',
+              '文件被原地修改（文件名不变）不会触发目录变化，其大小/修改时间'
+                  '要等下一次全量重建才会刷新；文件名搜索不受影响。',
             ),
             _Tip(
               theme,
               Icons.memory,
               '系统分区默认不索引',
-              '/system、/vendor 等只读分区体积大、几乎不变，默认不索引；'
-                  '可在设置中开启。/proc、/sys 等虚拟文件系统永远不索引。',
-            ),
-            _Tip(
-              theme,
-              Icons.link_off,
-              '非常规文件不入索引',
-              '符号链接、socket、设备节点按设计跳过，因此索引条数会少于 '
-                  'find 等工具的原始计数。',
+              '/system、/vendor 等只读分区体积大、几乎不变，默认不索引，可在'
+                  '设置中开启；/proc、/sys 等虚拟文件系统永远不索引。符号链接、'
+                  'socket、设备节点按设计跳过。',
             ),
           ]),
-          _Section(theme, '文件操作', [
+          _Section(theme, '隐私与耗电', [
             _Tip(
               theme,
-              Icons.delete_forever,
-              '删除不可恢复',
-              '删除不经过回收站、不可撤销；对话框会列出数量与名称，'
-                  '请在确认前仔细核对。root 区域的删除同样直接生效。',
+              Icons.wifi_off,
+              '不联网',
+              '应用没有网络权限：不联网、不采集、不上传，所有数据都保存在'
+                  '本机。',
             ),
-            _Tip(
-              theme,
-              Icons.open_in_new_off,
-              '保护区域暂不能打开/分享',
-              'Android/data 等封锁区内的文件，其他应用无法读取，'
-                  '因此“打开/分享”暂不可用；可先复制到可见区域（复制/移动'
-                  '功能开发中）。',
-            ),
-            _Tip(
-              theme,
-              Icons.drive_file_rename_outline,
-              '重命名与索引',
-              '重命名/删除后索引即时同步，无需重建。',
-            ),
-          ]),
-          _Section(theme, '按应用检索', [
-            _Tip(
-              theme,
-              Icons.apps,
-              '搜索范围',
-              '同时搜索所选应用的 /data/data、Android/data、Android/obb '
-                  '三个目录；进入即列出该应用全部已索引文件，可继续输入关键词过滤。',
-            ),
-            _Tip(
-              theme,
-              Icons.key_off,
-              '需要 root',
-              '应用私有目录需要 root 才能读取；无 root 时仅能检索已索引的'
-                  '常规区域。',
-            ),
-          ]),
-          _Section(theme, '其他', [
             _Tip(
               theme,
               Icons.battery_saver,
-              '耗电说明',
-              '无后台常驻、无轮询。索引更新只发生在：打开 app 的几秒内、'
-                  '前台使用期间。前台监听为事件驱动，空闲时不消耗 CPU。',
-            ),
-            _Tip(
-              theme,
-              Icons.palette,
-              '个性化',
-              '设置中可切换主题色（7 种）与明暗模式；文件夹图标颜色'
-                  '跟随主题主色。',
-            ),
-            _Tip(
-              theme,
-              Icons.construction,
-              '开发中的功能',
-              '复制/移动、WizTree 式空间分析、Shizuku 支持、多语言界面。',
+              '无后台常驻',
+              '无后台服务、无轮询。索引更新只发生在打开 app 的几秒内与前台'
+                  '使用期间；空闲时不消耗 CPU。',
             ),
           ]),
         ],

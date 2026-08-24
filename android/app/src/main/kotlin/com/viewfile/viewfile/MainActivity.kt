@@ -171,7 +171,8 @@ class MainActivity : FlutterActivity() {
                         val sortDesc = call.argument<Boolean>("sortDesc") ?: false
                         val category = call.argument<String>("category")
                         val hideDot = call.argument<Boolean>("hideDot") ?: false
-                        Engine.searchStartAsync(q, scopes, sortKey, sortDesc, category, hideDot) { id, total, ms ->
+                        val caseSensitive = call.argument<Boolean>("caseSensitive") ?: false
+                        Engine.searchStartAsync(q, scopes, sortKey, sortDesc, category, hideDot, caseSensitive) { id, total, ms ->
                             main.post {
                                 result.success(mapOf("id" to id, "total" to total, "elapsedMs" to ms))
                             }
@@ -287,13 +288,14 @@ class MainActivity : FlutterActivity() {
                     }
                     "mkdir" -> {
                         val path = call.argument<String>("path") ?: ""
-                        Thread {
+                        Engine.ioAsync({ m -> main.post { result.success(m["ok"]) } }) {
                             val ok = try {
-                                java.io.File(path).mkdirs() ||
-                                    FileOps.let { true } // FUSE 尝试
-                            } catch (_: Throwable) { false }
-                            main.post { result.success(ok) }
-                        }.start()
+                                java.io.File(path).mkdirs()
+                            } catch (_: Throwable) {
+                                false
+                            }
+                            mapOf("ok" to ok)
+                        }
                     }
                     "transfer" -> {
                         val paths = call.argument<List<String>>("paths") ?: emptyList()

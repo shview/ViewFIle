@@ -20,6 +20,8 @@ class _AppsPageState extends State<AppsPage> {
   List<Map<dynamic, dynamic>> _apps = [];
   List<Map<dynamic, dynamic>> _filtered = [];
   bool _loading = true;
+  bool _hideSystem = true;
+  String _sortKey = 'name'; // name | pkg
   final _icons = <String, Uint8List>{};
   final _iconPending = <String>{};
 
@@ -49,7 +51,9 @@ class _AppsPageState extends State<AppsPage> {
       if (mounted) {
         setState(() {
           _apps = apps;
-          _filtered = apps;
+          _filtered = _applySort(apps
+              .where((a) => !_hideSystem || a['system'] != true)
+              .toList());
           _loading = false;
         });
       }
@@ -60,11 +64,23 @@ class _AppsPageState extends State<AppsPage> {
 
   void _onFilter(String q) {
     final key = q.trim().toLowerCase();
-    setState(() => _filtered = _apps.where((a) {
+    setState(() => _filtered = _applySort(_apps.where((a) {
           final label = (a['label'] as String? ?? '').toLowerCase();
           final pkg = (a['pkg'] as String? ?? '').toLowerCase();
-          return key.isEmpty || label.contains(key) || pkg.contains(key);
-        }).toList());
+          return (!_hideSystem || a['system'] != true) &&
+              (key.isEmpty || label.contains(key) || pkg.contains(key));
+        }).toList()));
+  }
+
+  List<Map<dynamic, dynamic>> _applySort(List<Map<dynamic, dynamic>> l) {
+    l.sort((a, b) {
+      if (_sortKey == 'pkg') {
+        return (a['pkg'] as String? ?? '')
+            .compareTo(b['pkg'] as String? ?? '');
+      }
+      return (a['label'] as String? ?? '').compareTo(b['label'] as String? ?? '');
+    });
+    return l;
   }
 
   void _pick(Map<dynamic, dynamic> app) {
@@ -90,7 +106,43 @@ class _AppsPageState extends State<AppsPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('按应用检索')),
+      appBar: AppBar(
+        title: const Text('按应用检索'),
+        actions: [
+          PopupMenuButton<String>(
+            tooltip: '显示与排序',
+            icon: const Icon(Icons.tune),
+            onSelected: (v) {
+              setState(() {
+                if (v == 'hideSystem') {
+                  _hideSystem = !_hideSystem;
+                } else {
+                  _sortKey = v;
+                }
+                _onFilter(_filterCtl.text);
+              });
+            },
+            itemBuilder: (_) => [
+              CheckedPopupMenuItem(
+                value: 'hideSystem',
+                checked: _hideSystem,
+                child: const Text('隐藏系统应用'),
+              ),
+              const PopupMenuDivider(),
+              CheckedPopupMenuItem(
+                value: 'name',
+                checked: _sortKey == 'name',
+                child: const Text('按应用名排序'),
+              ),
+              CheckedPopupMenuItem(
+                value: 'pkg',
+                checked: _sortKey == 'pkg',
+                child: const Text('按包名排序'),
+              ),
+            ],
+          ),
+        ],
+      ),
       body: Column(
         children: [
           if (!widget.rootAvailable)

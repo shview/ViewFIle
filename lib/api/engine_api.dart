@@ -105,6 +105,7 @@ class EngineApi {
     bool sortDesc = false,
     String? category,
     bool hideDot = false,
+    bool caseSensitive = false,
   }) async =>
       Map<String, dynamic>.from(await _m.invokeMethod('searchStart', {
         'query': query,
@@ -113,6 +114,7 @@ class EngineApi {
         'sortDesc': sortDesc,
         if (category != null) 'category': category,
         'hideDot': hideDot,
+        'caseSensitive': caseSensitive,
       }));
 
   /// 取会话一页（默认 300 条）

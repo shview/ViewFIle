@@ -342,7 +342,8 @@ class SearchIndex {
         limit: Int,
         scopes: List<String>? = null,
         category: String? = null,
-        hideDot: Boolean = false
+        hideDot: Boolean = false,
+        caseSensitive: Boolean = false
     ): QueryResult {
         val snap = snapshot
         val s = snap.soa ?: return QueryResult(snap, IntArray(0), 0)
@@ -357,7 +358,8 @@ class SearchIndex {
         val hasScope = !intervals.isNullOrEmpty()
 
         val f = SearchQueryParser.parse(raw)
-        val q = f.text.trim().lowercase()
+        // 大小写敏感时保留原始大小写（折叠在比较期做，不在分词期破坏）
+        val q = if (caseSensitive) f.text.trim() else f.text.trim().lowercase()
         val tokens = q.split(' ', '\t').filter { it.isNotEmpty() }
             .map { it.toByteArray(Charsets.UTF_8) }
         val wantCat = FileCategories.idOf(category)
@@ -366,7 +368,7 @@ class SearchIndex {
         var hits = 0
         var total = 0
 
-        fun nameContainsFold(i: Int, tok: ByteArray): Boolean {
+        fun nameContains(i: Int, tok: ByteArray): Boolean {
             val r = s.nameRef[i]
             val a = s.nameOff[r]
             val b = s.nameOff[r + 1]
@@ -376,7 +378,7 @@ class SearchIndex {
                 for (k in 0 until tlen) {
                     var c1 = s.namePool[start + k].toInt() and 0xFF
                     val c2 = tok[k].toInt() and 0xFF
-                    if (c1 in 0x41..0x5A) c1 += 32
+                    if (!caseSensitive && c1 in 0x41..0x5A) c1 += 32
                     if (c1 != c2) continue@outer
                 }
                 return true
@@ -399,7 +401,7 @@ class SearchIndex {
             if (hasScope && !inScope(i)) return false
             if (hideDot && isDotName(i)) return false
             for (tok in tokens) {
-                if (!nameContainsFold(i, tok)) return false
+                if (!nameContains(i, tok)) return false
             }
             if (f.sizeMin != null && s.size[i] < f.sizeMin!!) return false
             if (f.sizeMax != null && s.size[i] > f.sizeMax!!) return false

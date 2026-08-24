@@ -16,6 +16,7 @@ import 'bookmarks_page.dart';
 import 'dupe_page.dart';
 import 'image_viewer_page.dart';
 import 'media_viewer_page.dart';
+import 'search_page.dart';
 import 'settings_page.dart';
 import 'dest_picker_page.dart';
 import 'storage_analysis_page.dart';
@@ -1280,12 +1281,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           children: [
             if (_hasPerm != true) _permissionCard(),
             if (_scanning || _statusLine.isNotEmpty) _statusCard(),
-            _searchField(),
-            if (_showHistoryPanel()) _historyPanel(),
-            if (_isSearching && _appScope == null) _categoryChips(),
-            if (!_isSearching) _pathBar(),
-            if (_isSearching && _totalResults > 0) _resultCountBar(),
-            if (_searching) const LinearProgressIndicator(minHeight: 2),
+            _searchEntry(),
+            _pathBar(),
             Expanded(child: _listArea()),
             if (_selecting) _selectBottomBar(),
           ],
@@ -1728,8 +1725,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 ),
               );
               if (picked != null && mounted) {
-                setState(() => _appScope = picked);
-                _runQuery(_searchCtl.text);
+                await _openSearch(appScope: picked);
               }
             }),
             _drawerItem(Icons.analytics_outlined, '空间分析',
@@ -1872,6 +1868,53 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 搜索入口：点击进入搜索专页（配置范围/大小写/类型/大小/时间）
+  Widget _searchEntry() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      child: InkWell(
+        onTap: _hasPerm == true ? _openSearch : null,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          height: 44,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          decoration: BoxDecoration(
+            border: Border.all(color: Theme.of(context).colorScheme.outline),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            children: [
+              Icon(Icons.search,
+                  size: 20, color: Theme.of(context).colorScheme.outline),
+              const SizedBox(width: 10),
+              Text(
+                _entries > 0 ? '搜索 $_entries 条索引…' : '等待索引建立…',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Theme.of(context).colorScheme.outline,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openSearch({String? dir, Map<String, dynamic>? appScope}) async {
+    _unfocus();
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SearchPage(
+          initialDir: dir ?? _currentDir,
+          appScope: appScope,
+          onBrowse: (p) => _loadDir(p),
+        ),
       ),
     );
   }
@@ -2263,19 +2306,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return true;
   }
 
-  /// 把搜索范围限定到某文件夹并重跑（结果内路径过滤）
+  /// 把搜索范围限定到某文件夹（跳转搜索专页）
   void _scopeToFolder(String dir) {
     if (dir.isEmpty) return;
-    setState(() {
-      _scopeMode = 0;
-      _currentDir = dir;
-      _appScope = null;
-    });
-    _runQuery(_searchCtl.text);
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text('已限定在 ${dir.substring(dir.lastIndexOf('/') + 1)} 内搜索'),
-      duration: const Duration(seconds: 1),
-    ));
+    _openSearch(dir: dir);
   }
 
   Widget _tile(Map<dynamic, dynamic> e, {required bool browsing}) {
@@ -2496,8 +2530,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       '在此文件夹内搜索',
                       () {
                         Navigator.pop(context);
-                        _scopeToFolder(
-                            path.substring(0, path.lastIndexOf('/')));
+                        _openSearch(
+                            dir: path.substring(0, path.lastIndexOf('/')));
                       },
                     ),
                   if (path.isNotEmpty)
