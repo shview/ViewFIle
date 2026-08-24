@@ -47,6 +47,7 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
   void dispose() {
     _searchCtl.dispose();
     _scrollCtl.dispose();
+    _hScroll.dispose();
     super.dispose();
   }
 
@@ -270,20 +271,19 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
     }
     _matchKeys.clear();
     final matchLines = <int>{for (final m in _matches) m.$1};
-    final highlight = theme.colorScheme.tertiaryContainer;
-    final current = theme.colorScheme.primary.withValues(alpha: 0.55);
 
+    // 横向滑动：所有行共用一个横向 ScrollController（行间联动），
+    // 外层 ListView 承担纵向
     return SelectionArea(
       child: ListView.builder(
         controller: _scrollCtl,
         itemCount: _lines.length,
         padding: const EdgeInsets.symmetric(vertical: 4),
         itemBuilder: (context, i) {
-          final line = _lines[i];
+          final line = _lines[i].isEmpty ? ' ' : _lines[i];
           final spans = <InlineSpan>[];
           if (matchLines.contains(i)) {
             final key = _matchKeys.putIfAbsent(i, () => GlobalKey());
-            // 该行的匹配列表
             final ms = [
               for (final m in _matches)
                 if (m.$1 == i) m,
@@ -295,7 +295,7 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
               spans.add(TextSpan(
                 text: line.substring(s, e),
                 style: TextStyle(
-                  backgroundColor: isCurrent ? current : highlight,
+                  backgroundColor: isCurrent ? _currentColor(theme) : _hitColor(theme),
                 ),
               ));
               pos = e;
@@ -303,21 +303,38 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
             if (pos < line.length) {
               spans.add(TextSpan(text: line.substring(pos)));
             }
-            return Padding(
+            return SizedBox(
               key: key,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Text.rich(
-                TextSpan(style: _mono, children: spans),
-                softWrap: false,
+              height: 18,
+              child: SingleChildScrollView(
+                controller: _hScroll,
+                scrollDirection: Axis.horizontal,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Text.rich(TextSpan(style: _mono, children: spans),
+                      softWrap: false),
+                ),
               ),
             );
           }
-          return Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Text(line, style: _mono, softWrap: false),
+          return SizedBox(
+            height: 18,
+            child: SingleChildScrollView(
+              controller: _hScroll,
+              scrollDirection: Axis.horizontal,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Text(line, style: _mono, softWrap: false),
+              ),
+            ),
           );
         },
       ),
     );
   }
+
+  final _hScroll = ScrollController();
+
+  Color _hitColor(ThemeData t) => t.colorScheme.tertiaryContainer;
+  Color _currentColor(ThemeData t) => t.colorScheme.primary.withValues(alpha: 0.55);
 }

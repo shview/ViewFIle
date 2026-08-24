@@ -145,6 +145,12 @@ class EngineApi {
         await _m.invokeMethod('hashFile', {'path': path}),
       );
 
+  /// 头部指纹：前 1MB 的 MD5（查重快速比对）
+  Future<Map<String, dynamic>> hashHead(String path) async =>
+      Map<String, dynamic>.from(
+        await _m.invokeMethod('hashHead', {'path': path}),
+      );
+
   /// VACUUM 压缩主库；pageSize 非空时切换页大小
   Future<Map<String, dynamic>> vacuum({int? pageSize}) async =>
       Map<String, dynamic>.from(

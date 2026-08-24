@@ -1,5 +1,7 @@
 # ViewFile
 
+[中文](README.md) | [English](README.en.md)
+
 Android 上的 Everything：即时全盘文件搜索 + 完整文件管理 + WizTree 式空间分析。
 
 Flutter UI + Kotlin 原生引擎，无后台常驻，支持 免 Root / Shizuku / Root 三层特权访问。

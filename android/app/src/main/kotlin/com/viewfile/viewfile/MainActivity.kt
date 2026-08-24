@@ -218,6 +218,12 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                     }
+                    "hashHead" -> {
+                        val path = call.argument<String>("path") ?: ""
+                        Engine.ioAsync({ m -> main.post { result.success(m) } }) {
+                            FileOps.hashHead(path)
+                        }
+                    }
                     "vacuum" -> {
                         val pageSize = call.argument<Int>("pageSize")
                         Engine.vacuumAsync(pageSize) { m ->

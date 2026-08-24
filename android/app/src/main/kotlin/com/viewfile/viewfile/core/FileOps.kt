@@ -112,6 +112,50 @@ object FileOps {
         return mapOf("ok" to false, "error" to "无权限读取该文件")
     }
 
+    /** 头部指纹：前 bytes 字节的 MD5（查重快速比对用，比全文件哈希快几个量级） */
+    fun hashHead(path: String, bytes: Int = 1 shl 20): Map<String, Any?> {
+        val f = File(path)
+        val t0 = System.currentTimeMillis()
+        if (f.isFile && f.canRead()) {
+            return try {
+                val md = java.security.MessageDigest.getInstance("MD5")
+                f.inputStream().use { ins ->
+                    val buf = ByteArray(bytes)
+                    var n = 0
+                    while (n < buf.size) {
+                        val r = ins.read(buf, n, buf.size - n)
+                        if (r < 0) break
+                        n += r
+                    }
+                    md.update(buf, 0, n)
+                }
+                mapOf(
+                    "ok" to true,
+                    "md5" to hex(md.digest()),
+                    "elapsedMs" to (System.currentTimeMillis() - t0),
+                )
+            } catch (t: Throwable) {
+                mapOf("ok" to false, "error" to (t.message ?: t.toString()))
+            }
+        }
+        if (PrivShell.tier() == PrivShell.Tier.ROOT) {
+            val raw = RootScanner.toRaw(path)
+            val res = PrivShell.run("head -c $bytes ${shq(raw)} 2>/dev/null | md5sum")
+            if (res.ok) {
+                val h = res.out.trim().split(Regex("\\s+")).firstOrNull()
+                if (h != null) {
+                    return mapOf(
+                        "ok" to true,
+                        "md5" to h,
+                        "elapsedMs" to (System.currentTimeMillis() - t0),
+                    )
+                }
+            }
+            return mapOf("ok" to false, "error" to "读取失败: rc=${res.code}")
+        }
+        return mapOf("ok" to false, "error" to "无权限读取该文件")
+    }
+
     private fun hex(bytes: ByteArray): String {
         val sb = StringBuilder(bytes.size * 2)
         for (b in bytes) {

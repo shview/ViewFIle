@@ -11,6 +11,9 @@ import '../utils/format.dart';
 import '../utils/index_bootstrap.dart';
 import '../utils/watcher_lifecycle.dart';
 import 'apps_page.dart';
+import 'apk_page.dart';
+import 'bookmarks_page.dart';
+import 'dupe_page.dart';
 import 'image_viewer_page.dart';
 import 'media_viewer_page.dart';
 import 'settings_page.dart';
@@ -18,6 +21,7 @@ import 'dest_picker_page.dart';
 import 'storage_analysis_page.dart';
 import 'text_preview_page.dart';
 import 'tips_page.dart';
+import 'trash_page.dart';
 
 const kSdcard = '/storage/emulated/0';
 
@@ -1114,32 +1118,49 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final dirCount = items.length - fileCount;
     final names = items.take(5).map((e) => e['name']).join('、');
     final more = items.length > 5 ? ' 等 ${items.length} 项' : '';
-    final ok = await showDialog<bool>(
+    // zip 虚拟项不能移动，只能永久删（解压后删）
+    final hasVirtual = items.any((e) => (e['path'] as String).contains('!/'));
+    final toTrash = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('永久删除？'),
+        title: const Text('删除'),
         content: Text(
-          '将删除 $fileCount 个文件、$dirCount 个文件夹：\n$names$more\n\n'
-          '此操作不可恢复，也不会进入回收站。',
+          '将删除 $fileCount 个文件、$dirCount 个文件夹：\n$names$more',
           style: const TextStyle(fontSize: 14),
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context, false),
+            onPressed: () => Navigator.pop(context, null),
             child: const Text('取消'),
           ),
-          FilledButton.tonal(
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(context).colorScheme.errorContainer,
+          if (!hasVirtual)
+            FilledButton.tonal(
+              style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(context).colorScheme.errorContainer,
+              ),
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('永久删除'),
             ),
+          FilledButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('删除'),
+            child: Text(hasVirtual ? '永久删除' : '移入回收站'),
           ),
         ],
       ),
     );
-    if (ok != true) return;
-    final r = await _api.delete(items.map((e) => e['path'] as String).toList());
+    if (toTrash == null || !mounted) return;
+    if (toTrash) {
+      final n = await TrashStore.put(
+          items.map((e) => e['path'] as String).toList());
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('已移入回收站 $n 项（侧边栏可恢复）')));
+      _exitSelection();
+      _rerun();
+      return;
+    }
+    final r =
+        await _api.delete(items.map((e) => e['path'] as String).toList());
     if (!mounted) return;
     if (r['ok'] == true) {
       ScaffoldMessenger.of(
@@ -1633,155 +1654,174 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _buildDrawer() {
     final theme = Theme.of(context);
+    void goBrowse(String path) {
+      _searchCtl.clear();
+      setState(() {
+        _appScope = null;
+        _results = const [];
+      });
+      _loadDir(path);
+    }
+
     return Drawer(
       child: SafeArea(
-        child: Column(
+        child: ListView(
+          padding: EdgeInsets.zero,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(20, 24, 20, 16),
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
               child: SizedBox(
                 width: double.infinity,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('ViewFile', style: theme.textTheme.headlineSmall),
-                    const SizedBox(height: 6),
-                    Text('索引 $_entries 条', style: theme.textTheme.bodySmall),
+                    Text('ViewFile',
+                        style: theme.textTheme.titleLarge
+                            ?.copyWith(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 4),
+                    Text('索引 $_entries 条',
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(fontSize: 11)),
                     if (_lastScanMs > 0)
                       Text(
-                        '扫描 ${(_lastScanMs / 1000.0).toStringAsFixed(1)} s · 载入 $_loadMs ms',
-                        style: theme.textTheme.bodySmall,
+                        '扫描 ${(_lastScanMs / 1000.0).toStringAsFixed(1)} s · 载入 $_loadMs ms · ${_tierName}',
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(fontSize: 10),
                       ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '访问层级：${switch (_tier) {
-                        'ROOT' => 'root（T3）',
-                        'SHIZUKU' => 'Shizuku（T2）',
-                        _ => '免 root（T1）',
-                      }}',
-                      style: theme.textTheme.bodySmall,
-                    ),
                   ],
                 ),
               ),
             ),
             const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.home_outlined),
-              title: const Text('内部存储'),
-              subtitle: Text(kSdcard, style: theme.textTheme.bodySmall),
-              onTap: () {
-                Navigator.pop(context);
-                _searchCtl.clear();
-                setState(() => _results = const []);
-                _loadDir(kSdcard);
-              },
-            ),
-            if (_root)
-              ListTile(
-                leading: const Icon(Icons.memory),
-                title: const Text('根目录 /'),
-                subtitle: Text('root 模式', style: theme.textTheme.bodySmall),
+            _drawerItem(Icons.home_outlined, '内部存储', subtitle: kSdcard,
                 onTap: () {
-                  Navigator.pop(context);
-                  _searchCtl.clear();
-                  setState(() => _results = const []);
-                  _loadDir('/');
-                },
-              ),
-            ListTile(
-              leading: const Icon(Icons.apps),
-              title: const Text('按应用检索'),
-              subtitle: Text(
-                '搜某应用的 /data/data 与 Android/data',
-                style: theme.textTheme.bodySmall,
-              ),
-              onTap: () async {
+              Navigator.pop(context);
+              goBrowse(kSdcard);
+            }),
+            if (_root)
+              _drawerItem(Icons.memory, '根目录 /', subtitle: 'root 模式',
+                  onTap: () {
                 Navigator.pop(context);
-                final picked = await Navigator.push<Map<String, dynamic>>(
+                goBrowse('/');
+              }),
+            _drawerItem(Icons.bookmark_border, '书签', subtitle: '收藏的快速访问',
+                onTap: () async {
+              Navigator.pop(context);
+              await Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (_) => BookmarksPage(onOpen: goBrowse)),
+              );
+            }),
+            _drawerItem(Icons.delete_outline, '回收站', onTap: () {
+              Navigator.pop(context);
+              Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const TrashPage()));
+            }),
+            _drawerItem(Icons.apps, '按应用检索', subtitle: '应用私有数据目录',
+                onTap: () async {
+              Navigator.pop(context);
+              final picked = await Navigator.push<Map<String, dynamic>>(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => AppsPage(rootAvailable: _root),
+                ),
+              );
+              if (picked != null && mounted) {
+                setState(() => _appScope = picked);
+                _runQuery(_searchCtl.text);
+              }
+            }),
+            _drawerItem(Icons.analytics_outlined, '空间分析',
+                subtitle: '按大小可视化', onTap: () {
+              Navigator.pop(context);
+              Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (_) => AppsPage(rootAvailable: _root),
-                  ),
-                );
-                if (picked != null && mounted) {
-                  setState(() => _appScope = picked);
-                  _runQuery(_searchCtl.text);
-                }
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.refresh),
-              title: const Text('重建索引'),
-              onTap: () {
-                Navigator.pop(context);
-                _rescan();
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.analytics_outlined),
-              title: const Text('空间分析'),
-              subtitle: Text('按大小可视化', style: theme.textTheme.bodySmall),
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                        builder: (_) => StorageAnalysisPage(
-                            initialPath: _currentDir)));
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.settings_outlined),
-              title: const Text('设置'),
-              onTap: () async {
-                Navigator.pop(context);
-                final changed = await Navigator.push<bool>(
-                  context,
-                  MaterialPageRoute(builder: (_) => const SettingsPage()),
-                );
-                if (changed == true) {
-                  await _loadPrefs();
-                  if (mounted &&
-                      await _api.needsRescan(
-                        rootIndex: _rootIndex,
-                        systemIndex: _systemIndex,
-                        deepData: _deepData,
-                      )) {
-                    _rescan();
-                  }
-                }
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.tips_and_updates_outlined),
-              title: const Text('使用提示与已知限制'),
-              subtitle: Text(
-                '访问分层 · 实时性边界 · 操作风险',
-                style: theme.textTheme.bodySmall,
-              ),
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (_) => const TipsPage()),
-                );
-              },
-            ),
+                      builder: (_) => StorageAnalysisPage(
+                          initialPath: _currentDir)));
+            }),
+            _drawerItem(Icons.find_in_page_outlined, '大文件查重',
+                subtitle: '找出重复占用', onTap: () {
+              Navigator.pop(context);
+              Navigator.push(
+                  context, MaterialPageRoute(builder: (_) => const DupePage()));
+            }),
+            _drawerItem(Icons.android_outlined, 'APK 管理', subtitle: '清理旧版安装包',
+                onTap: () {
+              Navigator.pop(context);
+              Navigator.push(
+                  context, MaterialPageRoute(builder: (_) => const ApkPage()));
+            }),
             const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.info_outline),
-              title: const Text('关于'),
-              onTap: () => showAboutDialog(
+            _drawerItem(Icons.refresh, '重建索引', onTap: () {
+              Navigator.pop(context);
+              _rescan();
+            }),
+            _drawerItem(Icons.settings_outlined, '设置', onTap: () async {
+              Navigator.pop(context);
+              final changed = await Navigator.push<bool>(
+                context,
+                MaterialPageRoute(builder: (_) => const SettingsPage()),
+              );
+              if (changed == true) {
+                await _loadPrefs();
+                if (mounted &&
+                    await _api.needsRescan(
+                      rootIndex: _rootIndex,
+                      systemIndex: _systemIndex,
+                      deepData: _deepData,
+                    )) {
+                  _rescan();
+                }
+              }
+            }),
+            _drawerItem(Icons.tips_and_updates_outlined, '使用提示与已知限制',
+                onTap: () {
+              Navigator.pop(context);
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const TipsPage()),
+              );
+            }),
+            _drawerItem(Icons.info_outline, '关于', onTap: () {
+              Navigator.pop(context);
+              showAboutDialog(
                 context: context,
                 applicationName: 'ViewFile',
-                applicationVersion: '0.2.0 (M2)',
+                applicationVersion: '0.3.0 (M5)',
                 applicationLegalese: 'Android 上的 Everything：即时文件搜索 + 文件管理',
-              ),
-            ),
+              );
+            }),
           ],
         ),
       ),
+    );
+  }
+
+  String get _tierName => switch (_tier) {
+        'ROOT' => 'root',
+        'SHIZUKU' => 'Shizuku',
+        _ => '免root',
+      };
+
+  /// 紧凑抽屉项：小字号、小图标、弱化副标题
+  Widget _drawerItem(IconData icon, String title,
+      {String? subtitle, VoidCallback? onTap}) {
+    final theme = Theme.of(context);
+    return ListTile(
+      dense: true,
+      visualDensity: VisualDensity.compact,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+      minLeadingWidth: 24,
+      leading: Icon(icon, size: 20, color: theme.colorScheme.onSurfaceVariant),
+      title: Text(title, style: const TextStyle(fontSize: 13.5)),
+      subtitle: subtitle == null
+          ? null
+          : Text(subtitle,
+              style: TextStyle(
+                  fontSize: 10.5, color: theme.colorScheme.outline)),
+      onTap: onTap,
     );
   }
 
@@ -2155,6 +2195,89 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 否则返回时焦点自动还给搜索框、键盘会再次弹起）
   void _unfocus() => FocusManager.instance.primaryFocus?.unfocus();
 
+  /// 搜索结果名高亮：命中关键词加底色（语法 token 不参与）
+  List<InlineSpan> _nameSpans(String name) {
+    final spans = <InlineSpan>[TextSpan(text: name)];
+    final q = _searchCtl.text.trim().toLowerCase();
+    if (q.isEmpty) return spans;
+    final tokens = q
+        .split(RegExp(r'\s+'))
+        .where((t) => t.isNotEmpty && _isNameToken(t))
+        .toList();
+    if (tokens.isEmpty) return spans;
+    final lower = name.toLowerCase();
+    final ranges = <(int, int)>[];
+    for (final t in tokens) {
+      var from = 0;
+      while (true) {
+        final i = lower.indexOf(t, from);
+        if (i < 0) break;
+        ranges.add((i, i + t.length));
+        from = i + t.length;
+      }
+    }
+    if (ranges.isEmpty) return spans;
+    ranges.sort((a, b) => a.$1.compareTo(b.$1));
+    final merged = <(int, int)>[ranges.first];
+    for (final r in ranges.skip(1)) {
+      if (r.$1 <= merged.last.$2) {
+        merged[merged.length - 1] =
+            (merged.last.$1, r.$2 > merged.last.$2 ? r.$2 : merged.last.$2);
+      } else {
+        merged.add(r);
+      }
+    }
+    final hl =
+        Theme.of(context).colorScheme.primary.withValues(alpha: 0.28);
+    final out = <InlineSpan>[];
+    var pos = 0;
+    for (final (s, e) in merged) {
+      if (s > pos) out.add(TextSpan(text: name.substring(pos, s)));
+      out.add(TextSpan(
+        text: name.substring(s, e),
+        style: TextStyle(backgroundColor: hl, fontWeight: FontWeight.w600),
+      ));
+      pos = e;
+    }
+    if (pos < name.length) out.add(TextSpan(text: name.substring(pos)));
+    return out;
+  }
+
+  /// 与引擎 SearchQueryParser 对齐的简化判定：是否为名称关键词
+  static bool _isNameToken(String t) {
+    if (RegExp(r'^[<>]=?\d+(\.\d+)?(b|kb|mb|gb)$', caseSensitive: false)
+        .hasMatch(t)) {
+      return false;
+    }
+    if (RegExp(r'^\d+(\.\d+)?(b|kb|mb|gb)\.\.\d+(\.\d+)?(b|kb|mb|gb)$',
+            caseSensitive: false)
+        .hasMatch(t)) {
+      return false;
+    }
+    if (RegExp(r'^[<>]=?\d{4}(-\d{2})?(-\d{2})?$').hasMatch(t)) return false;
+    if (const {
+      'today', 'yesterday', 'thisweek', 'thismonth', 'thisyear'
+    }.contains(t.toLowerCase())) {
+      return false;
+    }
+    return true;
+  }
+
+  /// 把搜索范围限定到某文件夹并重跑（结果内路径过滤）
+  void _scopeToFolder(String dir) {
+    if (dir.isEmpty) return;
+    setState(() {
+      _scopeMode = 0;
+      _currentDir = dir;
+      _appScope = null;
+    });
+    _runQuery(_searchCtl.text);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('已限定在 ${dir.substring(dir.lastIndexOf('/') + 1)} 内搜索'),
+      duration: const Duration(seconds: 1),
+    ));
+  }
+
   Widget _tile(Map<dynamic, dynamic> e, {required bool browsing}) {
     final theme = Theme.of(context);
     final isDir = e['isDir'] == true;
@@ -2199,7 +2322,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               height: 42,
               child: Center(child: Icon(icon, color: color)),
             ),
-      title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+      title: Text.rich(
+        TextSpan(children: browsing ? null : _nameSpans(name), text: browsing ? name : null),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
       subtitle: browsing
           ? Text(
               fmtDate(((e['mtime'] as num?)?.toInt() ?? 0)),
@@ -2207,8 +2334,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               overflow: TextOverflow.ellipsis,
               style: compactPath,
             )
-          : Text(path, maxLines: 1, overflow: TextOverflow.ellipsis,
-              style: compactPath),
+          : GestureDetector(
+              // 点路径：把搜索范围限定到该文件所在文件夹（Everything 式逐层收敛）
+              onTap: () => _scopeToFolder(
+                  path.substring(0, path.lastIndexOf('/'))),
+              child: Row(
+                children: [
+                  Flexible(
+                    child: Text(path,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: compactPath),
+                  ),
+                  Icon(Icons.filter_alt,
+                      size: 11, color: theme.colorScheme.outline),
+                ],
+              ),
+            ),
       trailing: _selecting
           ? null
           : isDir
@@ -2259,10 +2401,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  void _showDetail(Map<dynamic, dynamic> e) {
+  Future<void> _showDetail(Map<dynamic, dynamic> e) async {
     final isDir = e['isDir'] == true;
     final path = e['path'] as String? ?? '';
     final name = e['name'] as String? ?? '';
+    final bookmarked = path.isNotEmpty && await Bookmarks.contains(path);
+    if (!mounted) return;
     final (label, icon, color) = describe(
       name,
       isDir,
@@ -2344,6 +2488,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                           _results = const [];
                         });
                         _loadDir(path);
+                      },
+                    ),
+                  if (!isDir && path.isNotEmpty)
+                    _detailAction(
+                      Icons.filter_alt,
+                      '在此文件夹内搜索',
+                      () {
+                        Navigator.pop(context);
+                        _scopeToFolder(
+                            path.substring(0, path.lastIndexOf('/')));
+                      },
+                    ),
+                  if (path.isNotEmpty)
+                    _detailAction(
+                      bookmarked ? Icons.bookmark : Icons.bookmark_border,
+                      bookmarked ? '已收藏' : '收藏',
+                      () async {
+                        Navigator.pop(context);
+                        final added = await Bookmarks.toggle(path);
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                            content: Text(added ? '已加入书签' : '已移出书签'),
+                            duration: const Duration(seconds: 1),
+                          ));
+                        }
                       },
                     ),
                   if (isZip)
