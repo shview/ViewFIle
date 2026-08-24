@@ -1498,7 +1498,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Flexible(child: Text(title, overflow: TextOverflow.ellipsis)),
+            Flexible(
+              child: Text(title,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 16)),
+            ),
             if (!_isSearching && _appScope == null) ...[
               const SizedBox(width: 4),
               Icon(Icons.edit, size: 13, color: Theme.of(context).hintColor),

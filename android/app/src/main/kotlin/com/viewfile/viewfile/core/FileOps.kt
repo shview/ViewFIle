@@ -112,22 +112,32 @@ object FileOps {
         return mapOf("ok" to false, "error" to "无权限读取该文件")
     }
 
-    /** APK 元信息：PackageManager.getPackageArchiveInfo 读真实包名/版本（只读 APK 头，快） */
+    /** APK 元信息：PackageManager 优先；返回 null（部分 ROM 对 FUSE 路径异常）
+     *  时用自写 AXML 解析器直读 AndroidManifest.xml（只要文件可读必成） */
     fun apkMeta(
         context: Context,
         paths: List<String>,
     ): List<Map<String, Any?>> {
         val out = paths.map { p ->
-            val pi = try {
+            val pm = try {
                 context.packageManager.getPackageArchiveInfo(p, 0)
             } catch (_: Throwable) {
                 null
             }
-            mapOf(
-                "path" to p,
-                "pkg" to pi?.packageName,
-                "ver" to pi?.versionName,
-            )
+            if (pm != null) {
+                mapOf(
+                    "path" to p,
+                    "pkg" to pm.packageName,
+                    "ver" to pm.versionName,
+                )
+            } else {
+                val axml = ApkManifest.parse(p)
+                mapOf(
+                    "path" to p,
+                    "pkg" to axml?.pkg,
+                    "ver" to axml?.versionName,
+                )
+            }
         }
         val ok = out.count { it["pkg"] != null }
         Log.i(TAG, "apkMeta: ${paths.size} apks, $ok parsed, " +
