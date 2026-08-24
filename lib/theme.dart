@@ -28,13 +28,13 @@ class AppTheme {
         colorSchemeSeed: Color(seedValue),
         brightness: Brightness.light,
         useMaterial3: true,
-      );
+      )._withThemedSnack();
 
   static ThemeData get dark => ThemeData(
         colorSchemeSeed: Color(seedValue),
         brightness: Brightness.dark,
         useMaterial3: true,
-      );
+      )._withThemedSnack();
 
   static Future<void> load() async {
     final p = await SharedPreferences.getInstance();
@@ -53,4 +53,16 @@ class AppTheme {
     (await SharedPreferences.getInstance()).setInt('themeMode', v);
     changes.value++;
   }
+}
+
+extension _SnackTheme on ThemeData {
+  /// 提示条跟随主题色（默认的 inverseSurface 在部分设备上呈刺眼白条）
+  ThemeData _withThemedSnack() => copyWith(
+        snackBarTheme: SnackBarThemeData(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: colorScheme.primary,
+          contentTextStyle: TextStyle(color: colorScheme.onPrimary),
+          actionTextColor: colorScheme.onPrimary,
+        ),
+      );
 }

@@ -225,6 +225,12 @@ class MainActivity : FlutterActivity() {
                             FileOps.hashHead(path)
                         }
                     }
+                    "apkMeta" -> {
+                        val paths = call.argument<List<String>>("paths") ?: emptyList()
+                        Engine.ioAsync({ m -> main.post { result.success(m) } }) {
+                            mapOf("ok" to true, "items" to FileOps.apkMeta(this@MainActivity, paths))
+                        }
+                    }
                     "vacuum" -> {
                         val pageSize = call.argument<Int>("pageSize")
                         Engine.vacuumAsync(pageSize) { m ->

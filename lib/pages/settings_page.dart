@@ -18,6 +18,7 @@ class _SettingsPageState extends State<SettingsPage>
   bool _systemIndex = false;
   bool _deepData = false;
   bool _compactDb = false;
+  int _pathLines = 3;
   bool _vacuuming = false;
   int _dbBytes = 0;
   bool _rootGranted = false;
@@ -41,6 +42,7 @@ class _SettingsPageState extends State<SettingsPage>
         _deepData = p.getBool('deepDataIndex') ?? false;
 
         _compactDb = p.getBool('compactDb') ?? false;
+        _pathLines = p.getInt('pathLines') ?? 3;
       });
     });
     _api.stats().then((s) {
@@ -222,6 +224,26 @@ class _SettingsPageState extends State<SettingsPage>
                 selected: {AppTheme.modeValue},
                 showSelectedIcon: false,
                 onSelectionChanged: (s) => AppTheme.setMode(s.first),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.subtitles_outlined),
+              title: const Text('搜索结果路径行数'),
+              subtitle: const Text('长路径换行显示；自适应完整展开（行高不一）'),
+              trailing: SegmentedButton<int>(
+                segments: const [
+                  ButtonSegment(value: 1, label: Text('1')),
+                  ButtonSegment(value: 2, label: Text('2')),
+                  ButtonSegment(value: 3, label: Text('3')),
+                  ButtonSegment(value: 0, label: Text('自适应')),
+                ],
+                selected: {_pathLines},
+                showSelectedIcon: false,
+                onSelectionChanged: (s) async {
+                  setState(() => _pathLines = s.first);
+                  final p = await SharedPreferences.getInstance();
+                  await p.setInt('pathLines', s.first);
+                },
               ),
             ),
             const _SectionHeader('搜索'),

@@ -147,6 +147,15 @@ class EngineApi {
         await _m.invokeMethod('hashFile', {'path': path}),
       );
 
+  /// APK 元信息：[{path, pkg, ver}]（真包名，读 APK 头）
+  Future<List<Map<dynamic, dynamic>>> apkMeta(List<String> paths) async {
+    final r = Map<String, dynamic>.from(
+      await _m.invokeMethod('apkMeta', {'paths': paths}),
+    );
+    final items = r['items'] as List<dynamic>? ?? const [];
+    return items.map((e) => Map<dynamic, dynamic>.from(e as Map)).toList();
+  }
+
   /// 头部指纹：前 1MB 的 MD5（查重快速比对）
   Future<Map<String, dynamic>> hashHead(String path) async =>
       Map<String, dynamic>.from(

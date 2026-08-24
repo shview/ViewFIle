@@ -74,6 +74,7 @@ class _SearchPageState extends State<SearchPage> {
   final _dateTo = TextEditingController();
   bool _showHidden = false;
   bool _cfgExpanded = false;
+  int _pathLines = 3; // 路径显示行数：1/2/3，0=自适应完整展开
 
   String _sortKey = 'name';
   bool _sortDesc = false;
@@ -141,6 +142,7 @@ class _SearchPageState extends State<SearchPage> {
       _dateFrom.text = p.getString('searchDateFrom') ?? '';
       _dateTo.text = p.getString('searchDateTo') ?? '';
       _showHidden = p.getBool('showHidden') ?? false;
+      _pathLines = p.getInt('pathLines') ?? 3;
       _sortKey = p.getString('sortKey') ?? 'name';
       _sortDesc = p.getBool('sortDesc') ?? false;
     });
@@ -824,6 +826,13 @@ class _SearchPageState extends State<SearchPage> {
   int get _totalShown =>
       _sessId >= 0 ? _sessTotal : _localResults.length;
 
+  double? get _itemExtent => switch (_pathLines) {
+        1 => 60.0,
+        2 => 74.0,
+        3 => 88.0,
+        _ => null, // 自适应：完整展开，块高不一
+      };
+
   Future<void> _pickSort() async {
     final v = await showDialog<String>(
       context: context,
@@ -941,13 +950,15 @@ class _SearchPageState extends State<SearchPage> {
               ),
             ),
             const SizedBox(height: 8),
-            // 大小
+            // 大小（独立一行，防时间输入挤溢出）
             Row(
               children: [
-                Text('大小', style: theme.textTheme.labelSmall),
-                const SizedBox(width: 8),
                 SizedBox(
-                  width: 72,
+                  width: 42,
+                  child: Text('大小', style: theme.textTheme.labelSmall),
+                ),
+                SizedBox(
+                  width: 76,
                   child: TextField(
                     controller: _sizeMin,
                     keyboardType: TextInputType.number,
@@ -959,7 +970,7 @@ class _SearchPageState extends State<SearchPage> {
                 ),
                 const Text(' — '),
                 SizedBox(
-                  width: 72,
+                  width: 76,
                   child: TextField(
                     controller: _sizeMax,
                     keyboardType: TextInputType.number,
@@ -971,11 +982,17 @@ class _SearchPageState extends State<SearchPage> {
                 ),
                 const SizedBox(width: 6),
                 Text('MB', style: theme.textTheme.labelSmall),
-                const Spacer(),
-                Text('修改时间', style: theme.textTheme.labelSmall),
-                const SizedBox(width: 8),
+              ],
+            ),
+            const SizedBox(height: 6),
+            // 修改时间起止（独立一行，Expanded 自适应）
+            Row(
+              children: [
                 SizedBox(
-                  width: 100,
+                  width: 42,
+                  child: Text('时间', style: theme.textTheme.labelSmall),
+                ),
+                Expanded(
                   child: TextField(
                     controller: _dateFrom,
                     keyboardType: TextInputType.datetime,
@@ -989,9 +1006,11 @@ class _SearchPageState extends State<SearchPage> {
                     },
                   ),
                 ),
-                const Text(' — '),
-                SizedBox(
-                  width: 100,
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 4),
+                  child: Text('—'),
+                ),
+                Expanded(
                   child: TextField(
                     controller: _dateTo,
                     keyboardType: TextInputType.datetime,
@@ -1134,7 +1153,7 @@ class _SearchPageState extends State<SearchPage> {
       }
       return ListView.builder(
         itemCount: _localResults.length,
-        itemExtent: 60,
+        itemExtent: _itemExtent,
         itemBuilder: (context, i) => _tile(theme, _localResults[i]),
       );
     }
@@ -1144,7 +1163,7 @@ class _SearchPageState extends State<SearchPage> {
     }
     return ListView.builder(
       itemCount: _sessTotal,
-      itemExtent: 60,
+      itemExtent: _itemExtent,
       itemBuilder: (context, i) {
         final row = _lazyRowAt(i);
         if (row == null) return _skeleton(theme);
@@ -1190,6 +1209,14 @@ class _SearchPageState extends State<SearchPage> {
     final compact = TextStyle(
         fontSize: 11, height: 1.15, color: theme.colorScheme.outline);
     final sel = _selecting && _selected.contains(path);
+    // 路径行数：1/2/3 固定行高等高；0=自适应（完整展开，块高不一）
+    final maxLines = _pathLines == 0 ? null : _pathLines;
+    final pathText = Text(
+      path,
+      maxLines: maxLines,
+      overflow: maxLines == null ? TextOverflow.visible : TextOverflow.ellipsis,
+      style: compact,
+    );
     return ListTile(
       dense: true,
       selectedTileColor: theme.colorScheme.primary.withValues(alpha: 0.25),
@@ -1219,29 +1246,23 @@ class _SearchPageState extends State<SearchPage> {
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
+      // 多选时也保留路径与大小（路径点击收敛仅在非多选生效）
       subtitle: _selecting
-          ? null
+          ? pathText
           : GestureDetector(
               onTap: () => _scopeTo(path.substring(0, path.lastIndexOf('/'))),
               child: Row(
                 children: [
-                  Flexible(
-                    child: Text(path,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: compact),
-                  ),
+                  Flexible(child: pathText),
                   Icon(Icons.filter_alt,
                       size: 11, color: theme.colorScheme.outline),
                 ],
               ),
             ),
-      trailing: _selecting
-          ? null
-          : Text(
-              isDir ? '' : fmtSize(((e['size'] as num?)?.toInt() ?? 0)),
-              style: theme.textTheme.bodySmall?.copyWith(fontSize: 11),
-            ),
+      trailing: Text(
+        isDir ? '' : fmtSize(((e['size'] as num?)?.toInt() ?? 0)),
+        style: theme.textTheme.bodySmall?.copyWith(fontSize: 11),
+      ),
       onTap: () {
         if (_selecting) {
           _toggleSel(path);

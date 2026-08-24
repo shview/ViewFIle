@@ -142,7 +142,6 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
       _lines = binary ? const [] : _splitLines(text);
       _matches = const [];
       _currentMatch = -1;
-      _hOffset = 0;
       if (!binary) {
         var longest = '';
         for (final l in _lines) {
@@ -378,61 +377,60 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
     _matchKeys.clear();
     final matchLines = <int>{for (final m in _matches) m.$1};
 
-    // 整文档联动的横向滑动：内容整体 Transform 平移 + 横向拖拽。
-    // （每行各自 ScrollView 会各行各滑；共用 controller 在多 position 下行为不定）
-    final vw = MediaQuery.sizeOf(context).width;
-    final hMax = math.max(0.0, _maxLineWidth + 24 - vw);
-    if (_hOffset > hMax) _hOffset = hMax;
+    // 整文档联动的横向滑动：外层横向滚动（宽度=最长行）包住纵向列表。
+    // 之前 Transform 平移方案超出视口的字形不参与布局，划过去是空白。
+    final contentW =
+        math.max(MediaQuery.sizeOf(context).width, _maxLineWidth + 24);
 
     return SelectionArea(
-      child: GestureDetector(
-        behavior: HitTestBehavior.deferToChild,
-        onHorizontalDragUpdate: hMax <= 0
-            ? null
-            : (d) => setState(() {
-                  _hOffset = (_hOffset - d.delta.dx).clamp(0.0, hMax);
-                }),
-        child: ListView.builder(
-          controller: _scrollCtl,
-          itemCount: _lines.length,
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          itemBuilder: (context, i) {
-            if (matchLines.contains(i)) {
-              final key = _matchKeys.putIfAbsent(i, () => GlobalKey());
-              final ms = [
-                for (final m in _matches)
-                  if (m.$1 == i) m,
-              ];
-              final spans = <InlineSpan>[];
-              var pos = 0;
-              for (final (li, s, e) in ms) {
-                if (s > pos) {
-                  spans.add(TextSpan(text: _lines[i].substring(pos, s)));
+      child: LayoutBuilder(
+        builder: (context, constraints) => SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: SizedBox(
+            width: contentW,
+            height: constraints.maxHeight,
+            child: ListView.builder(
+              controller: _scrollCtl,
+              itemCount: _lines.length,
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              itemBuilder: (context, i) {
+                if (matchLines.contains(i)) {
+                  final key = _matchKeys.putIfAbsent(i, () => GlobalKey());
+                  final ms = [
+                    for (final m in _matches)
+                      if (m.$1 == i) m,
+                  ];
+                  final spans = <InlineSpan>[];
+                  var pos = 0;
+                  for (final (li, s, e) in ms) {
+                    if (s > pos) {
+                      spans.add(TextSpan(text: _lines[i].substring(pos, s)));
+                    }
+                    final isCurrent = _matches[_currentMatch] == (li, s, e);
+                    spans.add(TextSpan(
+                      text: _lines[i].substring(s, e),
+                      style: TextStyle(
+                        backgroundColor: isCurrent
+                            ? theme.colorScheme.primary.withValues(alpha: 0.55)
+                            : theme.colorScheme.tertiaryContainer,
+                      ),
+                    ));
+                    pos = e;
+                  }
+                  if (pos < _lines[i].length) {
+                    spans.add(TextSpan(text: _lines[i].substring(pos)));
+                  }
+                  return _lineWidget(i, spans, key: key);
                 }
-                final isCurrent = _matches[_currentMatch] == (li, s, e);
-                spans.add(TextSpan(
-                  text: _lines[i].substring(s, e),
-                  style: TextStyle(
-                    backgroundColor: isCurrent
-                        ? theme.colorScheme.primary.withValues(alpha: 0.55)
-                        : theme.colorScheme.tertiaryContainer,
-                  ),
-                ));
-                pos = e;
-              }
-              if (pos < _lines[i].length) {
-                spans.add(TextSpan(text: _lines[i].substring(pos)));
-              }
-              return _lineWidget(i, spans, key: key);
-            }
-            return _lineWidget(i, null);
-          },
+                return _lineWidget(i, null);
+              },
+            ),
+          ),
         ),
       ),
     );
   }
 
-  double _hOffset = 0;
   double _maxLineWidth = 0;
 
   Widget _lineWidget(int i, List<InlineSpan>? spans, {Key? key}) {
@@ -443,12 +441,9 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
     return SizedBox(
       key: key,
       height: 18,
-      child: Transform.translate(
-        offset: Offset(-_hOffset, 0),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: text,
-        ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        child: text,
       ),
     );
   }

@@ -112,6 +112,23 @@ object FileOps {
         return mapOf("ok" to false, "error" to "无权限读取该文件")
     }
 
+    /** APK 元信息：PackageManager.getPackageArchiveInfo 读真实包名/版本（只读 APK 头，快） */
+    fun apkMeta(
+        context: Context,
+        paths: List<String>,
+    ): List<Map<String, Any?>> = paths.map { p ->
+        val pi = try {
+            context.packageManager.getPackageArchiveInfo(p, 0)
+        } catch (_: Throwable) {
+            null
+        }
+        mapOf(
+            "path" to p,
+            "pkg" to pi?.packageName,
+            "ver" to pi?.versionName,
+        )
+    }
+
     /** 头部指纹：前 bytes 字节的 MD5（查重快速比对用，比全文件哈希快几个量级） */
     fun hashHead(path: String, bytes: Int = 1 shl 20): Map<String, Any?> {
         val f = File(path)

@@ -24,6 +24,8 @@ class _DestPickerPageState extends State<DestPickerPage> {
   List<Map<dynamic, dynamic>> _dirs = [];
   bool _loading = true;
   String? _error;
+  String _sortKey = 'name';
+  bool _sortDesc = false;
 
   @override
   void initState() {
@@ -45,11 +47,74 @@ class _DestPickerPageState extends State<DestPickerPage> {
         _dirs = List<Map<dynamic, dynamic>>.from(r['entries'] ?? const [])
             .where((e) => e['isDir'] == true)
             .toList();
+        _sortDirs();
       } else {
         _dirs = [];
         _error = r['error'] as String?;
       }
     });
+  }
+
+  void _sortDirs() {
+    int cmp(Map a, Map b) {
+      switch (_sortKey) {
+        case 'size':
+          return ((a['dirSize'] as num?)?.toInt() ?? 0)
+              .compareTo((b['dirSize'] as num?)?.toInt() ?? 0);
+        case 'time':
+          return ((a['mtime'] as num?)?.toInt() ?? 0)
+              .compareTo((b['mtime'] as num?)?.toInt() ?? 0);
+        default:
+          return (a['name'] as String? ?? '')
+              .toLowerCase()
+              .compareTo((b['name'] as String? ?? '').toLowerCase());
+      }
+    }
+
+    _dirs.sort((a, b) {
+      final c = cmp(a, b);
+      return _sortDesc ? -c : c;
+    });
+  }
+
+  Future<void> _pickSort() async {
+    final v = await showDialog<String>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('排序'),
+        children: [
+          for (final (k, label) in const [
+            ('name', '名称'),
+            ('size', '大小'),
+            ('time', '修改时间'),
+          ])
+            RadioListTile<String>(
+              value: k,
+              groupValue: _sortKey,
+              title: Text(label),
+              dense: true,
+              onChanged: (v) => Navigator.pop(context, v),
+            ),
+          RadioListTile<String>(
+            value: 'desc',
+            groupValue: _sortDesc ? 'desc' : 'asc',
+            title: Text(_sortDesc ? '当前：降序' : '当前：升序'),
+            subtitle: const Text('点击切换'),
+            dense: true,
+            onChanged: (v) => Navigator.pop(context, 'desc'),
+          ),
+        ],
+      ),
+    );
+    if (v == null) return;
+    setState(() {
+      if (v == 'desc') {
+        _sortDesc = !_sortDesc;
+      } else {
+        _sortKey = v;
+      }
+    });
+    _sortDirs();
   }
 
   void _navigateUp() {
@@ -102,6 +167,11 @@ class _DestPickerPageState extends State<DestPickerPage> {
         appBar: AppBar(
           title: Text(widget.title),
           actions: [
+            IconButton(
+              tooltip: '排序',
+              onPressed: _pickSort,
+              icon: const Icon(Icons.sort),
+            ),
             IconButton(
               tooltip: '上一级',
               onPressed: _currentDir == '/storage/emulated/0' ? null : _navigateUp,
