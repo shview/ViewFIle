@@ -1,6 +1,9 @@
+import 'dart:convert' show base64Decode, utf8;
 import 'dart:io' as io;
 import 'dart:math' as math;
+import 'dart:typed_data' show Uint8List;
 
+import 'package:charset_converter/charset_converter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -54,9 +57,9 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
   static const _maxBytes = 4 << 20;
 
   Future<void> _load() async {
-    String? text;
+    // 读取原始字节（本地直读优先，失败走引擎 root 通道），编码检测与解码统一在本端
+    Uint8List? raw;
     var truncated = false;
-    // 先本地直读（快），失败再走引擎（root 区域特权读取）
     try {
       final f = io.File(widget.path);
       if (await f.exists()) {
@@ -64,41 +67,83 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
         try {
           final len = await raf.length();
           final n = len > _maxBytes ? _maxBytes : len;
-          final bytes = await raf.read(n);
-          text = String.fromCharCodes(bytes);
+          raw = await raf.read(n);
           truncated = len > n;
         } finally {
           await raf.close();
         }
       }
     } catch (_) {
-      text = null;
+      raw = null;
     }
-    if (text == null) {
-      // 本地读不到：走引擎（root 区域特权读取）
-      final (engText, engTruncated) = await _readViaEngine();
-      text = engText;
-      truncated = engTruncated;
-    }
+    raw ??= await _readViaEngine();
     if (!mounted) return;
-    if (text == null) {
+    if (raw == null) {
       setState(() {
         _loading = false;
         _error = '无法读取文件（无权限或文件不存在）';
       });
       return;
     }
-    // 简单二进制检测：前 8KB 内含 NUL
+    _raw = raw;
+    _truncatedRaw = truncated;
+    // 自动检测：严格 UTF-8 → GBK → Big5，失败则容错 UTF-8
+    _enc = await _detectEnc(raw);
+    await _applyEnc(_enc);
+  }
+
+  Uint8List? _raw;
+  bool _truncatedRaw = false;
+  String _enc = 'UTF-8';
+
+  static const _encList = ['UTF-8', 'GBK', 'Big5', 'UTF-16LE', 'Shift_JIS'];
+
+  Future<String> _detectEnc(Uint8List raw) async {
+    try {
+      utf8.decode(raw, allowMalformed: false);
+      return 'UTF-8';
+    } catch (_) {}
+    for (final enc in const ['GBK', 'Big5']) {
+      try {
+        final s = await CharsetConverter.decode(enc, raw);
+        if (!s.contains('�')) return enc;
+      } catch (_) {}
+    }
+    return 'UTF-8'; // 容错解码（乱码可手切）
+  }
+
+  /// 用指定编码解码并刷新视图（预览即所见）
+  Future<void> _applyEnc(String enc) async {
+    final raw = _raw;
+    if (raw == null) return;
+    String text;
+    if (enc == 'UTF-8') {
+      text = utf8.decode(raw, allowMalformed: true);
+    } else {
+      try {
+        text = await CharsetConverter.decode(enc, raw);
+      } catch (_) {
+        if (mounted) {
+          setState(() => _error = '以 $enc 解码失败');
+        }
+        return;
+      }
+    }
+    if (!mounted) return;
     final probe = text.length > 8192 ? text.substring(0, 8192) : text;
     final binary = probe.contains('\u0000');
     setState(() {
       _loading = false;
+      _error = null;
+      _enc = enc;
       _binary = binary;
-      _truncated = truncated && !binary;
-      _text = binary ? '' : text!;
-      _lines = binary ? const [] : _splitLines(text!);
+      _truncated = _truncatedRaw && !binary;
+      _text = binary ? '' : text;
+      _lines = binary ? const [] : _splitLines(text);
+      _matches = const [];
+      _currentMatch = -1;
+      _hOffset = 0;
       if (!binary) {
-        // 最长行宽度（横向滑动上限）：只测最长的那一行
         var longest = '';
         for (final l in _lines) {
           if (l.length > longest.length) longest = l;
@@ -108,19 +153,18 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
           textDirection: TextDirection.ltr,
         )..layout();
         _maxLineWidth = tp.width;
-        _hOffset = 0;
       }
     });
   }
 
-  Future<(String?, bool)> _readViaEngine() async {
+  Future<Uint8List?> _readViaEngine() async {
     try {
       final r = await _api.readText(widget.path);
-      if (r['ok'] == true) {
-        return (r['text'] as String?, r['truncated'] == true);
+      if (r['ok'] == true && r['b64'] is String) {
+        return base64Decode(r['b64'] as String);
       }
     } catch (_) {}
-    return (null, false);
+    return null;
   }
 
   static List<String> _splitLines(String text) {
@@ -188,6 +232,55 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
       appBar: AppBar(
         title: Text(_name, overflow: TextOverflow.ellipsis),
         actions: [
+          // 编码切换（所见即所得预览）
+          PopupMenuButton<String>(
+            tooltip: '文本编码',
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: Center(
+                child: Text(
+                  _enc,
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ),
+            ),
+            onSelected: (enc) {
+              if (enc == 'AUTO') {
+                if (_raw != null) {
+                  _detectEnc(_raw!).then(_applyEnc);
+                }
+              } else {
+                _applyEnc(enc);
+              }
+            },
+            itemBuilder: (_) => [
+              for (final e in _encList)
+                PopupMenuItem(
+                  value: e,
+                  child: Row(
+                    children: [
+                      if (e == _enc)
+                        const Icon(Icons.check, size: 16)
+                      else
+                        const SizedBox(width: 16),
+                      const SizedBox(width: 8),
+                      Text(e),
+                    ],
+                  ),
+                ),
+              const PopupMenuDivider(),
+              const PopupMenuItem(
+                value: 'AUTO',
+                child: Row(
+                  children: [
+                    SizedBox(width: 16),
+                    SizedBox(width: 8),
+                    Text('重新自动检测'),
+                  ],
+                ),
+              ),
+            ],
+          ),
           IconButton(
             tooltip: '文内搜索',
             icon: const Icon(Icons.search),

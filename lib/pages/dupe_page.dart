@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 
 import '../api/engine_api.dart';
 import '../utils/format.dart';
-import 'trash_page.dart' show TrashStore;
 
 /// 大文件查重：大小过滤（用户输入阈值）→ 按大小分组 → 头 1MB MD5 二次分组
 class DupePage extends StatefulWidget {
@@ -126,7 +125,7 @@ class _DupePageState extends State<DupePage> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('删除重复文件？'),
-        content: Text('选中的 $n 项将移入回收站。'),
+        content: Text('选中的 $n 项将被永久删除，不可恢复。'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(context, false),
@@ -139,11 +138,11 @@ class _DupePageState extends State<DupePage> {
     );
     if (ok != true) return;
     setState(() => _phase = 'hash');
-    await TrashStore.put(_selected.toList());
+    final r = await EngineApi().delete(_selected.toList());
     if (mounted) {
       setState(() => _phase = null);
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('已移入回收站 $n 项')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(r['ok'] == true ? '已删除 $n 项' : '部分删除失败')));
       _start(); // 重新扫描
     }
   }
@@ -156,9 +155,51 @@ class _DupePageState extends State<DupePage> {
       appBar: AppBar(
         title: const Text('大文件查重'),
         actions: [
+          PopupMenuButton<String>(
+            tooltip: '批量选择',
+            icon: const Icon(Icons.checklist),
+            onSelected: (v) => setState(() {
+              switch (v) {
+                case 'all':
+                  for (final g in _groups) {
+                    for (final f in g.files) {
+                      _selected.add(f['path'] as String);
+                    }
+                  }
+                case 'none':
+                  _selected.clear();
+                case 'invert':
+                  final all = <String>{
+                    for (final g in _groups)
+                      for (final f in g.files) f['path'] as String,
+                  };
+                  final next = all.difference(_selected);
+                  _selected
+                    ..clear()
+                    ..addAll(next);
+                case 'old':
+                  // 选中每组较早的重复，保留最新一份
+                  for (final g in _groups) {
+                    if (g.files.length < 2) continue;
+                    final sorted = [...g.files]..sort((a, b) =>
+                        ((a['mtime'] as num?)?.toInt() ?? 0).compareTo(
+                            (b['mtime'] as num?)?.toInt() ?? 0));
+                    for (final f in sorted.take(sorted.length - 1)) {
+                      _selected.add(f['path'] as String);
+                    }
+                  }
+              }
+            }),
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'all', child: Text('全选所有重复文件')),
+              PopupMenuItem(value: 'none', child: Text('全不选')),
+              PopupMenuItem(value: 'invert', child: Text('反选')),
+              PopupMenuItem(value: 'old', child: Text('选中所有旧版本（每组保留最新）')),
+            ],
+          ),
           if (_selected.isNotEmpty)
             IconButton(
-              tooltip: '删除到回收站',
+              tooltip: '删除所选',
               icon: Icon(Icons.delete, color: theme.colorScheme.error),
               onPressed: busy ? null : _deleteSelected,
             ),
@@ -233,8 +274,28 @@ class _DupePageState extends State<DupePage> {
   }
 
   Widget _buildGroup(ThemeData theme, _DupeGroup g) {
+    final groupPaths = g.files.map((f) => f['path'] as String).toList();
+    final selCount =
+        groupPaths.where((p) => _selected.contains(p)).length;
+    final groupChecked = selCount == groupPaths.length;
+    final groupPartial = selCount > 0 && !groupChecked;
     return ExpansionTile(
       dense: true,
+      leading: Checkbox(
+        tristate: true,
+        value: groupChecked
+            ? true
+            : groupPartial
+                ? null
+                : false,
+        onChanged: (v) => setState(() {
+          if (v == true) {
+            _selected.addAll(groupPaths);
+          } else {
+            _selected.removeAll(groupPaths);
+          }
+        }),
+      ),
       title: Text(
         '${g.files.first['name']} × ${g.files.length} · 每份 ${fmtSize(g.size)}'
         '${g.verified ? '' : ' · 比对中…'}',
@@ -243,7 +304,9 @@ class _DupePageState extends State<DupePage> {
             color: g.verified ? null : theme.colorScheme.outline),
       ),
       subtitle: Text(
-        g.verified ? '可释放 ${fmtSize(g.size * (g.files.length - 1))}' : '大小相同的候选，正在比对指纹',
+        g.verified
+            ? '可释放 ${fmtSize(g.size * (g.files.length - 1))} · 勾选整组'
+            : '大小相同的候选，正在比对指纹',
         style: TextStyle(
             fontSize: 11, color: theme.colorScheme.outline),
       ),

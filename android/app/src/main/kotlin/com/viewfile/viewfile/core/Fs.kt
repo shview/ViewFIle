@@ -84,7 +84,8 @@ object Fs {
     private val dirsFirst = compareByDescending<Map<String, Any?>> { it["isDir"] as Boolean }
         .thenBy { (it["name"] as String).lowercase() }
 
-    /** 文本预览：应用直读，读不到再走特权通道（root cat / Shizuku） */
+    /** 文本预览原始字节（Base64）：编码检测与切换由 Dart 侧统一处理。
+     *  应用直读优先；读不到走特权通道（root head|base64）。 */
     fun readText(path: String, maxBytes: Int = 4 shl 20): Map<String, Any?> {
         val f = File(path)
         if (f.isFile && f.canRead()) {
@@ -98,7 +99,8 @@ object Fs {
                 }
                 return mapOf(
                     "ok" to true,
-                    "text" to String(buf, 0, n, Charsets.UTF_8),
+                    "b64" to android.util.Base64.encodeToString(
+                        buf, 0, n, android.util.Base64.NO_WRAP),
                     "truncated" to (f.length() > n),
                 )
             }
@@ -110,11 +112,12 @@ object Fs {
         if (PrivShell.needsRealRoot(raw) && PrivShell.tier() != PrivShell.Tier.ROOT) {
             return err("该位置只有真正的 root 才能读取")
         }
-        val res = PrivShell.run("head -c $maxBytes ${shq(raw)} 2>/dev/null")
+        val res = PrivShell.run("head -c $maxBytes ${shq(raw)} 2>/dev/null | base64")
         if (!res.ok) return err("读取失败: rc=${res.code}")
+        val b64 = res.out.filterNot { it == '\n' || it == '\r' }
         return mapOf(
             "ok" to true,
-            "text" to res.out,
+            "b64" to b64,
             "truncated" to (f.length() > maxBytes),
         )
     }

@@ -22,7 +22,6 @@ import 'dest_picker_page.dart';
 import 'storage_analysis_page.dart';
 import 'text_preview_page.dart';
 import 'tips_page.dart';
-import 'trash_page.dart';
 
 const kSdcard = '/storage/emulated/0';
 
@@ -1119,47 +1118,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final dirCount = items.length - fileCount;
     final names = items.take(5).map((e) => e['name']).join('、');
     final more = items.length > 5 ? ' 等 ${items.length} 项' : '';
-    // zip 虚拟项不能移动，只能永久删（解压后删）
-    final hasVirtual = items.any((e) => (e['path'] as String).contains('!/'));
-    final toTrash = await showDialog<bool>(
+    final ok = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('删除'),
+        title: const Text('永久删除？'),
         content: Text(
-          '将删除 $fileCount 个文件、$dirCount 个文件夹：\n$names$more',
+          '将删除 $fileCount 个文件、$dirCount 个文件夹：\n$names$more\n\n'
+          '此操作不可恢复。',
           style: const TextStyle(fontSize: 14),
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context, null),
+            onPressed: () => Navigator.pop(context, false),
             child: const Text('取消'),
           ),
-          if (!hasVirtual)
-            FilledButton.tonal(
-              style: FilledButton.styleFrom(
-                backgroundColor: Theme.of(context).colorScheme.errorContainer,
-              ),
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('永久删除'),
-            ),
           FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
             onPressed: () => Navigator.pop(context, true),
-            child: Text(hasVirtual ? '永久删除' : '移入回收站'),
+            child: const Text('删除'),
           ),
         ],
       ),
     );
-    if (toTrash == null || !mounted) return;
-    if (toTrash) {
-      final n = await TrashStore.put(
-          items.map((e) => e['path'] as String).toList());
-      if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('已移入回收站 $n 项（侧边栏可恢复）')));
-      _exitSelection();
-      _rerun();
-      return;
-    }
+    if (ok != true || !mounted) return;
     final r =
         await _api.delete(items.map((e) => e['path'] as String).toList());
     if (!mounted) return;
@@ -1437,21 +1420,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       child: SafeArea(
         child: SizedBox(
           height: 64,
-          child: ListView(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
+          // 固定屏内五等分，不再横向滚动
+          child: Row(
             children: [
-              action(Icons.share, '分享',
-                  () => _sharePaths(_selected.toList()),
-                  enabled: _allSelectedAreFiles),
-              action(Icons.content_copy, '复制路径',
-                  () => _copyPaths(_selected.toList())),
-              action(Icons.file_copy_outlined, '复制到',
-                  () => _transferSelected(move: false)),
-              action(Icons.drive_file_move_outlined, '移动到',
-                  () => _transferSelected(move: true)),
-              action(Icons.delete, '删除', () => _confirmDelete(_selectedItems),
-                  color: theme.colorScheme.error),
+              Expanded(
+                child: action(Icons.share, '分享',
+                    () => _sharePaths(_selected.toList()),
+                    enabled: _allSelectedAreFiles),
+              ),
+              Expanded(
+                child: action(Icons.content_copy, '复制路径',
+                    () => _copyPaths(_selected.toList())),
+              ),
+              Expanded(
+                child: action(Icons.file_copy_outlined, '复制到',
+                    () => _transferSelected(move: false)),
+              ),
+              Expanded(
+                child: action(Icons.drive_file_move_outlined, '移动到',
+                    () => _transferSelected(move: true)),
+              ),
+              Expanded(
+                child: action(Icons.delete, '删除',
+                    () => _confirmDelete(_selectedItems),
+                    color: theme.colorScheme.error),
+              ),
             ],
           ),
         ),
@@ -1709,11 +1702,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 MaterialPageRoute(
                     builder: (_) => BookmarksPage(onOpen: goBrowse)),
               );
-            }),
-            _drawerItem(Icons.delete_outline, '回收站', onTap: () {
-              Navigator.pop(context);
-              Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const TrashPage()));
             }),
             _drawerItem(Icons.apps, '按应用检索', subtitle: '应用私有数据目录',
                 onTap: () async {

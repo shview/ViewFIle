@@ -48,10 +48,10 @@ class TipsPage extends StatelessWidget {
           _Section(theme, '文件操作', [
             _Tip(
               theme,
-              Icons.delete_outline,
-              '回收站',
-              '删除默认移入回收站（侧边栏进入），可随时恢复到原路径或清空；'
-                  '确认框里也可选择永久删除。压缩包内的条目只能永久删除。',
+              Icons.delete_forever,
+              '删除不可恢复',
+              '删除直接生效、不可撤销；确认框会列出数量与名称，请在确认前'
+                  '仔细核对。',
             ),
             _Tip(
               theme,
@@ -89,7 +89,7 @@ class TipsPage extends StatelessWidget {
               Icons.find_in_page_outlined,
               '大文件查重',
               '先按大小分组找出候选，再比对每份文件前 1MB 指纹确认重复；'
-                  '阈值可自定（默认 10MB）。选中后移入回收站，「选中新出的'
+                  '阈值可自定（默认 10MB）。选中后可批量删除，「选中新出的'
                   '重复」自动保留每组最早的一份。',
             ),
             _Tip(

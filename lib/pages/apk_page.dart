@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 
 import '../api/engine_api.dart';
 import '../utils/format.dart';
-import 'trash_page.dart' show TrashStore;
 
 /// APK 安装包管理：全盘 APK 按包名分组、按体积排序，清理旧版本
 class ApkPage extends StatefulWidget {
@@ -88,7 +87,7 @@ class _ApkPageState extends State<ApkPage> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('删除安装包？'),
-        content: Text('选中的 $n 个 APK 将移入回收站。'),
+        content: Text('选中的 $n 个 APK 将被永久删除，不可恢复。'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(context, false),
@@ -100,11 +99,11 @@ class _ApkPageState extends State<ApkPage> {
       ),
     );
     if (ok != true) return;
-    await TrashStore.put(_selected.toList());
+    final r = await _api.delete(_selected.toList());
     if (!mounted) return;
     setState(() => _selected.clear());
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text('已移入回收站 $n 项')));
+    ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(r['ok'] == true ? '已删除 $n 项' : '部分删除失败')));
     _load();
   }
 
@@ -118,7 +117,7 @@ class _ApkPageState extends State<ApkPage> {
         actions: [
           if (_selected.isNotEmpty)
             IconButton(
-              tooltip: '删除到回收站',
+              tooltip: '删除所选',
               icon: Icon(Icons.delete, color: theme.colorScheme.error),
               onPressed: _deleteSelected,
             ),
