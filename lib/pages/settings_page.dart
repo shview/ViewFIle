@@ -11,16 +11,20 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsPageState extends State<SettingsPage> {
+class _SettingsPageState extends State<SettingsPage>
+    with WidgetsBindingObserver {
   final _api = EngineApi();
-  int _resultLimit = 200;
   bool _rootIndex = true;
   bool _systemIndex = false;
   bool _deepData = false;
-  bool _showHidden = false;
+  bool _compactDb = false;
+  bool _vacuuming = false;
+  int _dbBytes = 0;
   bool _rootGranted = false;
   bool _shizukuGranted = false;
   bool _shizukuBinder = false;
+  bool _hasPerm = false;
+  bool _permChecking = true;
   bool _rootChecking = false;
   bool _shizukuChecking = false;
   bool _dirty = false;
@@ -28,19 +32,47 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     SharedPreferences.getInstance().then((p) {
       if (!mounted) return;
       setState(() {
-        _resultLimit = p.getInt('resultLimit') ?? 200;
         _rootIndex = p.getBool('rootIndex') ?? true;
         _systemIndex = p.getBool('systemIndex') ?? false;
         _deepData = p.getBool('deepDataIndex') ?? false;
-        _showHidden = p.getBool('showHidden') ?? false;
+
+        _compactDb = p.getBool('compactDb') ?? false;
       });
     });
+    _api.stats().then((s) {
+      if (mounted) {
+        setState(() => _dbBytes = (s['dbBytes'] as num?)?.toInt() ?? 0);
+      }
+    });
+    _checkPerm();
     // 打开即自动检测两层状态
     _checkRoot();
     _checkShizuku();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 从系统授权页返回后刷新状态
+    if (state == AppLifecycleState.resumed) _checkPerm();
+  }
+
+  Future<void> _checkPerm() async {
+    final ok = await _api.hasPermission();
+    if (!mounted) return;
+    setState(() {
+      _hasPerm = ok;
+      _permChecking = false;
+    });
   }
 
   Future<void> _save(String key, Object value) async {
@@ -86,6 +118,51 @@ class _SettingsPageState extends State<SettingsPage> {
       // 弹出授权框后稍等再刷新状态
       await Future.delayed(const Duration(seconds: 2));
       if (mounted) await _checkShizuku();
+    }
+  }
+
+  double _vacuumEstimateSec() {
+    // 读写各一遍，按闪存 ~40MB/s 保守估算
+    if (_dbBytes <= 0) return 5;
+    return (_dbBytes / 1024 / 1024) * 2 / 40;
+  }
+
+  Future<void> _confirmVacuum() async {
+    final est = _vacuumEstimateSec();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('压缩数据库？'),
+        content: Text(
+          'VACUUM 会重写整个索引库以整理碎片${_compactDb ? '并切换到 8KB 页' : ''}，'
+          '预计约 ${est.toStringAsFixed(0)} 秒。\n期间搜索仍可用，但文件写入操作会暂停。',
+          style: const TextStyle(fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('开始')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _vacuuming = true);
+    final r = await _api.vacuum(pageSize: _compactDb ? 8192 : null);
+    if (!mounted) return;
+    setState(() => _vacuuming = false);
+    if (r['ok'] == true) {
+      setState(() => _dbBytes = (r['bytes'] as num?)?.toInt() ?? _dbBytes);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+            '完成：${((r['elapsedMs'] as num?)?.toInt() ?? 0) / 1000}s，'
+            '现在 ${((_dbBytes) / 1024 / 1024).toStringAsFixed(1)} MB'),
+      ));
+    } else {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('失败：${r['error']}')));
     }
   }
 
@@ -148,30 +225,22 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ),
             const _SectionHeader('搜索'),
+            const _SectionHeader('权限'),
             ListTile(
-              leading: const Icon(Icons.format_list_numbered),
-              title: const Text('单次最多显示结果数'),
-              trailing: DropdownButton<int>(
-                value: _resultLimit,
-                items: const [100, 200, 500, 1000, 2000]
-                    .map((v) => DropdownMenuItem(value: v, child: Text('$v')))
-                    .toList(),
-                onChanged: (v) {
-                  if (v == null) return;
-                  setState(() => _resultLimit = v);
-                  _save('resultLimit', v);
-                },
+              leading: const Icon(Icons.admin_panel_settings_outlined),
+              title: const Text('系统存储权限'),
+              subtitle: Text(
+                _permChecking
+                    ? '检测中…'
+                    : (_hasPerm
+                        ? '已授权（所有文件访问）'
+                        : '未授权：无法建立文件索引'),
+                style: Theme.of(context).textTheme.bodySmall,
               ),
-            ),
-            SwitchListTile(
-              secondary: const Icon(Icons.visibility_off_outlined),
-              title: const Text('显示隐藏文件'),
-              subtitle: const Text('显示 . 开头的文件与文件夹'),
-              value: _showHidden,
-              onChanged: (v) {
-                setState(() => _showHidden = v);
-                _save('showHidden', v);
-              },
+              trailing: TextButton(
+                onPressed: () => _api.requestPermission(),
+                child: Text(_hasPerm ? '检测' : '去授权'),
+              ),
             ),
             const _SectionHeader('特权层级与索引范围'),
             ListTile(
@@ -232,6 +301,34 @@ class _SettingsPageState extends State<SettingsPage> {
                 setState(() => _systemIndex = v);
                 _save('systemIndex', v);
               },
+            ),
+            const _SectionHeader('存储与性能'),
+            SwitchListTile(
+              secondary: const Icon(Icons.data_saver_on),
+              title: const Text('紧凑数据库（8KB 页）'),
+              subtitle: const Text(
+                  '库体积约省 5-8%、B 树更浅；下次重建索引时生效，'
+                  '对随机读写性能影响可忽略（写入均为批量）'),
+              value: _compactDb,
+              onChanged: (v) {
+                setState(() => _compactDb = v);
+                _save('compactDb', v);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.compress),
+              title: const Text('立即压缩数据库'),
+              subtitle: Text(_dbBytes > 0
+                  ? '当前 ${( _dbBytes / 1024 / 1024).toStringAsFixed(1)} MB · '
+                    '预计 ${_vacuumEstimateSec().toStringAsFixed(0)} 秒（期间文件操作暂停）'
+                  : '整理碎片并收缩空间'),
+              trailing: _vacuuming
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Text('执行'),
+              onTap: _vacuuming ? null : _confirmVacuum,
             ),
             const _SectionHeader('行为'),
             const ListTile(

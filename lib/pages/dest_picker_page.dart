@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../api/engine_api.dart';
-import '../utils/format.dart';
 
 /// 目标目录选择器：浏览目录树，选定后返回路径。
 /// 用于复制/移动的目标位置。

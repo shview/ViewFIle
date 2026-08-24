@@ -21,6 +21,107 @@ object FileOps {
 
     // ---------- 只读操作 ----------
 
+    /** APK 安装：root/Shizuku 走 pm（静默），无特权回退系统安装器 */
+    fun installApk(context: Context, path: String): Map<String, Any?> {
+        val tier = PrivShell.tier()
+        if (tier != PrivShell.Tier.NONE) {
+            val raw = RootScanner.toRaw(path)
+            val res = PrivShell.run("pm install -r -t ${shq(raw)}", timeoutMs = 120000)
+            val ok = res.ok && res.out.contains("Success")
+            return if (ok) mapOf("ok" to true, "mode" to tier.name)
+            else mapOf("ok" to false, "error" to res.out.trim().take(300).ifBlank { "rc=${res.code} ${res.err.take(120)}" })
+        }
+        // 无特权：拉起系统安装器
+        return try {
+            val f = File(path)
+            if (!f.isFile || !f.canRead()) return mapOf("ok" to false, "error" to "无法读取该 APK")
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uriFor(context, f), "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            mapOf("ok" to true, "mode" to "INTENT")
+        } catch (t: Throwable) {
+            mapOf("ok" to false, "error" to (t.message ?: t.toString()))
+        }
+    }
+
+    /** 哈希校验：直读单遍三摘要；不可直读时 root 走 md5sum/sha1sum/sha256sum。
+     *  onProgress 每约 4MB 回调一次（done, total），root 分支无进度。 */
+    fun hashFile(
+        path: String,
+        onProgress: (Long, Long) -> Unit = { _, _ -> },
+    ): Map<String, Any?> {
+        val f = File(path)
+        val t0 = System.currentTimeMillis()
+        if (f.isFile && f.canRead()) {
+            return try {
+                val md5 = java.security.MessageDigest.getInstance("MD5")
+                val sha1 = java.security.MessageDigest.getInstance("SHA-1")
+                val sha256 = java.security.MessageDigest.getInstance("SHA-256")
+                val total = f.length()
+                var done = 0L
+                var lastReport = 0L
+                f.inputStream().use { ins ->
+                    val buf = ByteArray(1 shl 16)
+                    while (true) {
+                        val r = ins.read(buf)
+                        if (r < 0) break
+                        md5.update(buf, 0, r)
+                        sha1.update(buf, 0, r)
+                        sha256.update(buf, 0, r)
+                        done += r
+                        if (done - lastReport >= (4 shl 20) || done >= total) {
+                            lastReport = done
+                            onProgress(done, total)
+                        }
+                    }
+                }
+                mapOf(
+                    "ok" to true,
+                    "md5" to hex(md5.digest()),
+                    "sha1" to hex(sha1.digest()),
+                    "sha256" to hex(sha256.digest()),
+                    "size" to total,
+                    "elapsedMs" to (System.currentTimeMillis() - t0),
+                )
+            } catch (t: Throwable) {
+                mapOf("ok" to false, "error" to (t.message ?: t.toString()))
+            }
+        }
+        if (PrivShell.tier() == PrivShell.Tier.ROOT) {
+            val raw = RootScanner.toRaw(path)
+            val res = PrivShell.run(
+                "md5sum ${shq(raw)} && sha1sum ${shq(raw)} && sha256sum ${shq(raw)}",
+                timeoutMs = 300000,
+            )
+            if (res.ok) {
+                val lines = res.out.trim().lines()
+                fun field(i: Int) = lines.getOrNull(i)?.split(Regex("\\s+"))?.firstOrNull()
+                return mapOf(
+                    "ok" to true,
+                    "md5" to field(0),
+                    "sha1" to field(1),
+                    "sha256" to field(2),
+                    "size" to f.length(),
+                    "elapsedMs" to (System.currentTimeMillis() - t0),
+                )
+            }
+            return mapOf("ok" to false, "error" to "读取失败: rc=${res.code}")
+        }
+        return mapOf("ok" to false, "error" to "无权限读取该文件")
+    }
+
+    private fun hex(bytes: ByteArray): String {
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            val v = b.toInt() and 0xFF
+            sb.append("0123456789abcdef"[v ushr 4])
+            sb.append("0123456789abcdef"[v and 0xF])
+        }
+        return sb.toString()
+    }
+
     fun open(context: Context, path: String): String? {
         val f = File(path)
         if (!f.isFile) return "无法打开（不是常规文件）"

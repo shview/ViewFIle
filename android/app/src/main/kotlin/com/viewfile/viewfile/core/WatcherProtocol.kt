@@ -18,9 +18,15 @@ internal object WatcherProtocol {
         return Ready(requested, installed)
     }
 
-    fun coversExpected(expected: Int, ready: Ready): Boolean =
-        expected <= MAX_WATCH && ready.requested == expected &&
-                ready.installed == ready.requested
+    fun coversExpected(expected: Int, ready: Ready): Boolean {
+        if (expected > MAX_WATCH || ready.requested != expected) return false
+        val shortfall = ready.requested - ready.installed
+        if (shortfall <= 0) return true
+        // 少量 add_watch 失败多为瞬时竞态（安装期间目录被并发增删），
+        // 差额 ≤0.5%（至少 256）仍接受；缺口由前台同步与下一轮对账兜底，
+        // 比整体回退 media observer（只覆盖媒体文件）好得多
+        return shortfall <= maxOf(256, ready.requested / 200)
+    }
 
     /** 解析 native 的 0-based 目录序号；任何非精确格式或越界值都拒绝。 */
     fun parseDirtyOrdinal(line: String, directoryCount: Int): Int? {

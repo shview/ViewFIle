@@ -39,6 +39,9 @@ dependencies:
 
   # 设置持久化（结果数量上限等）
   shared_preferences: ^2.5.3
+  archive: ^4.1.0
+  path_provider: ^2.1.6
+  video_player: ^2.11.1
 
 dev_dependencies:
   flutter_test:

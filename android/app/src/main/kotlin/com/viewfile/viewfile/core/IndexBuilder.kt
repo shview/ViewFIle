@@ -13,7 +13,7 @@ import java.io.File
  * 恒成立——内存层据此一遍即可按 parent 链重建完整路径。
  * 根链（/、/storage、/data…）按需补建，mtime 记 0。
  */
-class IndexBuilder(private val context: Context) : IndexSink {
+class IndexBuilder(private val context: Context, private val compact: Boolean = false) : IndexSink {
     private lateinit var db: SQLiteDatabase
     private val insert = lazy {
         db.compileStatement("INSERT OR IGNORE INTO entry(parent_id,name,type,size,mtime) VALUES(?,?,?,?,?)")
@@ -30,6 +30,8 @@ class IndexBuilder(private val context: Context) : IndexSink {
         abandoned = false
         deleteBuildArtifacts(context.getDatabasePath(Db.BUILD))
         db = context.openOrCreateDatabase(Db.BUILD, Context.MODE_PRIVATE, null)
+        // 紧凑模式：8KB 页（B 树更浅，库约小 5-8%）；建库时设置才对空库立即生效
+        if (compact) db.execSQL("PRAGMA page_size=8192")
         // journal_mode 返回结果行，必须走 rawQuery（A16 起 execSQL 拒绝带返回行的语句）。
         // 实测 journal=OFF 在百万级构建时触发 SQLITE_CORRUPT，WAL 稳定且构建库用完即删
         db.rawQuery("PRAGMA journal_mode=WAL", null).use { it.moveToFirst() }

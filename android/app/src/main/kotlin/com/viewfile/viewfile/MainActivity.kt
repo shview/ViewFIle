@@ -8,8 +8,10 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.Log
 import com.viewfile.viewfile.core.Engine
 import com.viewfile.viewfile.core.FileOps
+import com.viewfile.viewfile.core.Fs
 import com.viewfile.viewfile.core.SearchIndex
 import com.viewfile.viewfile.core.ShizukuShell
 import io.flutter.embedding.android.FlutterActivity
@@ -62,9 +64,10 @@ class MainActivity : FlutterActivity() {
                         val rootIndex = call.argument<Boolean>("rootIndex") ?: true
                         val systemIndex = call.argument<Boolean>("systemIndex") ?: false
                         val deepData = call.argument<Boolean>("deepData") ?: false
+                        val compactDb = call.argument<Boolean>("compactDb") ?: false
                         scanStartMs = System.currentTimeMillis()
                         Engine.scanAsync(
-                            rootIndex, systemIndex, deepData,
+                            rootIndex, systemIndex, deepData, compactDb,
                             onProgress = { files, dirs, current ->
                                 main.post {
                                     scanSink?.success(mapOf(
@@ -151,6 +154,73 @@ class MainActivity : FlutterActivity() {
                     "listDir" -> {
                         val path = call.argument<String>("path") ?: "/"
                         Engine.listDirAsync(path) { m ->
+                            main.post { result.success(m) }
+                        }
+                    }
+                    "readText" -> {
+                        val path = call.argument<String>("path") ?: ""
+                        Engine.ioAsync({ m -> main.post { result.success(m) } }) {
+                            Fs.readText(path)
+                        }
+                    }
+                    "nativeDir" -> result.success(applicationInfo.nativeLibraryDir)
+                    "searchStart" -> {
+                        val q = call.argument<String>("query") ?: ""
+                        val scopes = call.argument<List<String>>("scopes")
+                        val sortKey = call.argument<String>("sortKey") ?: "name"
+                        val sortDesc = call.argument<Boolean>("sortDesc") ?: false
+                        val category = call.argument<String>("category")
+                        val hideDot = call.argument<Boolean>("hideDot") ?: false
+                        Engine.searchStartAsync(q, scopes, sortKey, sortDesc, category, hideDot) { id, total, ms ->
+                            main.post {
+                                result.success(mapOf("id" to id, "total" to total, "elapsedMs" to ms))
+                            }
+                        }
+                    }
+                    "searchPage" -> {
+                        val id = call.argument<Int>("id") ?: -1
+                        val offset = call.argument<Int>("offset") ?: 0
+                        val count = call.argument<Int>("count") ?: 300
+                        Engine.searchPageAsync(id, offset, count) { list ->
+                            main.post { result.success(list.map { it.toMap() }) }
+                        }
+                    }
+                    "searchPaths" -> {
+                        val id = call.argument<Int>("id") ?: -1
+                        Engine.searchPathsAsync(id) { paths ->
+                            main.post { result.success(paths ?: emptyList<String>()) }
+                        }
+                    }
+                    "installApk" -> {
+                        val path = call.argument<String>("path") ?: ""
+                        Engine.opAsync({ m -> main.post { result.success(m) } }) {
+                            FileOps.installApk(this@MainActivity, path)
+                        }
+                    }
+                    "hashFile" -> {
+                        val path = call.argument<String>("path") ?: ""
+                        val tInvoke = System.currentTimeMillis()
+                        Engine.ioAsync({ m ->
+                            main.post {
+                                Log.i("ViewFile/Ops",
+                                    "hash total=${System.currentTimeMillis() - tInvoke}ms op=${m["elapsedMs"]}ms")
+                                result.success(m)
+                            }
+                        }) {
+                            FileOps.hashFile(path) { done, total ->
+                                main.post {
+                                    scanSink?.success(mapOf(
+                                        "type" to "hashProgress",
+                                        "done" to done,
+                                        "total" to total,
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    "vacuum" -> {
+                        val pageSize = call.argument<Int>("pageSize")
+                        Engine.vacuumAsync(pageSize) { m ->
                             main.post { result.success(m) }
                         }
                     }

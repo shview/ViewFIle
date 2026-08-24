@@ -79,7 +79,13 @@ object Engine {
         "root" to rootGranted,
         "shizuku" to ShizukuShell.getAvailable(),
         "tier" to PrivShell.tier().name,
+        "dbBytes" to Db.sizeBytes(appContext),
     )
+
+    /** VACUUM 压缩主库（串行在 scanExec，避免与写冲突）；pageSize 用于切换页大小 */
+    fun vacuumAsync(pageSize: Int?, cb: (Map<String, Any?>) -> Unit) {
+        scanExec.execute { cb(Db.vacuum(appContext, pageSize)) }
+    }
 
     /** 配置指纹是否与上次扫描一致（root 开关变化时提示重扫）；排队后台执行避免与载入争抢连接 */
     fun needsRescanAsync(rootIndex: Boolean, systemIndex: Boolean, deepData: Boolean, cb: (Boolean) -> Unit) {
@@ -123,7 +129,7 @@ object Engine {
                     return@execute
                 }
                 val t0 = System.currentTimeMillis()
-                val n = index.load(db)
+                val n = index.load(db).also { session = null } // 新快照发布：旧会话（钉住旧 SoA）立即失效
                 loadMs = System.currentTimeMillis() - t0
                 if (n > 0 && state == State.IDLE) state = State.READY
                 Log.i("ViewFile/Scan", "index loaded: $n entries in ${loadMs}ms")
@@ -144,6 +150,7 @@ object Engine {
         rootIndex: Boolean,
         systemIndex: Boolean,
         deepData: Boolean,
+        compactDb: Boolean = false,
         onProgress: (files: Int, dirs: Int, current: String) -> Unit,
         onDone: (Result?, String?) -> Unit
     ) {
@@ -165,7 +172,7 @@ object Engine {
             rootGranted = SuShell.getAvailable(refresh = true)
             ShizukuShell.getAvailable(refresh = true)
             state = State.SCANNING
-            val builder = IndexBuilder(appContext)
+            val builder = IndexBuilder(appContext, compactDb)
             var swapAttempted = false
             try {
                 val t0 = System.currentTimeMillis()
@@ -212,7 +219,7 @@ object Engine {
                 Db.setMeta(db, "scan_cfg", scanFingerprint(rootIndex, systemIndex, deepData))
 
                 val t2 = System.currentTimeMillis()
-                val n = index.load(db)
+                val n = index.load(db).also { session = null } // 新快照发布：旧会话（钉住旧 SoA）立即失效
                 loadMs = System.currentTimeMillis() - t2
                 val r = Result(files, dirs, System.currentTimeMillis() - t0, withRoot)
                 lastScan = r
@@ -258,6 +265,61 @@ object Engine {
             Log.d("ViewFile/Search",
                 "'$query' scopes=$scopeText -> ${res.size} hits in ${"%.2f".format(ms)}ms")
             cb(res)
+        }
+    }
+
+    // ---------- 懒加载搜索会话（只保留最新一个） ----------
+
+    @Volatile private var session: Pair<Int, SearchIndex.QueryResult>? = null
+    private val sessionGen = AtomicInteger(0)
+
+    fun searchStartAsync(
+        query: String,
+        scopes: List<String>?,
+        sortKey: String,
+        sortDesc: Boolean,
+        category: String?,
+        hideDot: Boolean,
+        cb: (id: Int, total: Int, ms: Double) -> Unit
+    ) {
+        searchExec.execute {
+            val t0 = System.nanoTime()
+            val r = index.queryResult(query, Int.MAX_VALUE, scopes, category, hideDot)
+            if (sortKey != "name" || sortDesc) {
+                index.sortResult(r, sortKey, sortDesc)
+            }
+            val ms = (System.nanoTime() - t0) / 1_000_000.0
+            val id = sessionGen.incrementAndGet()
+            session = id to r
+            Log.i("ViewFile/Search",
+                "session#$id '$query' cat=$category -> ${r.ids.size}/${r.totalBeforeLimit} in ${"%.2f".format(ms)}ms")
+            cb(id, r.ids.size, ms)
+        }
+    }
+
+    fun searchPageAsync(id: Int, offset: Int, count: Int, cb: (List<SearchIndex.Hit>) -> Unit) {
+        searchExec.execute {
+            val t0 = System.nanoTime()
+            val s = session
+            if (s == null || s.first != id) {
+                Log.i("ViewFile/Search",
+                    "page MISS asked=#$id cur=${s?.first ?: -1} offset=$offset")
+                cb(emptyList())
+            } else {
+                val hits = index.hitsOf(s.second, offset, count)
+                val ms = (System.nanoTime() - t0) / 1_000_000.0
+                Log.i("ViewFile/Search",
+                    "page session#$id offset=$offset n=${hits.size} in ${"%.2f".format(ms)}ms")
+                cb(hits)
+            }
+        }
+    }
+
+    /** 全量路径（供“全选”）；会话不匹配返回 null */
+    fun searchPathsAsync(id: Int, cb: (List<String>?) -> Unit) {
+        searchExec.execute {
+            val s = session
+            if (s == null || s.first != id) cb(null) else cb(index.pathsOf(s.second))
         }
     }
 
@@ -330,7 +392,7 @@ object Engine {
                 val changed = r.added + r.removed + r.updated
                 if (changed > 0) {
                     val t0 = System.currentTimeMillis()
-                    index.load(db)
+                    index.load(db).also { session = null } // 新快照发布：旧会话（钉住旧 SoA）立即失效
                     loadMs = System.currentTimeMillis() - t0
                 }
                 mapOf(
@@ -720,6 +782,25 @@ object Engine {
      * 状态在任务真正执行时检查，避免排队期间状态变化造成竞态。
      * 成功后自动重载内存索引，把数据库的最新状态带给 UI。
      */
+    /** 只读 IO（校验/文本预览）：不碰 DB 与索引，独立线程。
+     *  之前走 scanExec 会被 watcher 增量同步 + SoA 重建（秒级）排队，
+     *  体感“校验 20ms 却等了 5 秒”就是它。 */
+    private val ioExec = Executors.newSingleThreadExecutor { r -> Thread(r, "vf-io") }
+
+    fun ioAsync(
+        cb: (Map<String, Any?>) -> Unit,
+        body: () -> Map<String, Any?>
+    ) {
+        ioExec.execute {
+            val out = try {
+                body()
+            } catch (t: Throwable) {
+                mapOf("ok" to false, "error" to (t.message ?: t.toString()))
+            }
+            cb(out)
+        }
+    }
+
     fun opAsync(
         cb: (Map<String, Any?>) -> Unit,
         body: () -> Map<String, Any?>
@@ -740,7 +821,7 @@ object Engine {
             if (out["ok"] == true) {
                 try {
                     val t0 = System.currentTimeMillis()
-                    index.load(db)
+                    index.load(db).also { session = null } // 新快照发布：旧会话（钉住旧 SoA）立即失效
                     loadMs = System.currentTimeMillis() - t0
                 } catch (t: Throwable) {
                     Log.w("ViewFile/Ops", "index reload after op failed", t)

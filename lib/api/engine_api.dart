@@ -50,10 +50,12 @@ class EngineApi {
     bool rootIndex = true,
     bool systemIndex = false,
     bool deepData = false,
+    bool compactDb = false,
   }) => _m.invokeMethod('startScan', {
     'rootIndex': rootIndex,
     'systemIndex': systemIndex,
     'deepData': deepData,
+    'compactDb': compactDb,
   });
 
   /// 打开 app 时的增量对账，返回 {ok, added, removed, updated, elapsedMs}
@@ -81,9 +83,10 @@ class EngineApi {
   Future<void> stopWatcher({int lifecycleIntent = 0}) =>
       _m.invokeMethod('stopWatcher', {'lifecycleIntent': lifecycleIntent});
 
+  /// limit 默认给超大值 = 不限制，全部返回
   Future<List<Map<dynamic, dynamic>>> search(
     String query, {
-    int limit = 200,
+    int limit = 2000000000,
     List<String>? scopes,
   }) async {
     final list = await _m.invokeMethod<List<dynamic>>('search', {
@@ -93,6 +96,62 @@ class EngineApi {
     });
     return list?.map((e) => Map<dynamic, dynamic>.from(e)).toList() ?? const [];
   }
+
+  /// 懒加载搜索会话：只建索引命中集，返回 {id, total, elapsedMs}
+  Future<Map<String, dynamic>> searchStart(
+    String query, {
+    List<String>? scopes,
+    String sortKey = 'name',
+    bool sortDesc = false,
+    String? category,
+    bool hideDot = false,
+  }) async =>
+      Map<String, dynamic>.from(await _m.invokeMethod('searchStart', {
+        'query': query,
+        if (scopes != null) 'scopes': scopes,
+        'sortKey': sortKey,
+        'sortDesc': sortDesc,
+        if (category != null) 'category': category,
+        'hideDot': hideDot,
+      }));
+
+  /// 取会话一页（默认 300 条）
+  Future<List<Map<dynamic, dynamic>>> searchPage(
+          int id, int offset, int count) async =>
+      (await _m.invokeMethod<List<dynamic>>('searchPage', {
+            'id': id,
+            'offset': offset,
+            'count': count,
+          }))
+          ?.map((e) => Map<dynamic, dynamic>.from(e))
+          .toList() ??
+      const [];
+
+  /// 会话全量路径（供“全选”等批量操作）
+  Future<List<String>> searchPaths(int id) async =>
+      (await _m.invokeMethod<List<dynamic>>('searchPaths', {'id': id}))
+          ?.cast<String>() ??
+      const [];
+
+  /// APK 安装（root/Shizuku 静默，无特权拉系统安装器）
+  Future<Map<String, dynamic>> installApk(String path) async =>
+      Map<String, dynamic>.from(
+        await _m.invokeMethod('installApk', {'path': path}),
+      );
+
+  /// 哈希校验：{ok, md5, sha1, sha256, size, elapsedMs}
+  Future<Map<String, dynamic>> hashFile(String path) async =>
+      Map<String, dynamic>.from(
+        await _m.invokeMethod('hashFile', {'path': path}),
+      );
+
+  /// VACUUM 压缩主库；pageSize 非空时切换页大小
+  Future<Map<String, dynamic>> vacuum({int? pageSize}) async =>
+      Map<String, dynamic>.from(
+        await _m.invokeMethod('vacuum', {
+          if (pageSize != null) 'pageSize': pageSize,
+        }),
+      );
 
   /// 已安装应用列表：{pkg, label, system}，非系统应用在前（不含图标，秒回）
   Future<List<Map<dynamic, dynamic>>> listApps() async {
@@ -108,6 +167,16 @@ class EngineApi {
   Future<Map<String, dynamic>> listDir(String path) async =>
       Map<String, dynamic>.from(
         await _m.invokeMethod('listDir', {'path': path}),
+      );
+
+  /// 原生库目录（内含 libvfunrar.so 等自打包可执行）
+  Future<String?> nativeDir() async =>
+      await _m.invokeMethod<String>('nativeDir');
+
+  /// 文本预览：{ok, text, truncated} 或 {ok:false, error}；root 区域走特权读取
+  Future<Map<String, dynamic>> readText(String path) async =>
+      Map<String, dynamic>.from(
+        await _m.invokeMethod('readText', {'path': path}),
       );
 
   /// 打开（系统选择器）。返回 null=已发起，否则为错误信息

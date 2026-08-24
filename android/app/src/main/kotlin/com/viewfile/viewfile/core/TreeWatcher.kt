@@ -450,12 +450,38 @@ class TreeWatcher(
             Log.w(TAG, "read watch limit failed (rc=${result.code}); fallback to media observer")
             return false
         }
-        if (current < needed) {
+        if (current >= needed) return true
+        // 仅 root 提限额（Shizuku 的 shell 身份写不了 sysctl）；
+        // 记住原值，停止时恢复——不留长期系统痕迹
+        if (useShizuku) {
             Log.w(TAG, "watch limit insufficient: current=$current needed=$needed; " +
-                    "global setting left unchanged, fallback to media observer")
+                    "shizuku cannot raise, fallback to media observer")
             return false
         }
+        val raised = needed.coerceAtLeast(current * 2)
+        val write = SuShell.run("echo $raised > /proc/sys/fs/inotify/max_user_watches")
+        if (!write.ok) {
+            Log.w(TAG, "watch limit insufficient: current=$current needed=$needed; " +
+                    "raise failed (rc=${write.code}), fallback to media observer")
+            return false
+        }
+        raisedWatchLimitFrom = current
+        Log.i(TAG, "watch limit raised: $current -> $raised (will restore on stop)")
         return true
+    }
+
+    @Volatile private var raisedWatchLimitFrom: Int = -1
+
+    /** 停止/回退时恢复 inotify 限额（不留系统痕迹） */
+    private fun restoreWatchLimitIfRaised() {
+        val from = raisedWatchLimitFrom
+        if (from <= 0) return
+        raisedWatchLimitFrom = -1
+        try {
+            SuShell.run("echo $from > /proc/sys/fs/inotify/max_user_watches")
+            Log.i(TAG, "watch limit restored to $from")
+        } catch (_: Throwable) {
+        }
     }
 
     private fun runMediaTransition(requestGeneration: Long) {
@@ -519,6 +545,8 @@ class TreeWatcher(
             runCatching { context.contentResolver.unregisterContentObserver(it) }
         }
         detached.first?.let { runCatching { it.destroy() } }
+        // vfwatch 已死则不再需要提升的限额，恢复原值
+        restoreWatchLimitIfRaised()
         // 新 owner 在启动前也执行一次，收敛旧 stop 只 destroy(su) 留下的孤儿 helper。
         val target = claimGlobalCleanup(this, requestGeneration, stopRequest)
             ?: return WatcherCleanupResult(required = false, succeeded = true)

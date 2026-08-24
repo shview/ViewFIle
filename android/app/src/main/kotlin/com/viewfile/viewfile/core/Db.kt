@@ -3,6 +3,7 @@ package com.viewfile.viewfile.core
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.util.Log
+import java.io.File
 
 /**
  * 索引库 v3：entry(id, parent_id, name, type, size, mtime)。
@@ -33,6 +34,35 @@ object Db {
             migrate(db)
         }
         return db
+    }
+
+    /** 主库文件总大小（db+wal+shm），供压缩估算 */
+    fun sizeBytes(context: Context): Long {
+        val main = context.getDatabasePath(MAIN)
+        var total = 0L
+        for (suffix in listOf("", "-wal", "-shm")) {
+            val f = File(main.path + suffix)
+            if (f.exists()) total += f.length()
+        }
+        return total
+    }
+
+    /** VACUUM 压缩；pageSize 非空时切换页大小（VACUUM 时重写全库生效） */
+    fun vacuum(context: Context, pageSize: Int?): Map<String, Any?> {
+        return try {
+            val db = openDb(context)
+            val t0 = System.currentTimeMillis()
+            if (pageSize != null) db.execSQL("PRAGMA page_size=$pageSize")
+            db.execSQL("VACUUM")
+            db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { it.moveToFirst() }
+            mapOf(
+                "ok" to true,
+                "elapsedMs" to (System.currentTimeMillis() - t0),
+                "bytes" to sizeBytes(context),
+            )
+        } catch (t: Throwable) {
+            mapOf("ok" to false, "error" to (t.message ?: t.toString()))
+        }
     }
 
     private fun migrate(db: SQLiteDatabase) {

@@ -311,9 +311,12 @@ class SyncScanner(
         val display = area.display
         val depthArg = if (area.depth > 0) " -maxdepth ${area.depth}" else ""
         val actual = HashMap<String, Long>()
+        // -exec {} + 在 Android 15 的 toybox find 不守 ARG_MAX，目录多时
+        // exec stat 报 "Argument list too long" 且输出残缺（实测 3.3 万目录只剩 1.55 万），
+        // 改用 xargs -0 管道（xargs 按 ARG_MAX 自行分批，与全量扫描同构）
         val res = PrivShell.runStream(
-            "find ${shq(area.raw)}$depthArg -type d " +
-                    "-exec stat -c '%n|%Y' '{}' + 2>/dev/null"
+            "find ${shq(area.raw)}$depthArg -type d -print0 " +
+                    "| xargs -0 -r stat -c '%n|%Y' 2>/dev/null"
         ) { line ->
             val i = line.lastIndexOf('|')
             if (i <= 0) return@runStream
@@ -369,11 +372,11 @@ class SyncScanner(
         var allRelistsOk = true
         for (chunk in plan.selected.chunked(300)) {
             if (scanRequestedBridge?.invoke() == true) throw SCAN_YIELD
-            // 每个 find 自己批量 stat，并用 && 串联：任一目录重列失败都会成为
-            // 整体非零 rc，本 chunk 全部丢弃，不采用部分输出。
+            // 同 dir-stat：-exec + 不守 ARG_MAX（子项上万的目录会 E2BIG），
+            // 统一 -print0 | xargs -0；管道 rc 即 xargs rc，失败同旧语义整 chunk 丢弃
             val finds = chunk.joinToString(" && ") {
                 "find ${shq(RootScanner.toRaw(it))} -mindepth 1 -maxdepth 1 " +
-                        "-exec stat -c '%n|%F|%s|%Y' '{}' +"
+                        "-print0 | xargs -0 -r stat -c '%n|%F|%s|%Y'"
             }
             val r = PrivShell.run("($finds) 2>/dev/null")
             if (!r.ok) {

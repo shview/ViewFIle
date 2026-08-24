@@ -264,15 +264,90 @@ class SearchIndex {
 
     // ---------- 查询 ----------
 
+    /** 查询会话：索引代 + 命中的密集下标（按需物化成 Hit，避免一次性构造大列表） */
+    class QueryResult internal constructor(
+        internal val snap: Snapshot,
+        internal val ids: IntArray,
+        internal val totalBeforeLimit: Int
+    )
+
+    /** 物化一段命中（懒加载分页用） */
+    fun hitsOf(r: QueryResult, offset: Int, count: Int): List<Hit> {
+        if (offset < 0 || offset >= r.ids.size || count <= 0) return emptyList()
+        val end = minOf(offset + count, r.ids.size)
+        val out = ArrayList<Hit>(end - offset)
+        for (i in offset until end) out.add(Hit(r.ids[i], r.snap))
+        return out
+    }
+
+    /** 会话内全量路径（轻量：只传字符串，供“全选”等操作） */
+    fun pathsOf(r: QueryResult): List<String> {
+        val s = r.snap.soa ?: return emptyList()
+        val out = ArrayList<String>(r.ids.size)
+        for (i in r.ids) out.add(pathOfIdx(s, i))
+        return out
+    }
+
+    /** 会话排序：name=序号反转；size/time=并行数组比较排序 */
+    fun sortResult(r: QueryResult, key: String, desc: Boolean) {
+        val s = r.snap.soa ?: return
+        when (key) {
+            "name" -> if (desc) r.ids.reverse()
+            "size" -> {
+                val boxed = r.ids.toTypedArray()
+                boxed.sortWith { x, y -> s.size[x].compareTo(s.size[y]) }
+                for (i in boxed.indices) r.ids[i] = boxed[i]
+                if (desc) r.ids.reverse()
+            }
+            "time" -> {
+                val boxed = r.ids.toTypedArray()
+                boxed.sortWith { x, y -> s.mtime[x].compareTo(s.mtime[y]) }
+                for (i in boxed.indices) r.ids[i] = boxed[i]
+                if (desc) r.ids.reverse()
+            }
+        }
+    }
+
+    /** 分类缓存（按快照代计算一次）：0 其他 1 图 2 视 3 音 4 文档 5 APK 6 压缩 */
+    @Volatile private var catGen: Snapshot? = null
+    @Volatile private var catArr: ByteArray? = null
+
+    private fun categoryArray(snap: Snapshot): ByteArray? {
+        val s = snap.soa ?: return null
+        if (catGen === snap && catArr != null) return catArr
+        val arr = ByteArray(s.n)
+        for (i in 0 until s.n) {
+            val ref = s.nameRef[i]
+            val a = s.nameOff[ref]
+            val name = String(s.namePool, a, s.nameOff[ref + 1] - a, Charsets.UTF_8)
+            arr[i] = FileCategories.ofName(name)
+        }
+        catGen = snap
+        catArr = arr
+        return arr
+    }
+
     /**
      * 多关键词 AND 折叠子串匹配；scopes 非空时用欧拉区间 O(1) 过滤。
-     * 空关键词 + scopes = 列出范围内条目；按 sortIdx 序取前 limit。
+     * 支持 >10mb / 1mb..50mb / >2024-01-01 / today 等语法 token 与 category 类型过滤。
+     * 空关键词 + scopes = 列出范围内条目；按 sortIdx 序。
      */
     fun query(raw: String, limit: Int, scopes: List<String>? = null): List<Hit> {
+        val r = queryResult(raw, limit, scopes, null)
+        return hitsOf(r, 0, Int.MAX_VALUE)
+    }
+
+    fun queryResult(
+        raw: String,
+        limit: Int,
+        scopes: List<String>? = null,
+        category: String? = null,
+        hideDot: Boolean = false
+    ): QueryResult {
         val snap = snapshot
-        val s = snap.soa ?: return emptyList()
+        val s = snap.soa ?: return QueryResult(snap, IntArray(0), 0)
         val n = s.n
-        if (n == 0) return emptyList()
+        if (n == 0) return QueryResult(snap, IntArray(0), 0)
 
         val intervals = scopes?.mapNotNull { path ->
             val id = snap.dirIds[path] ?: return@mapNotNull null
@@ -281,10 +356,15 @@ class SearchIndex {
         }
         val hasScope = !intervals.isNullOrEmpty()
 
-        val q = raw.trim().lowercase()
+        val f = SearchQueryParser.parse(raw)
+        val q = f.text.trim().lowercase()
         val tokens = q.split(' ', '\t').filter { it.isNotEmpty() }
             .map { it.toByteArray(Charsets.UTF_8) }
-        val out = ArrayList<Hit>(minOf(limit, 256))
+        val wantCat = FileCategories.idOf(category)
+        val cats = if (wantCat != 0.toByte()) categoryArray(snap) else null
+        var ids = IntArray(64)
+        var hits = 0
+        var total = 0
 
         fun nameContainsFold(i: Int, tok: ByteArray): Boolean {
             val r = s.nameRef[i]
@@ -309,6 +389,26 @@ class SearchIndex {
             intervals!!.any { t >= it[0] && t < it[1] }
         }
 
+        fun isDotName(i: Int): Boolean {
+            val r = s.nameRef[i]
+            val a = s.nameOff[r]
+            return a < s.nameOff[r + 1] && s.namePool[a] == '.'.code.toByte()
+        }
+
+        fun matches(i: Int): Boolean {
+            if (hasScope && !inScope(i)) return false
+            if (hideDot && isDotName(i)) return false
+            for (tok in tokens) {
+                if (!nameContainsFold(i, tok)) return false
+            }
+            if (f.sizeMin != null && s.size[i] < f.sizeMin!!) return false
+            if (f.sizeMax != null && s.size[i] > f.sizeMax!!) return false
+            if (f.timeMin != null && s.mtime[i] < f.timeMin!!) return false
+            if (f.timeMax != null && s.mtime[i] >= f.timeMax!!) return false
+            if (cats != null && cats[i] != wantCat) return false
+            return true
+        }
+
         val order = s.sortIdx
         val seq: IntIterator = if (order != null) {
             object : IntIterator() {
@@ -324,30 +424,20 @@ class SearchIndex {
             }
         }
 
-        if (q.isEmpty()) {
-            if (!hasScope) return emptyList()
-            while (seq.hasNext()) {
-                val i = seq.nextInt()
-                if (inScope(i)) {
-                    out.add(Hit(i, snap))
-                    if (out.size >= limit) break
-                }
-            }
-            return out
+        if (q.isEmpty() && !hasScope && !f.hasRange && cats == null) {
+            return QueryResult(snap, IntArray(0), 0)
         }
         while (seq.hasNext()) {
             val i = seq.nextInt()
-            if (hasScope && !inScope(i)) continue
-            var hit = true
-            for (tok in tokens) {
-                if (!nameContainsFold(i, tok)) { hit = false; break }
-            }
-            if (hit) {
-                out.add(Hit(i, snap))
-                if (out.size >= limit) break
+            if (matches(i)) {
+                total++
+                if (hits < limit) {
+                    if (hits == ids.size) ids = ids.copyOf(ids.size * 2)
+                    ids[hits++] = i
+                }
             }
         }
-        return out
+        return QueryResult(snap, ids.copyOf(hits), total)
     }
 
     private fun emptySnapshot() = Snapshot(
