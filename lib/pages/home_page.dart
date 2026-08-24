@@ -1476,6 +1476,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             icon: const Icon(Icons.flip),
             onPressed: _invertSelection,
           ),
+          IconButton(
+            tooltip: '将选中的文件夹加入书签',
+            icon: const Icon(Icons.bookmark_add_outlined),
+            onPressed: _selectedItems.any((e) => e['isDir'] == true)
+                ? _bookmarkSelected
+                : null,
+          ),
         ],
       );
     }
@@ -2222,6 +2229,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// 把多选中选中的文件夹批量加入书签
+  Future<void> _bookmarkSelected() async {
+    final dirs = _selectedItems
+        .where((e) => e['isDir'] == true)
+        .map((e) => e['path'] as String)
+        .toList();
+    if (dirs.isEmpty) return;
+    var n = 0;
+    for (final d in dirs) {
+      if (await Bookmarks.add(d)) n++;
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('已加入书签 $n 个文件夹')));
+    _exitSelection();
+  }
+
   /// 收起键盘并让搜索框失焦（跳转子页/打开面板前调用，
   /// 否则返回时焦点自动还给搜索框、键盘会再次弹起）
   void _unfocus() => FocusManager.instance.primaryFocus?.unfocus();
@@ -2522,7 +2546,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             dir: path.substring(0, path.lastIndexOf('/')));
                       },
                     ),
-                  if (path.isNotEmpty)
+                  if (isDir && path.isNotEmpty)
                     _detailAction(
                       bookmarked ? Icons.bookmark : Icons.bookmark_border,
                       bookmarked ? '已收藏' : '收藏',

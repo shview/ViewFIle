@@ -212,38 +212,62 @@ class _SettingsPageState extends State<SettingsPage>
                 ],
               ),
             ),
-            ListTile(
-              leading: const Icon(Icons.brightness_6_outlined),
-              title: const Text('明暗模式'),
-              trailing: SegmentedButton<int>(
-                segments: const [
-                  ButtonSegment(value: 0, icon: Icon(Icons.auto_mode), label: Text('系统')),
-                  ButtonSegment(value: 1, icon: Icon(Icons.light_mode), label: Text('浅色')),
-                  ButtonSegment(value: 2, icon: Icon(Icons.dark_mode), label: Text('深色')),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Row(
+                children: [
+                  const Icon(Icons.brightness_6_outlined, size: 20),
+                  const SizedBox(width: 12),
+                  const Text('明暗模式'),
+                  const Spacer(),
+                  SegmentedButton<int>(
+                    segments: const [
+                      ButtonSegment(value: 0, label: Text('系统')),
+                      ButtonSegment(value: 1, label: Text('浅色')),
+                      ButtonSegment(value: 2, label: Text('深色')),
+                    ],
+                    selected: {AppTheme.modeValue},
+                    showSelectedIcon: false,
+                    onSelectionChanged: (s) => AppTheme.setMode(s.first),
+                  ),
                 ],
-                selected: {AppTheme.modeValue},
-                showSelectedIcon: false,
-                onSelectionChanged: (s) => AppTheme.setMode(s.first),
               ),
             ),
-            ListTile(
-              leading: const Icon(Icons.subtitles_outlined),
-              title: const Text('搜索结果路径行数'),
-              subtitle: const Text('长路径换行显示；自适应完整展开（行高不一）'),
-              trailing: SegmentedButton<int>(
-                segments: const [
-                  ButtonSegment(value: 1, label: Text('1')),
-                  ButtonSegment(value: 2, label: Text('2')),
-                  ButtonSegment(value: 3, label: Text('3')),
-                  ButtonSegment(value: 0, label: Text('自适应')),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.subtitles_outlined, size: 20),
+                      const SizedBox(width: 12),
+                      const Text('搜索结果路径行数'),
+                      const Spacer(),
+                      Text('长路径换行；自适应完整展开',
+                          style: Theme.of(context).textTheme.bodySmall),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  SizedBox(
+                    width: double.infinity,
+                    child: SegmentedButton<int>(
+                      segments: const [
+                        ButtonSegment(value: 1, label: Text('1 行')),
+                        ButtonSegment(value: 2, label: Text('2 行')),
+                        ButtonSegment(value: 3, label: Text('3 行')),
+                        ButtonSegment(value: 0, label: Text('自适应')),
+                      ],
+                      selected: {_pathLines},
+                      showSelectedIcon: false,
+                      onSelectionChanged: (s) async {
+                        setState(() => _pathLines = s.first);
+                        final p = await SharedPreferences.getInstance();
+                        await p.setInt('pathLines', s.first);
+                      },
+                    ),
+                  ),
                 ],
-                selected: {_pathLines},
-                showSelectedIcon: false,
-                onSelectionChanged: (s) async {
-                  setState(() => _pathLines = s.first);
-                  final p = await SharedPreferences.getInstance();
-                  await p.setInt('pathLines', s.first);
-                },
               ),
             ),
             const _SectionHeader('搜索'),

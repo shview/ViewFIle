@@ -114,6 +114,9 @@ class _SearchPageState extends State<SearchPage> {
     }
   }
 
+  // prefs 就绪后再跑一次：应用范围的空查询要显示入口目录，
+  // 且持久化的过滤条件(size/date)会影响首屏结果
+
   @override
   void dispose() {
     _debounce?.cancel();
@@ -146,7 +149,7 @@ class _SearchPageState extends State<SearchPage> {
       _sortKey = p.getString('sortKey') ?? 'name';
       _sortDesc = p.getBool('sortDesc') ?? false;
     });
-    if (_hasQuery) _runQuery();
+    _runQuery();
   }
 
   Future<void> _saveCfg() async {
@@ -202,10 +205,7 @@ class _SearchPageState extends State<SearchPage> {
 
   Future<void> _runQuery() async {
     // 按应用检索的空查询：显示入口目录
-    if (widget.appScope != null && !_hasQuery &&
-        _sizeMin.text.isEmpty &&
-        _sizeMax.text.isEmpty &&
-        _dateMode == null) {
+    if (widget.appScope != null && !_hasQuery) {
       final dirs = List<String>.from(widget.appScope!['dirs']);
       setState(() {
         _localResults = dirs

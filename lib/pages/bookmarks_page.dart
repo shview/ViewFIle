@@ -23,6 +23,16 @@ class Bookmarks {
     return true;
   }
 
+  /// 仅添加（已存在则跳过），返回是否新加入
+  static Future<bool> add(String path) async {
+    final p = await SharedPreferences.getInstance();
+    final list = await load();
+    if (list.contains(path)) return false;
+    list.insert(0, path);
+    await p.setStringList('bookmarks', list);
+    return true;
+  }
+
   static Future<bool> contains(String path) async => (await load()).contains(path);
 }
 

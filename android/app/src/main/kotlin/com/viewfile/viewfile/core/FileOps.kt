@@ -116,17 +116,23 @@ object FileOps {
     fun apkMeta(
         context: Context,
         paths: List<String>,
-    ): List<Map<String, Any?>> = paths.map { p ->
-        val pi = try {
-            context.packageManager.getPackageArchiveInfo(p, 0)
-        } catch (_: Throwable) {
-            null
+    ): List<Map<String, Any?>> {
+        val out = paths.map { p ->
+            val pi = try {
+                context.packageManager.getPackageArchiveInfo(p, 0)
+            } catch (_: Throwable) {
+                null
+            }
+            mapOf(
+                "path" to p,
+                "pkg" to pi?.packageName,
+                "ver" to pi?.versionName,
+            )
         }
-        mapOf(
-            "path" to p,
-            "pkg" to pi?.packageName,
-            "ver" to pi?.versionName,
-        )
+        val ok = out.count { it["pkg"] != null }
+        Log.i(TAG, "apkMeta: ${paths.size} apks, $ok parsed, " +
+                "samples=${out.take(3).joinToString { "${(it["pkg"] ?: "null")}" }}")
+        return out
     }
 
     /** 头部指纹：前 bytes 字节的 MD5（查重快速比对用，比全文件哈希快几个量级） */

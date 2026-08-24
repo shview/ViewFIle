@@ -25,6 +25,8 @@ class _ApkPageState extends State<ApkPage> {
   String? _phase; // 'list' / 'meta' / null
   List<_ApkGroup> _groups = const [];
   final _selected = <String>{};
+  int _pkgParsed = 0;
+  int _pkgTotal = 0;
 
   @override
   void initState() {
@@ -51,12 +53,16 @@ class _ApkPageState extends State<ApkPage> {
     setState(() => _phase = 'meta');
 
     // 真实包名：PackageManager 读 APK 头（比文件名猜测可靠）
-    final metas = await _api
-        .apkMeta(entries.map((e) => e['path'] as String).toList());
+    final paths = entries.map((e) => e['path'] as String).toList();
+    final metas = await _api.apkMeta(paths);
     final metaByPath = <String, Map<dynamic, dynamic>>{};
     for (final m in metas) {
       metaByPath[m['path'] as String] = m;
     }
+    _pkgTotal = paths.length;
+    _pkgParsed = paths
+        .where((p) => (metaByPath[p]?['pkg'] as String?)?.isNotEmpty == true)
+        .length;
     final byPkg = <String, _ApkGroup>{};
     for (final e in entries) {
       final p = e['path'] as String;
@@ -199,8 +205,28 @@ class _ApkPageState extends State<ApkPage> {
             ),
         ],
       ),
-      body: _phase != null
-          ? Center(
+      body: Column(
+        children: [
+          if (_phase == null && _pkgTotal > 0)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  _pkgParsed == _pkgTotal
+                      ? '$_pkgTotal 个安装包 · 包名已解析'
+                      : '$_pkgTotal 个安装包 · 包名解析 $_pkgParsed'
+                          '${_pkgParsed == 0 ? '（读不到包名，按文件名分组）' : ''}',
+                  style: Theme.of(context)
+                      .textTheme
+                      .bodySmall
+                      ?.copyWith(color: Theme.of(context).colorScheme.outline),
+                ),
+              ),
+            ),
+          Expanded(
+            child: _phase != null
+                ? Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -219,6 +245,9 @@ class _ApkPageState extends State<ApkPage> {
                   itemCount: _groups.length,
                   itemBuilder: (context, i) => _buildGroup(theme, _groups[i]),
                 ),
+          ),
+        ],
+      ),
       bottomSheet: _groups.isEmpty || dupGroups == 0 || _phase != null
           ? null
           : Padding(
