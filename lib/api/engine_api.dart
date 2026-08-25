@@ -1,5 +1,3 @@
-import 'dart:typed_data';
-
 import 'package:flutter/services.dart';
 
 /// 原生引擎通道封装
@@ -92,7 +90,7 @@ class EngineApi {
     final list = await _m.invokeMethod<List<dynamic>>('search', {
       'query': query,
       'limit': limit,
-      if (scopes != null) 'scopes': scopes,
+      'scopes': ?scopes,
     });
     return list?.map((e) => Map<dynamic, dynamic>.from(e)).toList() ?? const [];
   }
@@ -109,10 +107,10 @@ class EngineApi {
   }) async =>
       Map<String, dynamic>.from(await _m.invokeMethod('searchStart', {
         'query': query,
-        if (scopes != null) 'scopes': scopes,
+        'scopes': ?scopes,
         'sortKey': sortKey,
         'sortDesc': sortDesc,
-        if (category != null) 'category': category,
+        'category': ?category,
         'hideDot': hideDot,
         'caseSensitive': caseSensitive,
       }));
@@ -165,10 +163,7 @@ class EngineApi {
   /// VACUUM 压缩主库；pageSize 非空时切换页大小
   Future<Map<String, dynamic>> vacuum({int? pageSize}) async =>
       Map<String, dynamic>.from(
-        await _m.invokeMethod('vacuum', {
-          if (pageSize != null) 'pageSize': pageSize,
-        }),
-      );
+          await _m.invokeMethod('vacuum', {'pageSize': ?pageSize}));
 
   /// 已安装应用列表：{pkg, label, system}，非系统应用在前（不含图标，秒回）
   Future<List<Map<dynamic, dynamic>>> listApps() async {

@@ -125,6 +125,7 @@ object FileOps {
                 null
             }
             if (pm != null) {
+                pmCount.incrementAndGet()
                 mapOf(
                     "path" to p,
                     "pkg" to pm.packageName,
@@ -132,6 +133,7 @@ object FileOps {
                 )
             } else {
                 val axml = ApkManifest.parse(p)
+                if (axml?.pkg != null) axmlCount.incrementAndGet()
                 mapOf(
                     "path" to p,
                     "pkg" to axml?.pkg,
@@ -142,8 +144,25 @@ object FileOps {
         val ok = out.count { it["pkg"] != null }
         Log.i(TAG, "apkMeta: ${paths.size} apks, $ok parsed, " +
                 "samples=${out.take(3).joinToString { "${(it["pkg"] ?: "null")}" }}")
+        // 持久化诊断（logcat 会被系统刷掉；此文件 adb 可直接拉取）
+        try {
+            val f = File(
+                context.getExternalFilesDir(null) ?: context.filesDir,
+                "apkmeta_debug.txt",
+            )
+            f.writeText(buildString {
+                appendLine("time=${System.currentTimeMillis()} n=${paths.size} parsed=$ok pm=${pmCount.get()} axml=${axmlCount.get()}")
+                for (m in out.take(30)) {
+                    appendLine("${m["pkg"]} | ${m["ver"]} | ${m["path"]}")
+                }
+            })
+        } catch (_: Throwable) {
+        }
         return out
     }
+
+    private val pmCount = java.util.concurrent.atomic.AtomicInteger()
+    private val axmlCount = java.util.concurrent.atomic.AtomicInteger()
 
     /** 头部指纹：前 bytes 字节的 MD5（查重快速比对用，比全文件哈希快几个量级） */
     fun hashHead(path: String, bytes: Int = 1 shl 20): Map<String, Any?> {

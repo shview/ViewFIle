@@ -94,6 +94,7 @@ class _ApkPageState extends State<ApkPage> {
   Future<void> _install(Map<dynamic, dynamic> f) async {
     final pkg = f['realPkg'] as String? ?? '未知包名';
     final ver = f['ver'] as String? ?? '?';
+    final messenger = ScaffoldMessenger.of(context);
     final ok = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -117,13 +118,11 @@ class _ApkPageState extends State<ApkPage> {
       ),
     );
     if (ok != true) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(const SnackBar(content: Text('正在安装…')));
+    messenger.showSnackBar(const SnackBar(content: Text('正在安装…')));
     final r = await _api.installApk(f['path'] as String);
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(r['ok'] == true ? '已发起安装' : '安装失败：${r['error']}'),
-    ));
+    messenger.showSnackBar(SnackBar(
+        content: Text(r['ok'] == true ? '已发起安装' : '安装失败：${r['error']}')));
   }
 
   Future<void> _deleteSelected() async {

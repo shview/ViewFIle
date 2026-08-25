@@ -844,20 +844,20 @@ class _SearchPageState extends State<SearchPage> {
             ('size', '大小'),
             ('time', '修改时间'),
           ])
-            RadioListTile<String>(
-              value: k,
-              groupValue: _sortKey,
+            ListTile(
               title: Text(label),
               dense: true,
-              onChanged: (v) => Navigator.pop(context, v),
+              trailing: _sortKey == k
+                  ? const Icon(Icons.check_circle)
+                  : const Icon(Icons.radio_button_unchecked),
+              onTap: () => Navigator.pop(context, k),
             ),
-          RadioListTile<String>(
-            value: 'desc',
-            groupValue: _sortDesc ? 'desc' : 'asc',
+          ListTile(
             title: Text(_sortDesc ? '当前：降序' : '当前：升序'),
-            subtitle: const Text('点击切换升降序'),
+            subtitle: const Text('点击切换'),
             dense: true,
-            onChanged: (v) => Navigator.pop(context, 'desc'),
+            trailing: const Icon(Icons.swap_vert),
+            onTap: () => Navigator.pop(context, 'desc'),
           ),
         ],
       ),

@@ -1,7 +1,6 @@
 import 'dart:convert' show base64Decode, utf8;
 import 'dart:io' as io;
 import 'dart:math' as math;
-import 'dart:typed_data' show Uint8List;
 
 import 'package:charset_converter/charset_converter.dart';
 import 'package:flutter/material.dart';
@@ -294,13 +293,12 @@ class _TextPreviewPageState extends State<TextPreviewPage> {
             onPressed: _text.isEmpty
                 ? null
                 : () async {
+                    final messenger = ScaffoldMessenger.of(context);
                     await Clipboard.setData(ClipboardData(text: _text));
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                        content: Text('已复制全部文本'),
-                        duration: Duration(seconds: 1),
-                      ));
-                    }
+                    messenger.showSnackBar(const SnackBar(
+                      content: Text('已复制全部文本'),
+                      duration: Duration(seconds: 1),
+                    ));
                   },
           ),
         ],

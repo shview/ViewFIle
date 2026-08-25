@@ -17,7 +17,7 @@ class ViewFileApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return ValueListenableBuilder<int>(
       valueListenable: AppTheme.changes,
-      builder: (context, _, __) => MaterialApp(
+      builder: (context, one, two) => MaterialApp(
         title: 'ViewFile',
         debugShowCheckedModeBanner: false,
         theme: AppTheme.light,

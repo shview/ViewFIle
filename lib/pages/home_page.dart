@@ -96,14 +96,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _loadingDir = false;
   String? _dirError;
 
-  // 搜索状态
+  // 搜索状态（主页搜索已迁移至搜索专页，此处仅保留浏览所需）
   List<Map<dynamic, dynamic>> _results = const [];
-  bool _searching = false;
-  // 作用域：0=当前目录 1=全盘 2=当前界面（在当前显示的列表内过滤）
-  int _scopeMode = 0;
-  // “当前界面”模式的基底列表（浏览结果或上次搜索结果）
+  final int _scopeMode = 0;
   List<Map<dynamic, dynamic>> _viewBase = const [];
-  // 类型筛选：null=全部 image/video/audio/doc/apk/archive
   String? _category;
 
   // 懒加载搜索会话（普通搜索走引擎会话：总数即时、内容按需取）
@@ -114,7 +110,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // 搜索历史
   final _searchFocus = FocusNode();
-  List<String> _history = const [];
 
   // 排序：name | size | time
   String _sortKey = 'name';
@@ -143,8 +138,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 普通（引擎）搜索 = 懒加载会话；“当前界面”/应用检索默认视图走本地列表
   bool get _isLazySession =>
       _isSearching && _appScope == null && _scopeMode != 2 && _sessId >= 0;
-  int get _totalResults => _isLazySession ? _sessTotal : _results.length;
-
   @override
   void initState() {
     super.initState();
@@ -153,40 +146,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _onScanEvent,
       onError: (_) {},
     );
-    _loadHistory();
     _prefsReady = _loadPrefs();
     _bootstrap();
   }
 
   Future<void>? _prefsReady;
 
-  Future<void> _loadHistory() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (mounted) setState(() => _history = prefs.getStringList('searchHistory') ?? const []);
-  }
 
-  Future<void> _recordHistory(String q) async {
-    q = q.trim();
-    if (q.length < 2) return;
-    final prefs = await SharedPreferences.getInstance();
-    final list = [..._history.where((h) => h != q), q];
-    if (list.length > 20) list.removeRange(0, list.length - 20);
-    await prefs.setStringList('searchHistory', list);
-    if (mounted) setState(() => _history = list);
-  }
 
-  Future<void> _removeHistory(int i) async {
-    final list = [..._history]..removeAt(i);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList('searchHistory', list);
-    if (mounted) setState(() => _history = list);
-  }
 
-  Future<void> _clearHistory() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList('searchHistory', const []);
-    if (mounted) setState(() => _history = const []);
-  }
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
@@ -451,10 +419,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // ---------- 搜索 ----------
 
-  void _onQueryChanged(String q) {
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 120), () => _runQuery(q));
-  }
 
   int _querySeq = 0; // 搜索请求序号：防响应乱序（旧查询后到覆盖新结果）
   bool _sessionRebuilding = false; // 会话失效重建退避
@@ -475,7 +439,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               },
             )
             .toList();
-        _searching = false;
         _viewBase = _results;
         _sessId = -1;
         _sessTotal = 0;
@@ -508,7 +471,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 !((e['name'] as String? ?? '').startsWith('.')))
             .toList()
           ..sort(_clientSort);
-        _searching = false;
         _sessId = -1;
         _pages.clear();
       });
@@ -522,9 +484,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       scopes = [_currentDir];
     }
     final seq = ++_querySeq;
-    // seamless（增量同步触发）：不闪进度条、不清旧页——旧结果保持显示，
+    // seamless（增量同步触发）：不清旧页——旧结果保持显示，
     // 新会话就位后静默重拉已缓存的页，到货原地替换
-    if (!seamless) setState(() => _searching = true);
     final r = await _api.searchStart(
       q,
       scopes: scopes,
@@ -541,7 +502,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       setState(() {
         _sessId = newId;
         _sessTotal = newTotal;
-        _searching = false;
       });
       // 后台静默刷新已展示的页（含滑窗外的缓存页）
       for (final p in _pages.keys.toList()) {
@@ -552,7 +512,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() {
       _sessId = newId;
       _sessTotal = newTotal;
-      _searching = false;
       _results = const [];
       // 新会话已就位，此时清旧页：itemBuilder 将用新 id 拉页
       _pages.clear();
@@ -693,16 +652,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String get _scopeLabel =>
       switch (_scopeMode) { 1 => '全盘', 2 => '当前界面', _ => '当前目录' };
 
-  void _toggleScope() {
-    setState(() => _scopeMode = (_scopeMode + 1) % 3);
-    if (_scopeMode == 2) {
-      // 进入“当前界面”：以当前显示的列表为过滤基底
-      if (_isSearching && _results.isNotEmpty) {
-        _viewBase = _results;
-      }
-    }
-    if (_isSearching) _runQuery(_searchCtl.text);
-  }
 
   /// 操作完成后刷新当前视图（seamless：文件操作后的自动刷新也不闪屏）
   void _rerun({bool seamless = true}) {
@@ -898,7 +847,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('${k.toUpperCase()}',
+                        Text(k.toUpperCase(),
                             style: const TextStyle(
                                 fontSize: 11, fontWeight: FontWeight.w700)),
                         Text(r[k] as String? ?? '—',
@@ -1274,122 +1223,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  bool _showHistoryPanel() {
-    if (_appScope != null || _history.isEmpty) return false;
-    if (!_searchFocus.hasFocus) return false;
-    final q = _searchCtl.text.trim().toLowerCase();
-    if (q.isEmpty) return true;
-    return _history.any((h) => h.toLowerCase().startsWith(q) && h.toLowerCase() != q);
-  }
 
-  List<String> get _historySuggestions {
-    final q = _searchCtl.text.trim().toLowerCase();
-    if (q.isEmpty) return _history.take(8).toList();
-    return _history
-        .where((h) => h.toLowerCase().startsWith(q) && h.toLowerCase() != q)
-        .take(6)
-        .toList();
-  }
 
-  Widget _historyPanel() {
-    final theme = Theme.of(context);
-    final sugg = _historySuggestions;
-    return Material(
-      elevation: 2,
-      color: theme.colorScheme.surfaceContainerLow,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          for (final h in sugg)
-            InkWell(
-              onTap: () {
-                _searchCtl.text = h;
-                _onQueryChanged(h);
-                _searchFocus.unfocus();
-              },
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
-                child: Row(
-                  children: [
-                    Icon(Icons.history, size: 16, color: theme.colorScheme.outline),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(h,
-                          maxLines: 1, overflow: TextOverflow.ellipsis,
-                          style: theme.textTheme.bodySmall),
-                    ),
-                    if (_searchCtl.text.trim().isEmpty)
-                      InkWell(
-                        onTap: () => _removeHistory(_history.indexOf(h)),
-                        child: Icon(Icons.close,
-                            size: 16, color: theme.colorScheme.outline),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-          if (_searchCtl.text.trim().isEmpty && _history.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 4, 8, 6),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text('搜索历史',
-                        style: theme.textTheme.labelSmall?.copyWith(
-                            color: theme.colorScheme.outline)),
-                  ),
-                  TextButton(
-                    onPressed: _clearHistory,
-                    child: const Text('清空', style: TextStyle(fontSize: 12)),
-                  ),
-                ],
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  static const _categories = <(String?, String, IconData)>[
-    (null, '全部', Icons.all_inclusive),
-    ('image', '图片', Icons.image),
-    ('video', '视频', Icons.movie),
-    ('audio', '音频', Icons.audiotrack),
-    ('doc', '文档', Icons.description),
-    ('apk', 'APK', Icons.android),
-    ('archive', '压缩包', Icons.folder_zip),
-  ];
-
-  Widget _categoryChips() {
-    return SizedBox(
-      height: 40,
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        children: [
-          for (final (cat, label, icon) in _categories)
-            Padding(
-              padding: const EdgeInsets.only(right: 6),
-              child: FilterChip(
-                avatar: Icon(icon,
-                    size: 15,
-                    color: _category == cat
-                        ? null
-                        : Theme.of(context).colorScheme.outline),
-                label: Text(label),
-                selected: _category == cat,
-                showCheckmark: false,
-                visualDensity: VisualDensity.compact,
-                onSelected: (_) {
-                  setState(() => _category = cat);
-                  if (_isSearching) _runQuery(_searchCtl.text);
-                },
-              ),
-            ),
-        ],
-      ),
-    );
-  }
 
   /// 多选底部操作栏（图标+文字块，横向可滚动）
   Widget _selectBottomBar() {
@@ -1685,7 +1520,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             ?.copyWith(fontSize: 11)),
                     if (_lastScanMs > 0)
                       Text(
-                        '扫描 ${(_lastScanMs / 1000.0).toStringAsFixed(1)} s · 载入 $_loadMs ms · ${_tierName}',
+                        '扫描 ${(_lastScanMs / 1000.0).toStringAsFixed(1)} s · 载入 $_loadMs ms · $_tierName',
                         style: theme.textTheme.bodySmall
                             ?.copyWith(fontSize: 10),
                       ),
@@ -1918,84 +1753,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _searchField() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-      child: Row(
-        children: [
-          Expanded(
-            child: TextField(
-              controller: _searchCtl,
-              focusNode: _searchFocus,
-              enabled: _hasPerm == true,
-              onChanged: (v) {
-                setState(() {}); // 刷新历史建议面板
-                _onQueryChanged(v);
-              },
-              onSubmitted: (v) {
-                _recordHistory(v);
-                _searchFocus.unfocus();
-                _runQuery(v);
-              },
-              decoration: InputDecoration(
-                hintText: _appScope != null
-                    ? '在 ${_appScope!['label']} 内搜索…'
-                    : (_entries > 0
-                          ? '在$_scopeLabel搜索…'
-                          : '等待索引建立…'),
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _searchCtl.text.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.clear),
-                        onPressed: () {
-                          _searchCtl.clear();
-                          _onQueryChanged('');
-                        },
-                      ),
-                border: const OutlineInputBorder(),
-                isDense: true,
-              ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          // 应用检索时不放芯片（AppBar 标题已显示应用名），保持搜索框全长
-          if (_appScope == null)
-            Tooltip(
-              message: '当前作用域：$_scopeLabel，点击切换（当前目录 → 全盘 → 当前界面）',
-              child: ActionChip(
-                avatar: Icon(
-                  switch (_scopeMode) {
-                    1 => Icons.public,
-                    2 => Icons.filter_alt,
-                    _ => Icons.subdirectory_arrow_right,
-                  },
-                  size: 18,
-                ),
-                label: Text(_scopeLabel),
-                onPressed: _toggleScope,
-              ),
-            ),
-        ],
-      ),
-    );
-  }
 
   /// 搜索结果计数条
-  Widget _resultCountBar() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: Text(
-          '共 ${_totalResults} 条',
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: Theme.of(context).colorScheme.outline,
-              ),
-        ),
-      ),
-    );
-  }
 
   /// 面包屑路径条（浏览模式，含压缩包虚拟层级）
   Widget _pathBar() {
@@ -2430,15 +2189,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           _unfocus();
           _loadDir('$path!/');
         } else if (!isDir && isImageName(name)) {
-          _recordHistory(_searchCtl.text);
           _unfocus();
           _viewImage(e);
         } else if (!isDir && (isVideoName(name) || isAudioName(name))) {
-          _recordHistory(_searchCtl.text);
           _unfocus();
           _openMedia(e);
         } else if (!isDir && isTextLikeName(name)) {
-          _recordHistory(_searchCtl.text);
           _unfocus();
           _previewText(e);
         } else {
@@ -2556,13 +2312,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       bookmarked ? '已收藏' : '收藏',
                       () async {
                         Navigator.pop(context);
+                        final messenger = ScaffoldMessenger.of(context);
                         final added = await Bookmarks.toggle(path);
-                        if (mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                            content: Text(added ? '已加入书签' : '已移出书签'),
-                            duration: const Duration(seconds: 1),
-                          ));
-                        }
+                        messenger.showSnackBar(SnackBar(
+                          content: Text(added ? '已加入书签' : '已移出书签'),
+                          duration: const Duration(seconds: 1),
+                        ));
                       },
                     ),
                   if (isZip)

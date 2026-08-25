@@ -12,7 +12,7 @@ class TipsPage extends StatelessWidget {
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
-          _Section(theme, '搜索', [
+          _section(theme, '搜索', [
             _Tip(
               theme,
               Icons.search,
@@ -45,7 +45,7 @@ class TipsPage extends StatelessWidget {
                   '时下拉展示，可单条删除或清空。',
             ),
           ]),
-          _Section(theme, '文件操作', [
+          _section(theme, '文件操作', [
             _Tip(
               theme,
               Icons.delete_forever,
@@ -76,7 +76,7 @@ class TipsPage extends StatelessWidget {
                   '受系统保护的区域会自动改用已授权的更高权限执行。',
             ),
           ]),
-          _Section(theme, '清理工具', [
+          _section(theme, '清理工具', [
             _Tip(
               theme,
               Icons.analytics_outlined,
@@ -100,7 +100,7 @@ class TipsPage extends StatelessWidget {
                   '按修改时间保留最新一份，其余一键清理。',
             ),
           ]),
-          _Section(theme, '存储访问', [
+          _section(theme, '存储访问', [
             _Tip(
               theme,
               Icons.verified,
@@ -133,7 +133,7 @@ class TipsPage extends StatelessWidget {
                   'root 管理器会重新请求授权。',
             ),
           ]),
-          _Section(theme, '索引与实时性', [
+          _section(theme, '索引与实时性', [
             _Tip(
               theme,
               Icons.bolt,
@@ -165,7 +165,7 @@ class TipsPage extends StatelessWidget {
                   'socket、设备节点按设计跳过。',
             ),
           ]),
-          _Section(theme, '隐私与耗电', [
+          _section(theme, '隐私与耗电', [
             _Tip(
               theme,
               Icons.wifi_off,
@@ -186,7 +186,7 @@ class TipsPage extends StatelessWidget {
     );
   }
 
-  static Widget _Section(ThemeData theme, String title, List<Widget> tips) {
+  static Widget _section(ThemeData theme, String title, List<Widget> tips) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
