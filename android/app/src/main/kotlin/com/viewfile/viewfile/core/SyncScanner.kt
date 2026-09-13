@@ -74,6 +74,8 @@ class SyncScanner(
 
     companion object {
         private const val MAX_RELIST_PER_SYNC = 2000
+        /** 区域 dir-stat 常态 1.5~3s，10x 余量；超时按区域失败跳过，下轮收敛 */
+        private const val DIR_STAT_TIMEOUT_MS = 30_000L
         /** 内部控制流：同步让位给扫描请求（不视为错误） */
         private val SCAN_YIELD = RuntimeException("__scan_yield__")
     }
@@ -314,9 +316,12 @@ class SyncScanner(
         // -exec {} + 在 Android 15 的 toybox find 不守 ARG_MAX，目录多时
         // exec stat 报 "Argument list too long" 且输出残缺（实测 3.3 万目录只剩 1.55 万），
         // 改用 xargs -0 管道（xargs 按 ARG_MAX 自行分批，与全量扫描同构）
+        // 常态 1.5~3s；显式限时防止 su 管道被冻结器/FUSE 停滞卡住 scanExec 长达
+        // 默认 10 分钟（实测侧滑退出重进时 freezer 干扰可停滞 ~80s，重进首页一直转圈）
         val res = PrivShell.runStream(
             "find ${shq(area.raw)}$depthArg -type d -print0 " +
-                    "| xargs -0 -r stat -c '%n|%Y' 2>/dev/null"
+                    "| xargs -0 -r stat -c '%n|%Y' 2>/dev/null",
+            timeoutMs = DIR_STAT_TIMEOUT_MS
         ) { line ->
             val i = line.lastIndexOf('|')
             if (i <= 0) return@runStream
@@ -347,11 +352,14 @@ class SyncScanner(
             toDelete.clear()
             massDeleteGuarded = true
         }
-        for (p in toDelete) {
+        // toDelete 含被删树的全部后代；后代行随顶层目录的递归 CTE 一并删除，
+        // 逐个处理只会做冗余 CTE 查询 + 冗余全表 prune。先归约出最顶层集合。
+        val topMost = topmostPaths(toDelete)
+        for (p in topMost) {
             val id = index.dirId(p) ?: continue
             deleteDirectorySubtree(id)
-            index.pruneDirMaps(p)
         }
+        index.pruneDirMapsAll(topMost)
 
         // 先计划再写 mtime：pending 目录只补行/父链，保留旧 mtime（新行为 0）。
         // 否则超过单轮上限或 chunk 失败的目录下轮会被误判为无变化。
@@ -370,6 +378,7 @@ class SyncScanner(
                     "this run=${plan.selected.size}, deferred=${plan.deferred.size}")
         }
         var allRelistsOk = true
+        var consecutiveFailures = 0
         for (chunk in plan.selected.chunked(300)) {
             if (scanRequestedBridge?.invoke() == true) throw SCAN_YIELD
             // 同 dir-stat：-exec + 不守 ARG_MAX（子项上万的目录会 E2BIG），
@@ -381,8 +390,15 @@ class SyncScanner(
             val r = PrivShell.run("($finds) 2>/dev/null")
             if (!r.ok) {
                 allRelistsOk = false
+                // 环境异常（su 冻结/存储停滞）时每个 chunk 都要烧满 15s 超时；
+                // 连续两败即放弃本轮，避免 N×15s 独占 scanExec
+                if (++consecutiveFailures >= 2) {
+                    Log.w("ViewFile/Sync", "relist consecutive failures, abort pass")
+                    break
+                }
                 continue
             }
+            consecutiveFailures = 0
             val parsedChildren = ArrayList<Pair<String, Child>>()
             r.out.lineSequence().forEach { line ->
                 val e = RootScanner.parseStatLine(line) ?: return@forEach
@@ -526,16 +542,19 @@ class SyncScanner(
                 updated++
             }
         }
+        // 同一目录下整批子目录消失时逐个 prune 是 O(表)×N，先收集再一次剔除
+        val prunedChildren = ArrayList<String>()
         for ((name, meta) in dbChildren) {
             if (kidNames.contains(name)) continue
             if (meta.second) {
                 deleteDirectorySubtree(meta.first)
-                index.pruneDirMaps("$parentPath/$name")
+                prunedChildren.add("$parentPath/$name")
             } else {
                 db.execSQL("DELETE FROM entry WHERE id=?", arrayOf(meta.first.toString()))
                 removed++
             }
         }
+        index.pruneDirMapsAll(topmostPaths(prunedChildren))
         return newDirs
     }
 
@@ -577,5 +596,20 @@ class SyncScanner(
         if (counts.first == 0) return
         removed += Db.deleteSubtree(db, id)
         dirAddedRemoved += counts.second
+    }
+
+    /** 路径按长度升序保留互非祖先的项：/a、/a/b、/a/b/c → /a。 */
+    private fun topmostPaths(paths: List<String>): List<String> {
+        if (paths.size <= 1) return paths
+        val sorted = paths.sortedBy { it.length }
+        val top = ArrayList<String>()
+        outer@ for (p in sorted) {
+            for (k in top) {
+                val ks = if (k.endsWith("/")) k else "$k/"
+                if (p == k || p.startsWith(ks)) continue@outer
+            }
+            top.add(p)
+        }
+        return top
     }
 }

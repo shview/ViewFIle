@@ -69,6 +69,30 @@ class SearchIndex {
         }
     }
 
+    /**
+     * 批量前缀剔除：对两张目录表各做一次遍历。
+     * 逐个调用 pruneDirMaps 是 O(表大小)×路径数——目录树被整棵删除时
+     * toDelete 含全部后代（批量删除守卫放行上界 2000），实测 190k 键 × 千级
+     * 路径 ≈ 30s 纯 CPU，scanExec 被独占导致重进后 ensureIndexLoaded 永远排不上队。
+     */
+    fun pruneDirMapsAll(prefixes: List<String>) {
+        if (prefixes.isEmpty()) return
+        synchronized(mutationLock) {
+            val snap = snapshot
+            val exact = prefixes.toTypedArray()
+            val slash = prefixes.map { if (it.endsWith("/")) it else "$it/" }.toTypedArray()
+            snap.dirIds.keys.removeIf { path -> matchesAny(path, exact, slash) }
+            snap.dirMtimes.keys.removeIf { path -> matchesAny(path, exact, slash) }
+        }
+    }
+
+    private fun matchesAny(path: String, exact: Array<String>, slash: Array<String>): Boolean {
+        for (i in exact.indices) {
+            if (path == exact[i] || path.startsWith(slash[i])) return true
+        }
+        return false
+    }
+
     fun markDir(path: String, id: Long, mtime: Long) {
         synchronized(mutationLock) {
             val snap = snapshot
